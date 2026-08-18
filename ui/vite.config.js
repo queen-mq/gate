@@ -1,12 +1,13 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
+import tailwindcss from '@tailwindcss/vite'
 
 // The build output is embedded into the gate binary by rust-embed, so it
 // must be fully self-contained and served from the root. `vite dev` proxies the
 // API to a locally running gate so the console can be worked on with hot
 // reload against real state.
 export default defineConfig({
-  plugins: [vue()],
+  plugins: [vue(), tailwindcss()],
   build: {
     outDir: 'dist',
     emptyOutDir: true,
