@@ -1,0 +1,55 @@
+# ---- Rust ----
+/target/
+**/target/
+*.rs.bk
+*.pdb
+
+# Coverage
+*.profraw
+*.profdata
+/coverage/
+tarpaulin-report.html
+
+# Cargo.lock is committed on purpose: this workspace ships binaries
+# (crates/server, crates/e2e), so builds must be reproducible.
+
+# ---- Console UI (Vite + Vue) ----
+node_modules/
+/ui/dist/
+.vite/
+.eslintcache
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---- Secrets and local config ----
+# A target spec carries no credentials, but the server talks to QueenMQ
+# and the e2e harness to real vendors. Keep both out of a public repo.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+secrets/
+.claude/settings.local.json
+
+# ---- Editors ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ---- OS ----
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+
+# ---- Local scratch ----
+*.log
+/tmp/
+
+helm/

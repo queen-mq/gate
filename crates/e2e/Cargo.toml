@@ -1,0 +1,13 @@
+[package]
+name = "gate-e2e"
+description = "Drives a declared target under load and checks the ceiling holds."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

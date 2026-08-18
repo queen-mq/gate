@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>Gate</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23888' stroke-width='2' stroke-linecap='round'><path d='M4 4v16'/><path d='M20 4v16'/><path d='M9 12h6'/><path d='M12 9v6'/></svg>">
+  <script>
+    // Applied before first paint so a reload never flashes the wrong theme.
+    (function () {
+      var t = localStorage.getItem('gate-theme')
+      var dark = t ? t === 'dark' : window.matchMedia('(prefers-color-scheme: dark)').matches
+      document.documentElement.classList.toggle('dark', dark)
+    })()
+  </script>
+</head>
+<body>
+  <div id="app"></div>
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>

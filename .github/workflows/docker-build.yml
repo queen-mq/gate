@@ -1,0 +1,111 @@
+name: Docker Image
+
+# Publishes one image to GHCR under this repository's own org:
+#
+#   ghcr.io/<org>/gate    the limiter, with the console compiled into it
+#
+# Auth is the workflow's own GITHUB_TOKEN — no registry secret to rotate. The
+# `packages: write` permission below is what lets that token push.
+#
+# A package is PRIVATE the first time it is published, and a private package is
+# an ImagePullBackOff in a cluster that has no pull secret. Flip it once by
+# hand: https://github.com/orgs/<org>/packages -> gate -> Package settings ->
+# Change visibility.
+#
+# Both architectures are built. arm64 is not decoration: the whole team develops
+# on Apple silicon, and an amd64-only image cannot be run locally to reproduce
+# what stage is doing.
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+# One run per ref: a tag push landing on top of a branch push should supersede
+# it rather than race it to the same tags.
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Tags
+      id: meta
+      run: |
+        SHA="$(git rev-parse --short HEAD)"
+        if [ "${{ github.ref_type }}" = "tag" ]; then
+          VERSION="${GITHUB_REF_NAME#v}"
+        else
+          # Not "latest-and-nothing-else": an untagged build still gets an
+          # immutable name, because `sha-` is what stage.yaml should pin. A
+          # version tag can be overwritten; a sha cannot.
+          VERSION="sha-$SHA"
+        fi
+        REG="ghcr.io/${{ github.repository_owner }}/gate"
+        {
+          echo "tags<<EOF"
+          echo "$REG:$VERSION"
+          echo "$REG:sha-$SHA"
+          echo "$REG:latest"
+          echo "EOF"
+          echo "version=$VERSION"
+          echo "sha=$SHA"
+        } >> $GITHUB_OUTPUT
+
+    - uses: docker/setup-qemu-action@v3
+    - uses: docker/setup-buildx-action@v3
+
+    - name: Log in to GHCR
+      if: github.event_name != 'pull_request'
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Build and push
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./Dockerfile
+        platforms: linux/amd64,linux/arm64
+        push: ${{ github.event_name != 'pull_request' }}
+        tags: ${{ steps.meta.outputs.tags }}
+        # `image.source` is what links the package to this repository on the
+        # GitHub UI — and what makes the package inherit the repo's README and
+        # visibility conversation instead of appearing as an orphan.
+        labels: |
+          org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          org.opencontainers.image.revision=${{ github.sha }}
+          org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+          org.opencontainers.image.licenses=Apache-2.0
+        cache-from: type=gha,scope=gate
+        cache-to: type=gha,scope=gate,mode=max
+
+    - name: Summary
+      env:
+        TAGS: ${{ steps.meta.outputs.tags }}
+      run: |
+        {
+          echo "### gate"
+          echo ""
+          echo '```'
+          echo "$TAGS"
+          echo '```'
+          echo ""
+          echo "- platforms: linux/amd64, linux/arm64"
+          echo "- revision: ${{ steps.meta.outputs.sha }}"
+          echo "- pushed: ${{ github.event_name != 'pull_request' }}"
+        } >> $GITHUB_STEP_SUMMARY

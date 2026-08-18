@@ -1,0 +1,175 @@
+/* The fonts are bundled, not fetched: the console is embedded in the binary and
+   may run somewhere with no route to the internet. Latin subset only — the
+   console's entire vocabulary is Latin, and the other subsets are 160 kB an
+   operator would ship forever. */
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('@fontsource-variable/inter/files/inter-latin-wght-normal.woff2') format('woff2-variations');
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 100 800;
+  font-display: swap;
+  src: url('@fontsource-variable/jetbrains-mono/files/jetbrains-mono-latin-wght-normal.woff2') format('woff2-variations');
+}
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ---------------------------------------------------------------- tokens
+   A strictly neutral scale (the queenmq.com / Vercel school): gray carries the
+   structure, hue appears only where it means state. Light and dark are one
+   class on <html>; nothing below this block knows which mode it is in.
+
+   The one hard rule: a token used as an AREA fill must be far enough from the
+   surface behind it. Pill-lightness tints (96%+) vanish as fills in light mode.
+   -dim tokens here are ~92% / ~25%. */
+@layer base {
+  :root {
+    --bg: oklch(98.6% 0 0);
+    --surface: oklch(100% 0 0);
+    --surface-2: oklch(96.8% 0 0);
+    --text: oklch(17% 0 0);
+    --text-2: oklch(48% 0 0);
+    --text-3: oklch(65% 0 0);
+    --border: oklch(92.5% 0 0);
+    --border-2: oklch(85% 0 0);
+
+    --link: oklch(50% 0.17 255);
+    --good: oklch(50% 0.13 152);
+    --good-dim: oklch(92.5% 0.05 152);
+    --warn: oklch(53% 0.12 70);
+    --warn-dim: oklch(93% 0.06 80);
+    --bad: oklch(51% 0.19 26);
+    --bad-dim: oklch(93.5% 0.045 26);
+
+    /* Categorical, for one line per application. Deliberately none of the
+       semantic hues: green, amber and red mean healthy, elevated and breached
+       everywhere else in this console, and a chart that spends them as identity
+       would have an application looking fine because of who it is. */
+    --series-1: oklch(50% 0.17 255);
+    --series-2: oklch(50% 0.16 300);
+    --series-3: oklch(48% 0.13 195);
+    --series-4: oklch(52% 0.16 330);
+    --series-5: oklch(46% 0.12 225);
+    --series-6: oklch(54% 0.14 275);
+
+    --shadow-card: 0 1px 2px rgb(0 0 0 / 0.04);
+  }
+
+  .dark {
+    --bg: oklch(9% 0 0);
+    --surface: oklch(12.3% 0 0);
+    --surface-2: oklch(16% 0 0);
+    --text: oklch(96% 0 0);
+    --text-2: oklch(63% 0 0);
+    --text-3: oklch(45% 0 0);
+    --border: oklch(20.5% 0 0);
+    --border-2: oklch(28.5% 0 0);
+
+    --link: oklch(72% 0.13 255);
+    --good: oklch(76% 0.15 152);
+    --good-dim: oklch(24% 0.055 152);
+    --warn: oklch(80% 0.13 80);
+    --warn-dim: oklch(25% 0.055 80);
+    --bad: oklch(70% 0.17 25);
+    --bad-dim: oklch(24.5% 0.06 25);
+
+    --series-1: oklch(74% 0.14 255);
+    --series-2: oklch(74% 0.14 300);
+    --series-3: oklch(76% 0.12 195);
+    --series-4: oklch(75% 0.14 330);
+    --series-5: oklch(70% 0.11 225);
+    --series-6: oklch(78% 0.12 275);
+
+    --shadow-card: none;
+  }
+
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    @apply bg-bg text-fg font-sans;
+    font-size: 14px;
+    line-height: 1.55;
+  }
+
+  ::selection { background: var(--warn-dim); }
+
+  :focus-visible {
+    outline: 2px solid var(--link);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--border-2) transparent;
+  }
+}
+
+@layer components {
+  .card {
+    @apply bg-surface border border-line rounded-xl;
+    box-shadow: var(--shadow-card);
+  }
+
+  /* Buttons: monochrome primary (Vercel school), hairline secondary. */
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 h-[34px] px-3.5 rounded-lg
+           border border-line-2 bg-surface text-fg text-[13px] font-medium select-none
+           transition-colors duration-100 hover:bg-surface-2
+           active:scale-[0.985] disabled:opacity-40 disabled:pointer-events-none;
+  }
+  .btn-primary {
+    @apply bg-fg text-bg border-transparent hover:bg-fg hover:opacity-88;
+  }
+  .btn-danger {
+    @apply text-bad border-transparent bg-transparent hover:bg-bad-dim;
+  }
+  .btn-sm { @apply h-[28px] px-2.5 text-xs rounded-md; }
+
+  .input {
+    @apply w-full h-[36px] px-3 rounded-lg border border-line-2 bg-surface text-fg
+           text-[13.5px] placeholder:text-fg-3 transition-shadow
+           focus:outline-none focus:border-fg-3;
+  }
+  select.input {
+    @apply pr-8 appearance-none bg-no-repeat;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23888' stroke-width='1.5'%3E%3Cpath d='M4 6l4 4 4-4'/%3E%3C/svg%3E");
+    background-position: right 0.6rem center;
+    background-size: 1rem;
+  }
+  .label { @apply block text-xs font-medium text-fg-2 mb-1.5; }
+  .hint { @apply text-xs text-fg-2 leading-relaxed; }
+
+  /* Tiny mono chip for ids, ops and window periods — bordered, never filled. */
+  .chip {
+    @apply inline-flex items-center h-[20px] px-1.5 rounded-[5px] border border-line
+           font-mono text-[11px] text-fg-2 whitespace-nowrap;
+  }
+
+  .kbd {
+    @apply font-mono text-[11px] text-fg-2 bg-surface-2 border border-line rounded px-1.5 py-px;
+  }
+
+  /* Section heading: small, quiet, with room for a count. */
+  .section-title {
+    @apply flex items-baseline gap-2 text-[13px] font-semibold tracking-tight mb-3;
+  }
+  .section-count { @apply text-xs font-normal text-fg-3 tabular-nums; }
+
+  .skeleton {
+    @apply rounded animate-shimmer;
+    background: linear-gradient(90deg, var(--surface-2) 25%, var(--border) 37%, var(--surface-2) 63%);
+    background-size: 400% 100%;
+  }
+}
