@@ -80,3 +80,24 @@ fn a_relay_group_is_named_for_the_edge_it_serves() {
         edge::group_of("a", "g", "y", "z")
     );
 }
+
+/// A `store: kv` ceiling paces the node exactly as a gate-held one does — it is merely
+/// enforced from a local lease instead of from the state document. Excluding it sent a node
+/// whose only total-rate bound is a shared ceiling down the "nothing paces this" path, and
+/// its queue was then allowed to run deep: the shallow-window property that makes priority
+/// real, quietly lost.
+#[test]
+fn a_shared_ceiling_paces_a_node_like_any_other() {
+    let shared = spec(json!({
+        "name": "airbnb.ip", "version": 1,
+        "budgets": [
+            { "id": "egress", "cap": 1000, "periodSeconds": 10, "alignment": "calendar",
+              "store": "kv", "confidence": "inferred" }
+        ],
+        "lanes": [{ "name": "default", "cap": "ceiling", "concurrency": 8, "default": true }],
+        "cost": { "field": "httpCost", "default": 1, "max": 1 },
+        "pacing": { "leaseSeconds": 1, "batch": 200 }
+    }));
+    // 1000 per 10s = 100/s, two lease-windows of it.
+    assert_eq!(edge::window_for(&shared), 200);
+}

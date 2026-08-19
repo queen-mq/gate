@@ -148,8 +148,16 @@ lane, and answers with what it resolved. A change that re-founds the counters
 `PUT /v1/apps/{app}/targets` declares a whole SET and reaps what is missing —
 scoped to that application, so one team cannot delete another's targets.
 
-`GET` and `DELETE` on the same path read and remove one target. Deleting stops
-the runners and forgets the declaration; work already pushed stays in the broker.
+`GET` and `DELETE` on the same path read and remove one target. A delete is about the
+stored DECLARATION — it forgets that first, then stops the runners — so a spec whose
+provisioning keeps failing can still be removed, and a delete that could not reach the
+store is refused rather than undone by the next reconcile. The answer's `registered`
+says whether anything was running. Work already pushed stays in the broker.
+
+A declare answers `200` only when the spec is validated, provisioned AND stored. A
+store that will not take it is a `502` naming what happened: the target is running the
+new spec, it is not durable, and the next reconcile pass will put the stored one back.
+
 
 ### Push
 
@@ -167,10 +175,15 @@ the backlog instead of growing it.
 
 ```http
 GET /v1/apps/{app}/targets/{name}/lanes/{lane}/next?batch=100&wait_ms=1000
-→ { "items": [ { "id": "...", "payload": {...} } ], "lease": [...] }
+→ { "items": [ { "id": "...", "payload": {...} } ], "lease": [...],
+    "target": "airbnb", "lane": "bulk" }
 ```
 
-You get work only when the budget allows it. Long-polls until `wait_ms`.
+You get work only when the budget allows it. Long-polls until `wait_ms`. The answer
+names the `target` and `lane` to settle it as — which matters for a graph, where the
+node you popped is `messages` and the target is `airbnb.messages`. An ack that names
+something else settles the work and tells you what it could not do with it.
+
 
 ```http
 POST /v1/leases/ack
@@ -318,3 +331,23 @@ cargo build --release
 
 The console is compiled into the binary, so `ui/dist` must exist before the Rust
 build. `docker build` does both.
+
+## Test
+
+```bash
+cargo test
+```
+
+The live suite is `#[ignore]`d, so that run reports it as ignored rather than as
+passed: those tests need a broker, and a suite that silently verifies nothing is
+worse than one that says it did not run. With a queen to point at:
+
+```bash
+GATE_TEST_QUEEN_URL=http://127.0.0.1:6632 cargo test -- --include-ignored
+```
+
+CI runs exactly that against a real broker
+([.github/workflows/test.yml](.github/workflows/test.yml)), with
+`GATE_TEST_REQUIRE_LIVE=1` so a missing broker fails the build instead of skipping
+the only tests that cover the relay, the reconcile and the retro path.
+

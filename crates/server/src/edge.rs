@@ -80,23 +80,32 @@ pub struct Leg {
 /// the limiter. Two windows so there is always a lease's worth of work in front of
 /// the gate while the relay is between loops.
 pub fn window_for(dest: &TargetSpec) -> u64 {
-    // UNSCOPED budgets only. A scoped budget's rate is per key — a hundred photo
-    // deletions per listing per week is not "one item per six thousand seconds of
-    // node throughput" — and sizing the window on it collapses the window to one
-    // item, which stalls the relay: the depth it compares against is the whole
-    // node's, so a single item waiting anywhere stops everything.
+    // UNSCOPED budgets, whichever store holds them.
+    //
+    // Unscoped, because a scoped budget's rate is per key — a hundred photo deletions per
+    // listing per week is not "one item per six thousand seconds of node throughput" — and
+    // sizing the window on it collapses the window to one item, which stalls the relay:
+    // the depth it compares against is the whole node's, so one item waiting anywhere
+    // would stop everything.
+    //
+    // Either store, because a `store: kv` ceiling bounds this node's total rate exactly as
+    // a gate-held one does; it is merely enforced from a local lease instead of from the
+    // state document. Excluding it sent a node whose only total-rate bound is a shared
+    // ceiling down the "nothing paces this" path and let its queue run deep, which is the
+    // shallow-window property that makes priority real.
     let per_sec = dest
         .budgets
         .iter()
-        .filter(|b| b.store == gate_core::Store::Gate && b.scope.is_empty())
+        .filter(|b| b.scope.is_empty())
         .map(|b| b.rate_per_sec())
         .fold(0.0f64, f64::max);
     if per_sec <= 0.0 {
-        // Nothing here bounds the node's total rate — it has no budget at all, or
-        // only per-key ones. The relay is then not the pacer and must not pretend to
-        // be: a cycle's worth of work per gate runner, so every shard can be fed.
+        // Nothing here bounds the node's total rate — it has no budget at all, or only
+        // per-key ones. The relay is then not the pacer and must not pretend to be: a
+        // cycle's worth of work per gate runner, so every shard can be fed.
         return (dest.pacing.batch.max(1) as u64).saturating_mul(dest.shard_count() as u64);
     }
+
     ((2.0 * per_sec * dest.pacing.lease_seconds.max(1) as f64).ceil() as u64).max(1)
 }
 
@@ -127,6 +136,8 @@ pub fn spawn(queen: Queen, depths: Arc<Depths>, plan: Plan) -> Arc<RelayRuntime>
         window,
         forwarded: Default::default(),
         unroutable: Default::default(),
+        duplicates: Default::default(),
+
         cancel: queen_mq::Cancel::new(),
     });
 
@@ -174,7 +185,18 @@ pub fn spawn(queen: Queen, depths: Arc<Depths>, plan: Plan) -> Arc<RelayRuntime>
                     break;
                 }
                 for lane in &leg.spec.lanes {
-                    if allowance == 0 {
+                    // Drain this lane until the window closes or it runs dry.
+                    //
+                    // One pop per pass was not strict priority: with a window wider than
+                    // a single forward (the plan's own `ip` node allows 300, a forward
+                    // carries at most 200) the REMAINING allowance went to the next
+                    // priority while this leg still had a backlog — a third of the
+                    // throughput handed to bulk under sustained load on both legs. An
+                    // EMPTY read is the only unambiguous "nothing left here": a short one
+                    // can mean the partitions this pop happened to claim are drained
+                    // while others still hold work.
+                    'drain: loop {
+                    if allowance == 0 || task.cancel.is_cancelled() {
                         break;
                     }
                     let take = allowance.min(MAX_FORWARD) as i32;
@@ -209,11 +231,11 @@ pub fn spawn(queen: Queen, depths: Arc<Depths>, plan: Plan) -> Arc<RelayRuntime>
                                 error = %e,
                                 "relay could not claim"
                             );
-                            continue;
+                            break 'drain;
                         }
                     };
                     if msgs.is_empty() {
-                        continue;
+                        break 'drain;
                     }
 
                     let mut tx = queen.transaction();
@@ -287,7 +309,7 @@ pub fn spawn(queen: Queen, depths: Arc<Depths>, plan: Plan) -> Arc<RelayRuntime>
                         // A half-built transaction would settle some messages and
                         // forward others; dropping it settles nothing, and the
                         // leases lapse in seconds.
-                        continue;
+                        break 'drain;
                     }
                     match tx.commit().await {
 
@@ -306,14 +328,42 @@ pub fn spawn(queen: Queen, depths: Arc<Depths>, plan: Plan) -> Arc<RelayRuntime>
                         // is retried one item at a time, and the one that is already
                         // downstream is simply acked.
                         Err(e) if e.to_string().contains("QDUP") => {
+                            task.duplicates.fetch_add(1, Ordering::Relaxed);
                             tracing::warn!(
                                 edge = %format!("{} -> {}", leg.node, plan.dest_node),
                                 "relay: an item was already forwarded; settling the batch one at a time"
                             );
+
                             for m in &msgs {
+                                // An item the destination cannot route gets the same
+                                // treatment it gets on the batch path — dead-lettered
+                                // with the reason. Skipping it here left it holding a
+                                // lease until expiry and settled only by some later
+                                // clean batch, which is a different answer to the same
+                                // question depending on how the relay got here.
                                 let Some(partition) =
                                     partition_for(&plan.dest, &dest_lane, &m.data)
                                 else {
+                                    if queen
+                                        .transaction()
+                                        .nack(
+                                            m,
+                                            format!(
+                                                "gate: `{}` shards by `{}` and this item carries none",
+                                                plan.dest_node,
+                                                plan.dest
+                                                    .shard_by
+                                                    .map(|d| d.as_str())
+                                                    .unwrap_or("?")
+                                            ),
+                                        )
+                                        .commit()
+                                        .await
+                                        .is_ok()
+                                    {
+                                        task.unroutable.fetch_add(1, Ordering::Relaxed);
+                                        moved += 1;
+                                    }
                                     continue;
                                 };
                                 let one = queen.transaction().ack(m).push_item(TxnPushItem {
@@ -347,13 +397,18 @@ pub fn spawn(queen: Queen, depths: Arc<Depths>, plan: Plan) -> Arc<RelayRuntime>
                             }
                         }
                         // Nothing was settled and nothing was pushed. The lease
-                        // expires in seconds and the batch comes back.
-                        Err(e) => tracing::warn!(
-                            edge = %format!("{} -> {}", leg.node, plan.dest_node),
-                            error = %e,
-                            "relay transaction did not commit; the batch will be redelivered"
-                        ),
-
+                        // expires in seconds and the batch comes back; this pass stops
+                        // draining the leg rather than hammering a broker that just
+                        // refused it.
+                        Err(e) => {
+                            tracing::warn!(
+                                edge = %format!("{} -> {}", leg.node, plan.dest_node),
+                                error = %e,
+                                "relay transaction did not commit; the batch will be redelivered"
+                            );
+                            break 'drain;
+                        }
+                    }
                     }
                 }
             }

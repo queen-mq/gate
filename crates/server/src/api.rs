@@ -352,10 +352,26 @@ async fn declare_locked(app: &Shared, spec: TargetSpec) -> ApiResult {
     // for ever.
     match crate::store::save(&app.queen, &spec).await {
         Ok(()) => rt.persisted.store(true, std::sync::atomic::Ordering::Relaxed),
-        // NOT persisted, and marked as such: the reconcile loop removes a target
-        // the store no longer holds, and it must not read this as a delete.
-        Err(e) => tracing::warn!(target_name = %spec.name, error = %e, "declared but not persisted"),
+        // A declare that did not persist is not a declare that happened.
+        //
+        // It used to warn and answer 200. With a reconcile loop that is a lie with a
+        // fifteen-second fuse: the store still holds the previous spec, so the very next
+        // pass restarts this target on it and the change the caller was told had landed is
+        // gone. The runtime keeps serving the new spec until then — tearing it down would
+        // add an outage to a failed write — but the caller is told, so it can retry.
+        Err(e) => {
+            tracing::warn!(target_name = %spec.name, error = %e, "declared but not persisted");
+            return Err(Fail(
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "`{name}` is running this spec but it could not be stored ({e}), so it is NOT \
+                     durable: the next reconcile pass will restart it on the stored one. Retry the \
+                     declare"
+                ),
+            ));
+        }
     }
+
 
     Ok(Json(json!({
 
@@ -550,13 +566,17 @@ async fn remove_target(app: &Shared, application: &str, name: &str) -> ApiResult
             ));
         }
     }
-    if app.registry.get(application, name).is_none() {
-        return Err(Fail(
-            StatusCode::NOT_FOUND,
-            format!("no target `{application}/{name}`"),
-        ));
-    }
+    // Whether anything is RUNNING is not the question a delete asks.
+    //
+    // A stored spec whose provisioning keeps failing never reaches the registry, so a
+    // lookup-first delete answered 404 and never touched the store — while the reconcile
+    // loop retried that same spec every fifteen seconds, for ever. There was no way to
+    // remove it through the API at all. So the stored declaration is what a delete is
+    // about, and the runtime is stopped if there is one.
+    let registered = app.registry.get(application, name).is_some();
+
     // The store FIRST, and a failure there refuses the delete.
+
     //
     // The store is what the fleet reconciles against: a target dropped from this
     // registry but still in the store comes back here within one interval and never
@@ -573,14 +593,14 @@ async fn remove_target(app: &Shared, application: &str, name: &str) -> ApiResult
                 ),
             )
         })?;
-    match app.registry.remove(application, name) {
-        Some(rt) => {
-            supervisor::stop_with(&app.queen, &rt).await;
-            Ok(Json(json!({ "ok": true })).into_response())
-        }
-        None => Ok(Json(json!({ "ok": true })).into_response()),
+    if let Some(rt) = app.registry.remove(application, name) {
+        supervisor::stop_with(&app.queen, &rt).await;
     }
+    // `registered: false` is the interesting case, and it is a success: the declaration is
+    // gone from the store, which is what stops it coming back.
+    Ok(Json(json!({ "ok": true, "registered": registered })).into_response())
 }
+
 
 
 
@@ -639,7 +659,28 @@ async fn do_push(
 /// the relay, and the item is then executed by the caller AND forwarded by the
 /// graph). Reaching a node through the target path would bypass both, and the
 /// entry stamp a breach rule reads.
+/// A runtime whose runners have been cancelled must not be handed a caller.
+///
+/// Provisioning is stop-then-start, so this is the window a swap opens; it outlives the
+/// swap when a restore fails. Answering "not available" is recoverable — the reconcile
+/// loop repairs it on its next pass — where accepting a push into a queue nothing
+/// drains is not.
+fn refuse_if_stopped(rt: &Arc<TargetRuntime>) -> Result<(), Fail> {
+    if rt.is_running() {
+        return Ok(());
+    }
+    Err(Fail(
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!(
+            "`{}/{}` is not running: its runners were stopped and not replaced. It will be brought \
+             back by the next reconcile pass",
+            rt.spec.application, rt.spec.name
+        ),
+    ))
+}
+
 fn refuse_graph_node(rt: &Arc<TargetRuntime>, verb: &str) -> Result<(), Fail> {
+
     match &rt.graph {
         None => Ok(()),
         Some(key) => {
@@ -668,9 +709,11 @@ async fn push_into(
     meta: Option<Value>,
 ) -> ApiResult {
     let name = &rt.spec.name;
+    refuse_if_stopped(rt)?;
     if rt.spec.lane(lane).is_none() {
         return Err(Fail(StatusCode::NOT_FOUND, format!("no lane `{lane}` on `{name}`")));
     }
+
 
     let cost = body.cost.unwrap_or(rt.spec.cost.default);
     if cost > rt.spec.cost.max {
@@ -780,7 +823,9 @@ async fn do_next(
 /// The pop itself, with no ownership rule attached: a graph route has already
 /// decided that this node is one a caller may consume.
 async fn next_from(app: &Shared, rt: &Arc<TargetRuntime>, lane: &str, q: NextQuery) -> ApiResult {
+    refuse_if_stopped(rt)?;
     let l = rt
+
         .spec
         .lane(lane)
         .ok_or_else(|| Fail(StatusCode::NOT_FOUND, format!("no lane `{lane}`")))?;
@@ -817,6 +862,15 @@ async fn next_from(app: &Shared, rt: &Arc<TargetRuntime>, lane: &str, q: NextQue
         // Opaque, and deliberately so: it carries what the ack needs, so any
         // replica can settle it. The caller never parses it.
         "lease": serde_json::to_value(&msgs).unwrap_or(Value::Null),
+        // What to ack this work as.
+        //
+        // Not decoration: the ack is keyed on the TARGET name, and for a graph node
+        // that is `{graph}.{node}` — a name the caller never typed, because it popped a
+        // NODE. Naming it wrongly used to settle the work with the meter and the breach
+        // rules silently skipped, so the answer now carries it and nobody has to
+        // reconstruct it from the declare response.
+        "target": rt.spec.name,
+        "lane": lane,
     }))
     .into_response())
 }
@@ -880,6 +934,99 @@ fn is_duplicate(e: &queen_mq::Error) -> bool {
     e.to_string().contains("QDUP")
 }
 
+/// A transactional ack the broker refused because the lease has gone — the message was
+/// settled already, or its lease lapsed while the handler ran.
+///
+/// Inside a transaction this is an EXCEPTION ("ack soft failures escalate", queen
+/// `005_log_ack.sql`), where a plain `ack_all` of the same message is a tolerated
+/// noop. Recovery leans on that difference rather than on retrying the strict path.
+fn is_stale_lease(e: &queen_mq::Error) -> bool {
+    let s = e.to_string();
+    s.contains("QTXN") || s.contains("invalid or expired lease")
+}
+
+
+/// What a one-at-a-time settlement did.
+struct Settled {
+    /// Re-entries this call actually pushed.
+    retried: usize,
+    /// Items whose re-entry was already downstream — the duplicate that sent us here.
+    already: usize,
+}
+
+/// Settle a batch message by message, each with its own re-entry.
+///
+/// The recovery for a duplicate inside the bundle. One item's re-entry being already
+/// downstream must not cost another item its own: an ack settles a PREFIX, so a
+/// caller finishing a lease necessarily re-sends what it already settled, and mixing
+/// a stale prefix with a fresh item in one transaction is the normal case rather than
+/// a pathological one.
+///
+/// The measurement event rides the first item's transaction, so it stays atomic with
+/// an ack in every path — the meter under-reading is its own silent failure, and a
+/// recovery path is no place to introduce one.
+async fn settle_item_by_item(
+    app: &Shared,
+    target: &Arc<TargetRuntime>,
+    slice: &[Message],
+    retro: &Retro,
+    event: &Value,
+) -> Result<Settled, Fail> {
+    let mut out = Settled { retried: 0, already: 0 };
+    let mut event_landed = false;
+
+    for m in slice {
+        let push = retro
+            .pushes
+            .iter()
+            .find(|(id, _)| id == &m.id)
+            .map(|(_, p)| p.clone());
+
+        // The event goes with the first message that settles cleanly.
+        let with_event = !event_landed;
+        let mut tx = app.queen.transaction().ack(m);
+        if with_event {
+            tx = tx
+                .push(target.spec.calls_queue(), event.clone())
+                .map_err(|e| Fail(StatusCode::BAD_GATEWAY, e.to_string()))?;
+        }
+        if let Some(p) = &push {
+            tx = tx
+                .push_item(p.clone())
+                .map_err(|e| Fail(StatusCode::BAD_GATEWAY, e.to_string()))?;
+        }
+        match tx.commit().await {
+            Ok(_) => {
+                event_landed |= with_event;
+                if push.is_some() {
+                    out.retried += 1;
+                }
+            }
+            // This item was settled by an earlier copy of this ack — either its
+            // re-entry is already downstream (`QDUP` on our push) or its lease is
+            // already gone (`QTXN`, because an ack soft failure inside a transaction
+            // escalates to an exception while a plain ack of a settled message is a
+            // tolerated noop). Both say the same thing, so it is settled the tolerant
+            // way and the next item gets its own chance — including the chance to
+            // carry the measurement event.
+            Err(e) if is_duplicate(&e) || is_stale_lease(&e) => {
+                app.queen
+                    .ack_all(std::slice::from_ref(m))
+                    .await
+                    .map_err(|e| Fail(StatusCode::BAD_GATEWAY, e.to_string()))?;
+                out.already += 1;
+            }
+            Err(e) => return Err(Fail(StatusCode::BAD_GATEWAY, e.to_string())),
+        }
+    }
+    // The event is deliberately NOT pushed when nothing settled through a live lease:
+    // this ack has been made before, and its calls are already in the meter. Pushing it
+    // again would report the same work twice.
+    let _ = event_landed;
+    Ok(out)
+}
+
+
 fn default_outcome() -> String {
     "ok".to_string()
 
@@ -899,6 +1046,26 @@ async fn ack(State(app): State<Shared>, Json(body): Json<AckBody>) -> ApiResult 
         .target
         .as_ref()
         .and_then(|t| app.registry.get(&application, t));
+    // A target named but not found is a naming mistake, and it used to pass in
+    // silence: the lookup failed, the ack fell through to a plain settlement with a
+    // 200, and everything hanging off the target went with it — no calls event for the
+    // meter, no breach rule, so an `outcome: throttled` was settled with no re-entry
+    // and the vendor-refused call was dropped for good.
+    //
+    // The work HAS been made by the time this arrives, so refusing to settle it would
+    // have it made twice. It is settled, and the answer says what was skipped — the
+    // same contract the retro refusals already use. A graph node is the likely case,
+    // so the message names how those are addressed.
+    let unknown_target = match (&body.target, &rt) {
+        (Some(name), None) => Some(format!(
+            "no target `{application}/{name}`: the work was settled, but nothing that hangs off the \
+             target was applied — no calls event for the meter and no breach rule, so a throttled \
+             item was NOT re-entered. A graph node is the target `{{graph}}.{{node}}`, which a `next` \
+             now returns as `target`",
+        )),
+        _ => None,
+    };
+
 
     // A vendor throttle routed back into the graph, paced instead of amplified.
     //
@@ -937,7 +1104,11 @@ async fn ack(State(app): State<Shared>, Json(body): Json<AckBody>) -> ApiResult 
     });
 
     let mut already_re_entered = false;
+    // How many re-entries this ack actually made. It differs from what was PLANNED
+    // only on the recovery path below, where some of them were already downstream.
+    let mut retried_now = retro.pushes.len();
     match (&event, &rt) {
+
         (Some(ev), Some(target)) => {
             let mut tx = app.queen.transaction();
             for m in slice {
@@ -946,30 +1117,34 @@ async fn ack(State(app): State<Shared>, Json(body): Json<AckBody>) -> ApiResult 
             tx = tx
                 .push(target.spec.calls_queue(), ev.clone())
                 .map_err(|e| Fail(StatusCode::BAD_GATEWAY, e.to_string()))?;
-            for item in &retro.pushes {
+            for (_, item) in &retro.pushes {
                 tx = tx
                     .push_item(item.clone())
                     .map_err(|e| Fail(StatusCode::BAD_GATEWAY, e.to_string()))?;
             }
+
             match tx.commit().await {
                 Ok(_) => {}
-                // A re-entry this ack has already made.
+                // At least one re-entry in this bundle is already downstream.
                 //
                 // A duplicate transaction id is a soft verdict for a plain push and a
                 // HARD one inside a transaction — the broker raises `QDUP` and rolls
                 // the whole bundle back (queen `005_log_ack.sql`: "a duplicate is a
                 // SOFT verdict for plain pushes but a HARD error inside a
-                // transaction"). The retro push is keyed `{txn}:r{attempt}`, so this
-                // means exactly one thing: this ack has been sent before, the retry is
-                // already waiting for budget, and all that is left to do is settle.
-                // Failing here instead would leave a caller retrying an ack that can
-                // never succeed until its lease lapses — and then doing the work again.
+                // transaction"). It says nothing about the OTHER items: an ack is
+                // positional, so settling the rest of a lease re-sends the prefix that
+                // was already settled, and one duplicated prefix push would otherwise
+                // take a brand new item's re-entry down with it — a call the vendor
+                // refused and nobody would make again.
+                //
+                // So the batch is settled one message at a time, each with its own
+                // re-entry, which is the same recovery the relay makes for the same
+                // error.
                 Err(e) if is_duplicate(&e) => {
-                    already_re_entered = true;
-                    app.queen
-                        .ack_all(slice)
-                        .await
-                        .map_err(|e| Fail(StatusCode::BAD_GATEWAY, e.to_string()))?;
+                    let settled =
+                        settle_item_by_item(&app, target, slice, &retro, ev).await?;
+                    already_re_entered = settled.already > 0;
+                    retried_now = settled.retried;
                 }
                 Err(e) => return Err(Fail(StatusCode::BAD_GATEWAY, e.to_string())),
             }
@@ -994,9 +1169,14 @@ async fn ack(State(app): State<Shared>, Json(body): Json<AckBody>) -> ApiResult 
             if body.outcome == "throttled" {
                 s.throttled += 1;
             }
-            s.retried += if already_re_entered { 0 } else { retro.pushes.len() as u64 };
-
-            s.exhausted += retro.exhausted;
+            s.retried += retried_now as u64;
+            // An ack that turns out to have been sent before counted all of this the
+            // first time. Counting it again would inflate an abandonment figure an
+            // operator reads as "work we gave up on", so a replay adds nothing —
+            // under-counting a duplicate rather than inventing one.
+            if !already_re_entered {
+                s.exhausted += retro.exhausted;
+            }
         }
         if body.outcome == "throttled" {
             *t.last_breach.write() =
@@ -1005,7 +1185,13 @@ async fn ack(State(app): State<Shared>, Json(body): Json<AckBody>) -> ApiResult 
         // Traces, because a retry that is paced looks like nothing at all from the
         // outside: the queue simply takes longer to drain. These are the only record
         // that a vendor refused work this gate had admitted and what became of it.
-        for outcome in retro.traces {
+        let traces: Vec<String> = if already_re_entered {
+            // One line saying so, rather than a second copy of the first ack's story.
+            vec!["replayed".to_string()]
+        } else {
+            retro.traces.clone()
+        };
+        for outcome in traces {
             app.meter.record_outcome(
                 &t.spec.key(),
                 &lane,
@@ -1020,30 +1206,48 @@ async fn ack(State(app): State<Shared>, Json(body): Json<AckBody>) -> ApiResult 
     Ok(Json(json!({
         "ok": true,
         "acked": n,
-        // Named, because a caller that acks `throttled` and sees `retried: 0` is
-        // looking at a graph with no breach rule, and that is worth knowing.
-        // Zero when the re-entry was already made by an earlier copy of this same
-        // ack: the caller is not being told a retry happened twice.
-        "retried": if already_re_entered { 0 } else { retro.pushes.len() },
+        // What this ack DID, not what it planned: a caller that acks `throttled` and
+        // sees `retried: 0` is either looking at a graph with no breach rule or at a
+        // re-entry that was already made, and `refused` says which.
+        "retried": retried_now,
         "exhausted": retro.exhausted,
         "unroutable": retro.unroutable,
-        "refused": if already_re_entered {
-            Some("this ack had already been settled; its re-entry is already waiting for budget"
-                .to_string())
+        "refused": if let Some(unknown) = &unknown_target {
+            Some(unknown.clone())
+        } else if already_re_entered {
+            Some(format!(
+                "{} of this ack's re-entries were already waiting for budget: it had been settled \
+                 before",
+                retro.pushes.len() - retried_now
+            ))
         } else {
             retro.refused.clone()
         },
 
+        // Named so a caller does not have to learn it from the declare response: this
+        // is what an ack of work popped from this queue has to say it is settling.
+        "target": t_name(&rt),
     }))
-
     .into_response())
+}
+
+/// The target name an ack for this work must carry, echoed back so the data plane
+/// answers the question rather than only the control plane.
+fn t_name(rt: &Option<Arc<TargetRuntime>>) -> Option<String> {
+    rt.as_ref().map(|t| t.spec.name.clone())
 }
 
 /// What a breach rule does to one settled batch.
 #[derive(Default)]
 struct Retro {
-    /// One push per item that re-enters, already carrying its bumped attempt count.
-    pushes: Vec<TxnPushItem>,
+    /// One push per item that re-enters, already carrying its bumped attempt count,
+    /// paired with the id of the message it came from.
+    ///
+    /// Paired, because a duplicate is a hard error inside a transaction: when one
+    /// re-entry of a batch is already downstream the whole bundle rolls back, and the
+    /// only way not to lose the OTHERS is to settle each item with its own push.
+    pushes: Vec<(String, TxnPushItem)>,
+
     /// Items that had used up `maxAttempts` and are settled instead.
     exhausted: u64,
     /// Items a rule matched but that had nowhere to go — no entry could be resolved,
@@ -1210,16 +1414,20 @@ fn plan_retro(
             obj.insert(GATE_META.to_string(), meta);
         }
 
-        out.pushes.push(TxnPushItem {
-            queue: ns.push_queue(),
-            partition: Some(partition),
-            payload,
-            // The attempt is IN the id, so a replayed ack re-pushes the same
-            // re-entry and the broker's dedup collapses it — while a genuine second
-            // attempt is a different id and is not mistaken for one.
-            transaction_id: Some(format!("{}:r{next}", m.transaction_id)),
-            trace_id: None,
-        });
+        out.pushes.push((
+            m.id.clone(),
+            TxnPushItem {
+                queue: ns.push_queue(),
+                partition: Some(partition),
+                payload,
+                // The attempt is IN the id, so a replayed ack re-pushes the same
+                // re-entry and the broker refuses it as a duplicate — while a genuine
+                // second attempt is a different id and is not mistaken for one.
+                transaction_id: Some(format!("{}:r{next}", m.transaction_id)),
+                trace_id: None,
+            },
+        ));
+
         out.traces.push("retried".to_string());
     }
     out
@@ -1412,11 +1620,10 @@ async fn del_graph_default(State(st): State<Shared>, Path(name): Path<String>) -
 async fn remove_graph(st: &Shared, application: &str, name: &str) -> ApiResult {
     let _guard = st.declare_lock.lock().await;
     match crate::graph::remove(st, application, name).await {
-        Ok(true) => Ok(Json(json!({ "ok": true })).into_response()),
-        Ok(false) => Err(Fail(
-            StatusCode::NOT_FOUND,
-            format!("no graph `{application}/{name}`"),
-        )),
+        Ok(registered) => {
+            Ok(Json(json!({ "ok": true, "registered": registered })).into_response())
+        }
+
         Err(crate::graph::Refusal::Invalid(m)) => Err(Fail(StatusCode::UNPROCESSABLE_ENTITY, m)),
         Err(crate::graph::Refusal::Conflict(m)) => Err(Fail(StatusCode::CONFLICT, m)),
         Err(crate::graph::Refusal::Gateway(m)) => Err(Fail(StatusCode::BAD_GATEWAY, m)),

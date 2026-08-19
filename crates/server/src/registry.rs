@@ -61,7 +61,16 @@ pub struct TargetRuntime {
     /// failed would look exactly like that, so it is marked instead and the
     /// reconcile retries the save rather than tearing down a live target.
     pub persisted: AtomicBool,
+    /// Set the moment this runtime's runners are cancelled.
+    ///
+    /// A target that is registered but stopped is the one unrecoverable state in this
+    /// server: it accepts pushes and admits nothing, for ever, and every route that
+    /// gates on "is it in the registry" would serve it. Provisioning is stop-then-start,
+    /// so the state exists for as long as a swap takes and outlives it whenever a
+    /// restore fails — this is what makes it visible instead of implied.
+    pub stopped: AtomicBool,
     pub lanes: HashMap<String, Arc<LaneRuntime>>,
+
 
     /// Last state document seen by the gate, per lane. A copy, for reading
     /// utilisation without a round trip; the authority is always Postgres.
@@ -97,6 +106,12 @@ pub struct RelayRuntime {
     /// Items a relay could not route: a destination sharded by a dimension the
     /// item does not carry. Nacked with a reason rather than dropped.
     pub unroutable: AtomicU64,
+    /// Batches this relay found already partly forwarded, and settled one item at a
+    /// time instead. Should be zero; it is here because "should be" is not a
+    /// measurement, and because a recovery path nobody can see is a recovery path
+    /// nobody knows ran.
+    pub duplicates: AtomicU64,
+
     pub cancel: queen_mq::Cancel,
 }
 
@@ -107,6 +122,10 @@ impl RelayRuntime {
     pub fn unroutable(&self) -> u64 {
         self.unroutable.load(Ordering::Relaxed)
     }
+    pub fn duplicates(&self) -> u64 {
+        self.duplicates.load(Ordering::Relaxed)
+    }
+
 }
 
 /// A declared graph and the relays that make its edges real.
@@ -122,8 +141,17 @@ pub struct GraphRuntime {
     pub persisted: AtomicBool,
 }
 
+impl TargetRuntime {
+    /// Whether this runtime is still draining its queues. A caller must never be
+    /// pointed at one that is not.
+    pub fn is_running(&self) -> bool {
+        !self.stopped.load(Ordering::Relaxed)
+    }
+}
+
 #[derive(Default)]
 pub struct Registry {
+
     targets: RwLock<HashMap<String, Arc<TargetRuntime>>>,
     graphs: RwLock<HashMap<String, Arc<GraphRuntime>>>,
 }

@@ -150,6 +150,8 @@ function nodeState(n) {
             <th class="font-normal pb-1.5">window</th>
             <th class="font-normal pb-1.5">relayed</th>
             <th class="font-normal pb-1.5">unroutable</th>
+            <th class="font-normal pb-1.5">already there</th>
+
           </tr>
         </thead>
         <tbody>
@@ -163,6 +165,13 @@ function nodeState(n) {
             <td class="py-2 tabular-nums" :class="r.unroutable ? 'text-bad' : 'text-fg-3'">
               {{ num(r.unroutable) }}
             </td>
+            <!-- Batches this relay found part-forwarded and settled one item at a time.
+                 Should be zero; visible because a recovery nobody can see is a recovery
+                 nobody knows ran. -->
+            <td class="py-2 tabular-nums" :class="r.duplicates ? 'text-warn' : 'text-fg-3'">
+              {{ num(r.duplicates) }}
+            </td>
+
           </tr>
         </tbody>
       </table>

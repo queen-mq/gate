@@ -40,8 +40,27 @@ impl Depths {
                 return v.clone();
             }
         }
-        self.pending_now(queen, queue).await
+        match self.try_pending_now(queen, queue).await {
+            Some(v) => v,
+            // The broker did not answer. Serve the last thing it DID say rather than a
+            // zero, and stamp it so an outage costs one round trip per TTL instead of one
+            // per caller: a console polling every few seconds across a dozen targets would
+            // otherwise hammer an admin API that is already unhappy.
+            None => {
+                let stale = self
+                    .cache
+                    .read()
+                    .get(queue)
+                    .map(|(v, _)| v.clone())
+                    .unwrap_or_default();
+                self.cache
+                    .write()
+                    .insert(queue.to_string(), (stale.clone(), Instant::now()));
+                stale
+            }
+        }
     }
+
 
     /// The same read with the cache skipped, and the answer left in it.
     ///

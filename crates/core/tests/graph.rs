@@ -543,3 +543,25 @@ fn a_named_re_entry_must_be_able_to_admit_what_it_receives() {
     let problems = validate_graph(&parse(v));
     assert!(!problems.iter().any(|p| p.rule == "retry-cost"), "{problems:?}");
 }
+
+#[test]
+fn the_cost_field_refusal_names_each_field_once() {
+    // Deduplicating a name-ordered list only removes neighbours, so `a: x, b: y, c: x`
+    // reported three fields and listed one of them twice. The refusal was right; what it
+    // said about the document was not.
+    let mut v = chain();
+    v["nodes"]["mid"] = json!({
+        "budgets": [{ "id": "m", "cap": 100, "periodSeconds": 10, "alignment": "rolling",
+                      "confidence": "inferred" }],
+        "cost": { "field": "weight", "default": 1, "max": 1 }
+    });
+    v["edges"] = json!([{ "from": "messages", "to": "mid" }, { "from": "mid", "to": "ip" }]);
+    let problems = validate_graph(&parse(v));
+    let field = problems
+        .iter()
+        .find(|p| p.rule == "cost-field")
+        .expect("the graph names two fields");
+    assert!(field.detail.contains("name 2 different"), "{}", field.detail);
+    assert!(field.detail.contains("`httpCost` in ip, messages"), "{}", field.detail);
+    assert!(field.detail.contains("`weight` in mid"), "{}", field.detail);
+}

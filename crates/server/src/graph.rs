@@ -36,30 +36,53 @@ pub enum Refusal {
     Gateway(String),
 }
 
+/// Who asked for this declare, which decides two things: whether the document is
+/// written back, and whether a migration-class change needs a version bump.
+#[derive(Clone, Copy, PartialEq)]
+enum Source {
+    /// A caller's `PUT`. The document is new to the cell, so both rules apply.
+    Caller,
+    /// The store, on a boot restore or a reconcile pass. The document is already
+    /// authoritative — some other replica's declare was accepted — so neither applies.
+    Store,
+}
+
 /// Declare a graph, atomically, as a caller asked. The caller holds the declare lock.
 pub async fn declare(app: &Shared, spec: GraphSpec) -> Result<Arc<GraphRuntime>, Refusal> {
-    declare_with(app, spec, true).await
+    declare_with(app, spec, Source::Caller).await
 }
+
 
 /// Bring up a graph the STORE already holds — a boot restore, or a reconcile pass
 /// applying another replica's declare.
 ///
-/// The difference is one write, and it matters: saving a document that came from the
-/// store re-creates it. A delete on another replica removes the document while this
-/// pass is half way through provisioning it, and the save at the end would resurrect
-/// the graph fleet-wide — the delete having been acknowledged.
+/// Two things differ from a caller's declare, and both are about the store being the
+/// authority rather than this process:
+///
+/// * the document is NOT written back. Saving a document that came from the store
+///   re-creates it, so a delete landing on another replica while this pass provisions
+///   would be undone — the delete having been acknowledged.
+/// * a migration-class change does NOT need a version bump. The bump rule protects a
+///   caller from re-founding counters by accident, and that judgement was already made
+///   where the declare was accepted. Enforcing it here against a replica-LOCAL runtime
+///   is how a replica wedges: a delete-and-redeclare at the same version is legal for
+///   the caller and refused for ever by every pod that still holds the old runtime,
+///   which is precisely the indefinite divergence the reconcile exists to end. Targets
+///   converge on the store for the same reason (their version check lives only in the
+///   API handler), and graphs must not be the exception.
 pub async fn declare_from_store(
     app: &Shared,
     spec: GraphSpec,
 ) -> Result<Arc<GraphRuntime>, Refusal> {
-    declare_with(app, spec, false).await
+    declare_with(app, spec, Source::Store).await
 }
 
 async fn declare_with(
     app: &Shared,
     spec: GraphSpec,
-    persist: bool,
+    source: Source,
 ) -> Result<Arc<GraphRuntime>, Refusal> {
+
 
     let problems = gate_core::validate_graph(&spec);
     if !problems.is_empty() {
@@ -118,10 +141,10 @@ async fn declare_with(
         }
     }
 
-    if let Some(old) = &previous {
+    if let (Source::Caller, Some(old)) = (source, &previous) {
         if gate_core::needs_graph_version_bump(&old.spec, &spec) && spec.version <= old.spec.version {
-
             return Err(Refusal::Conflict(format!(
+
                 "this change re-founds a counter or a path (a new partition starts at zero): bump \
                  version above {}",
                 old.spec.version
@@ -198,18 +221,30 @@ async fn declare_with(
 
     // Persisted only once it is actually up, like a target: a document saved for a
     // graph that failed to provision would come back on every boot and fail again.
-    if !persist {
+    if source == Source::Store {
         // It came FROM the store, so it is already there — and writing it back would
         // undo a delete that landed while this was provisioning.
         rt.persisted.store(true, Ordering::Relaxed);
         return Ok(rt);
     }
+
     match store::save_graph(&app.queen, &spec).await {
         Ok(()) => rt.persisted.store(true, Ordering::Relaxed),
-        Err(e) => tracing::warn!(graph = %spec.key(), error = %e, "declared but not persisted"),
+        // Same as a target: a document that did not persist is not durable, and the next
+        // reconcile pass restores the stored one over it. The graph keeps running so the
+        // failure costs no traffic, and the caller is told so it can retry.
+        Err(e) => {
+            tracing::warn!(graph = %spec.key(), error = %e, "declared but not persisted");
+            return Err(Refusal::Gateway(format!(
+                "graph `{}` is running but its document could not be stored ({e}), so it is NOT \
+                 durable: the next reconcile pass will restore the stored one. Retry the declare",
+                spec.name
+            )));
+        }
     }
     Ok(rt)
 }
+
 
 
 /// One relay per destination node, each draining its upstreams in priority order.
@@ -291,10 +326,27 @@ async fn rollback(
             Ok(restored) => {
                 app.registry.put(restored);
             }
-            Err(f) => tracing::error!(
-                graph = %old.spec.key(), node = %node, error = %f.error,
-                "could not restore a node after a failed declare"
-            ),
+            // The same contract the declare loop honours, and for the same reason: a
+            // runtime that could not be restarted has been STOPPED, and leaving it
+            // registered is the one unrecoverable state — the node accepts pushes and
+            // admits nothing, for ever, because every route gates on registry presence
+            // and not on liveness. Unregistered it refuses pushes instead, which the
+            // reconcile loop then repairs on its next pass.
+            Err(f) => {
+                match f.restored {
+                    Some(restored) => {
+                        app.registry.put(restored);
+                    }
+                    None => {
+                        app.registry.remove(&rt.spec.application, &rt.spec.name);
+                    }
+                }
+                tracing::error!(
+                    graph = %old.spec.key(), node = %node, error = %f.error,
+                    "could not restore a node after a failed declare"
+                );
+            }
+
         }
     }
     let relays = start_relays(app, &old.spec, &old.spec.node_specs());
@@ -308,9 +360,10 @@ async fn rollback(
 
 /// Stop the relays, stop the nodes, forget the document.
 pub async fn remove(app: &Shared, application: &str, name: &str) -> Result<bool, Refusal> {
-    if app.registry.graph(application, name).is_none() {
-        return Ok(false);
-    }
+    // Not conditional on a runtime existing: a document whose provisioning keeps failing
+    // is exactly the one an operator needs to delete, and it never reaches the registry.
+    let registered = app.registry.graph(application, name).is_some();
+
     // The document first: it is what the fleet reconciles against, so a graph torn
     // down here but left in the store comes back within one interval — and the other
     // replicas never stopped it at all.
@@ -322,17 +375,17 @@ pub async fn remove(app: &Shared, application: &str, name: &str) -> Result<bool,
                  ({e}), and it would come back on the next reconcile"
             ))
         })?;
-    let Some(g) = app.registry.remove_graph(application, name) else {
-        return Ok(false);
-    };
-    edge::stop_all(&g.relays).await;
-    for (_, ns) in g.spec.node_specs() {
-        if let Some(rt) = app.registry.remove(application, &ns.name) {
-            supervisor::stop_with(&app.queen, &rt).await;
+    if let Some(g) = app.registry.remove_graph(application, name) {
+        edge::stop_all(&g.relays).await;
+        for (_, ns) in g.spec.node_specs() {
+            if let Some(rt) = app.registry.remove(application, &ns.name) {
+                supervisor::stop_with(&app.queen, &rt).await;
+            }
         }
     }
-    Ok(true)
+    Ok(registered)
 }
+
 
 
 /// Stop a graph's relays and nodes without forgetting the document — what the
@@ -484,6 +537,8 @@ pub async fn view(app: &Shared, g: &Arc<GraphRuntime>) -> Value {
                 "window": r.window,
                 "forwarded": r.forwarded(),
                 "unroutable": r.unroutable(),
+                "duplicates": r.duplicates(),
+
             })
         })
         .collect();

@@ -70,8 +70,14 @@ pub struct Budget {
     pub matcher: Option<Match>,
     #[serde(default)]
     pub scope: Vec<Dim>,
+    /// How many scope keys this budget's counter is expected to hold at once.
+    ///
+    /// The LIVE set, not the set per window: a rolling budget reads its own window and the
+    /// one before it, so the state document carries up to two windows' worth of keys until
+    /// the older ones are swept. A number chosen per window will be met at twice itself.
     #[serde(default, rename = "maxKeys", skip_serializing_if = "Option::is_none")]
     pub max_keys: Option<u64>,
+
     #[serde(default)]
     pub store: Store,
     pub confidence: Confidence,

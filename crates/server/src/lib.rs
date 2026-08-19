@@ -115,21 +115,16 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // with the looser one winning, because the tighter pod simply admits less of
     // the same traffic. There is no reconcile in the broker to lean on: the specs
     // are the one thing gate owns.
-    tokio::spawn({
-        let app = app.clone();
-        async move {
-            let every = std::time::Duration::from_secs(
-                std::env::var("GATE_RECONCILE_SECONDS")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(15),
-            );
-            loop {
-                tokio::time::sleep(every).await;
-                reconcile(&app).await;
-            }
-        }
-    });
+    spawn_reconcile(
+        app.clone(),
+        std::time::Duration::from_secs(
+            std::env::var("GATE_RECONCILE_SECONDS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(15),
+        ),
+    );
+
 
 
     // Two listeners, the SAME router. The internal one has no authentication
@@ -173,6 +168,21 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         None => axum::serve(internal, internal_app).await?,
     }
     Ok(())
+}
+
+/// The loop itself, with its interval passed rather than read from the environment —
+/// so a test can drive the wiring (the task, the period, its turn at the declare lock)
+/// and not just the pass it performs.
+pub fn spawn_reconcile(
+    app: api::Shared,
+    every: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(every).await;
+            reconcile(&app).await;
+        }
+    })
 }
 
 /// Bring back everything that was declared, at boot.
@@ -258,9 +268,15 @@ pub async fn reconcile(app: &api::Shared) {
                     // a queue with no gate on it.
                     Some(spec)
                         if spec == g.spec
+                            // Running, not merely registered: a node whose restore
+                            // failed is registered-and-stopped or gone, and either way
+                            // this graph needs provisioning again.
                             && spec.node_specs().iter().all(|(_, ns)| {
-                                app.registry.get(&ns.application, &ns.name).is_some()
+                                app.registry
+                                    .get(&ns.application, &ns.name)
+                                    .is_some_and(|rt| rt.is_running())
                             }) => {}
+
 
                     Some(spec) => {
                         tracing::info!(graph = %spec.key(), "reconcile: re-declaring a graph that is changed or not fully up");

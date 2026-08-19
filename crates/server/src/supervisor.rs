@@ -84,6 +84,8 @@ pub async fn start(
         spec: spec.clone(),
         graph: owner,
         persisted: std::sync::atomic::AtomicBool::new(false),
+        stopped: std::sync::atomic::AtomicBool::new(false),
+
         lanes,
 
         last_state: RwLock::new(HashMap::new()),
@@ -199,9 +201,14 @@ pub struct SwapFailed {
 }
 
 pub async fn stop(rt: &Arc<TargetRuntime>) {
+    // Before the cancels, so nothing can observe a runtime whose runners are going away
+    // and still believe it is serving.
+    rt.stopped
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     for lane in rt.lanes.values() {
         lane.cancel.cancel();
     }
+
 
     if let Some(c) = rt.meter_cancel.read().as_ref() {
         c.cancel();

@@ -492,12 +492,16 @@ pub fn validate_graph(g: &GraphSpec) -> Vec<Problem> {
     // every relay forwards the payload verbatim, so a downstream node reading a
     // different field name finds nothing and charges its `cost.default` — a
     // hundred-call item counted as one, all the way to the vendor's ceiling.
-    let mut fields: Vec<(&str, &str)> = g
-        .nodes
-        .iter()
-        .map(|(name, n)| (name.as_str(), n.cost.field.as_str()))
-        .collect();
-    fields.dedup_by_key(|(_, f)| *f);
+    // Grouped by field, so the message names each DISTINCT field once with the nodes that
+    // ask for it. Deduplicating a name-ordered list only removes neighbours, which counted
+    // `a: x, b: y, c: x` as three fields and listed `x` twice.
+    let mut fields: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (name, n) in &g.nodes {
+        fields
+            .entry(n.cost.field.as_str())
+            .or_default()
+            .push(name.as_str());
+    }
     if fields.len() > 1 {
         out.push(p(
             "cost-field",
@@ -508,12 +512,13 @@ pub fn validate_graph(g: &GraphSpec) -> Vec<Problem> {
                 fields.len(),
                 fields
                     .iter()
-                    .map(|(n, f)| format!("`{n}`: {f}"))
+                    .map(|(f, nodes)| format!("`{f}` in {}", nodes.join(", ")))
                     .collect::<Vec<_>>()
-                    .join(", ")
+                    .join("; ")
             ),
         ));
     }
+
 
 
     // ---- G6: path length.

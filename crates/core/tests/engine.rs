@@ -439,3 +439,97 @@ fn the_busiest_key_is_what_a_scoped_budget_is_spending() {
     assert!((utilisation_max(&b, &state, now) - 0.9).abs() < 1e-9);
     assert_eq!(key_count(&b, &state), 2);
 }
+
+/// The plan's phase-5 test: per-shard state stays under its key bound across windows.
+///
+/// A shard IS a state document — one per push partition, each with its own gate runner and
+/// its own single writer — so the bound that matters is per document, and the sweep is what
+/// holds it there over time. Nothing combined sharding with expiry.
+///
+/// Two things are narrower than they first look, and the test says both rather than
+/// asserting a bound that is not there:
+///
+/// * `maxKeys / shards` is a MEAN. A hash ring does not promise an even split, so one
+///   document can sit above that figure while the declaration is honoured in aggregate.
+/// * a ROLLING budget reads its own window and the one before it, so a document holds up to
+///   two windows' worth of keys. `maxKeys` is therefore a statement about the live set, not
+///   about a single window.
+///
+/// What the sweep guarantees, and what the failure was, is the third assertion: the live set
+/// stops growing. Before it, a document gained one cell per key seen and never gave one back.
+#[test]
+fn a_sharded_budget_holds_its_key_bound_across_windows() {
+    const SHARDS: u32 = 8;
+    const MAX_KEYS: u64 = 400;
+    // Two windows of these have to fit inside the declaration, because two windows is what
+    // a rolling budget can still read.
+    const KEYS_PER_WINDOW: usize = 150;
+    let mut b = budget("per-listing", 5.0, 60, Alignment::Rolling);
+    b.scope = vec![Dim::Entity];
+    b.max_keys = Some(MAX_KEYS);
+    let mut s = spec(vec![b.clone()]);
+    s.shard_by = Some(Dim::Entity);
+    s.shards = Some(SHARDS);
+    // The declared shape is the one the validator accepts, or this proves nothing.
+    assert_eq!(validate(&s), vec![]);
+
+    // One document per shard, exactly as the runners hold them.
+    let mut states: Vec<Value> = (0..SHARDS).map(|_| json!({})).collect();
+    let period = 60_000i64;
+    let mut steady = None;
+
+    // Five windows of traffic, a fresh set of listings in each. Nothing ever revisits an old
+    // key, which is the pattern that used to grow the document without bound — `maxKeys` is
+    // checked once at declare time and never again.
+    for window in 0..5i64 {
+        for i in 0..KEYS_PER_WINDOW {
+            let key = format!("listing-{window}-{i}");
+            let shard = s.shard_of(&key) as usize;
+            let item = Item {
+                op: "photo.delete".into(),
+                cost: 1.0,
+                scope: vec![(Dim::Entity, key)],
+            };
+            // Denials are expected — five per listing per minute — and charge nothing.
+            let _ = decide(&s, None, &mut states[shard], period * (10 + window), &item);
+        }
+
+        // Every key lands in exactly one document: the shards partition the live set rather
+        // than each holding a copy of it, which is the whole single-writer argument.
+        let total: usize = states.iter().map(|st| key_count(&b, st)).sum();
+        let live_windows = (window + 1).min(2) as usize;
+        assert_eq!(
+            total,
+            KEYS_PER_WINDOW * live_windows,
+            "window {window}: the documents hold something other than the live set"
+        );
+        assert!(
+            total <= MAX_KEYS as usize,
+            "window {window}: {total} keys across the shards, above the {MAX_KEYS} declared"
+        );
+
+        // From the second window on it is a steady state, not a staircase.
+        if window >= 1 {
+            match steady {
+                None => steady = Some(total),
+                Some(before) => assert_eq!(
+                    total, before,
+                    "window {window}: the documents grew with history instead of holding the live set"
+                ),
+            }
+        }
+    }
+
+    // And what survives is the last two windows, not an accumulation of every window that
+    // ever ran.
+    for (shard, state) in states.iter().enumerate() {
+        let cells = state["b"]["per-listing"].as_object().cloned().unwrap_or_default();
+        assert!(
+            cells
+                .keys()
+                .all(|k| k.starts_with("listing-3-") || k.starts_with("listing-4-")),
+            "shard {shard} is still carrying a closed window's keys: {:?}",
+            cells.keys().take(3).collect::<Vec<_>>()
+        );
+    }
+}

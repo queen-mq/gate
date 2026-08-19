@@ -1,0 +1,103 @@
+name: Tests
+
+# The suite, against a REAL broker.
+#
+# This job exists because the alternative was a lie: the live tests skip when no
+# broker is configured, so a `cargo test` with nothing running is thirteen green
+# lines that verified nothing — and the parts only they can reach are the ones the
+# design rests on (a relay that is exactly-once, two replicas converging on the
+# store, a throttle that is paced rather than amplified, priority at a merge,
+# per-key limits across shards). So a broker is provided, and
+# `GATE_TEST_REQUIRE_LIVE` turns a missing one from a skip into a failure.
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      queen:
+        image: ghcr.io/queen-mq/queen:1.0.3
+        env:
+          PG_HOST: postgres
+          PG_PASSWORD: postgres
+          # kv holds the declared specs and the cross-target budgets: without it a
+          # declare cannot persist and the reconcile has nothing to reconcile against.
+          QUEEN_KV_ENABLED: "true"
+          # A consumer group created at the tail skips every message already waiting.
+          # Gate asks for `all` explicitly on every group it owns, so this is belt to
+          # that brace — and it is what the plan requires of the broker.
+          DEFAULT_SUBSCRIPTION_MODE: all
+        ports:
+          - 6632:6632
+
+    env:
+      GATE_TEST_QUEEN_URL: http://127.0.0.1:6632
+      # A missing broker is a red build here, never a skipped test.
+      GATE_TEST_REQUIRE_LIVE: "1"
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 22
+        cache: npm
+        cache-dependency-path: ui/package-lock.json
+
+    # The console is compiled into the binary by rust-embed, and a missing `ui/dist`
+    # is a macro error rather than a warning — so the Rust build cannot start until
+    # the console is built. That makes this a check on the console build too.
+    - name: Build the console
+      working-directory: ui
+      run: npm ci && npm run build
+
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy
+
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Wait for the broker
+      run: |
+        for i in $(seq 1 60); do
+          if curl -fsS http://127.0.0.1:6632/health > /dev/null; then
+            curl -fsS http://127.0.0.1:6632/health; echo; exit 0
+          fi
+          sleep 2
+        done
+        echo "queen did not become healthy" >&2
+        docker ps -a >&2
+        exit 1
+
+    - name: Clippy
+      run: cargo clippy --workspace --all-targets
+
+    # `--include-ignored`, because the live tests are ignored by default: a laptop
+    # without a broker should report them as ignored rather than as passed, and this
+    # is the job that actually runs them.
+    - name: Test
+      run: cargo test --workspace -- --include-ignored
+
+    - name: Release build
+      run: cargo build --release --workspace
