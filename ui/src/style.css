@@ -1,3 +1,17 @@
+/* `@import` has to lead the file — CSS drops one that appears after a rule, and
+   the @font-face blocks below are rules. `source(none)` turns off v4's
+   filesystem auto-detection and the two @source lines replace it: without them
+   Tailwind walks up to the repository root and scans the Rust crates as well. */
+@import 'tailwindcss' source(none);
+@source '../index.html';
+@source '../src/**/*.{vue,js}';
+
+/* Dark is a class on <html>, written there before first paint. v4 would
+   otherwise resolve `dark:` against prefers-color-scheme and disagree with the
+   toggle. Nothing uses the variant today; it stays declared so that the first
+   thing that does is right rather than subtly inverted. */
+@custom-variant dark (&:where(.dark, .dark *));
+
 /* The fonts are bundled, not fetched: the console is embedded in the binary and
    may run somewhere with no route to the internet. Latin subset only — the
    console's entire vocabulary is Latin, and the other subsets are 160 kB an
@@ -17,9 +31,60 @@
   src: url('@fontsource-variable/jetbrains-mono/files/jetbrains-mono-latin-wght-normal.woff2') format('woff2-variations');
 }
 
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+/* ------------------------------------------------------------------- theme
+   Every colour resolves through a CSS variable declared below, so light and
+   dark are one class on <html> and no component knows which it is in.
+   `inline` is what makes that work: it spends the utilities as
+   `var(--surface)` rather than as `var(--color-surface)`, so a token the
+   `.dark` block redefines takes effect at the point of use instead of being
+   frozen at the value :root happened to hold.
+
+   One convention carried over from the relay console, learned the hard way:
+   structural sizes (sidebar, control heights) are px literals in the markup,
+   so nothing about the layout depends on the root font size. The v3 ban on
+   opacity modifiers (`bg-good/30`) is lifted — v4 composes alpha over a
+   var() colour with color-mix() instead of silently emitting nothing. */
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-fg: var(--text);
+  --color-fg-2: var(--text-2);
+  --color-fg-3: var(--text-3);
+  --color-line: var(--border);
+  --color-line-2: var(--border-2);
+  --color-link: var(--link);
+  --color-good: var(--good);
+  --color-good-dim: var(--good-dim);
+  --color-warn: var(--warn);
+  --color-warn-dim: var(--warn-dim);
+  --color-bad: var(--bad);
+  --color-bad-dim: var(--bad-dim);
+}
+
+@theme {
+  --font-sans: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --ease-spring: cubic-bezier(0.16, 1, 0.3, 1);
+
+  --animate-in: in 0.2s cubic-bezier(0.16, 1, 0.3, 1) both;
+  --animate-shimmer: shimmer 1.4s ease infinite;
+  --animate-pulse2: pulse2 2.4s ease-in-out infinite;
+
+  @keyframes in {
+    from { opacity: 0; transform: translateY(4px); }
+    to { opacity: 1; transform: none; }
+  }
+  @keyframes shimmer {
+    0% { background-position: 100% 50%; }
+    100% { background-position: 0 50%; }
+  }
+  @keyframes pulse2 {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.35; }
+  }
+}
 
 /* ---------------------------------------------------------------- tokens
    A strictly neutral scale (the queenmq.com / Vercel school): gray carries the
@@ -51,7 +116,8 @@
     /* Categorical, for one line per application. Deliberately none of the
        semantic hues: green, amber and red mean healthy, elevated and breached
        everywhere else in this console, and a chart that spends them as identity
-       would have an application looking fine because of who it is. */
+       would have an application looking fine because of who it is. Read by name
+       from FlowChart.vue, so these stay plain variables and out of the theme. */
     --series-1: oklch(50% 0.17 255);
     --series-2: oklch(50% 0.16 300);
     --series-3: oklch(48% 0.13 195);
@@ -102,6 +168,13 @@
     line-height: 1.55;
   }
 
+  /* v3 preflight gave these a pointer and v4 leaves them at the browser
+     default, which reads as "not a control" on all 18 of them. */
+  button:not(:disabled),
+  [role='button']:not(:disabled) {
+    cursor: pointer;
+  }
+
   ::selection { background: var(--warn-dim); }
 
   :focus-visible {
@@ -140,7 +213,7 @@
   .input {
     @apply w-full h-[36px] px-3 rounded-lg border border-line-2 bg-surface text-fg
            text-[13.5px] placeholder:text-fg-3 transition-shadow
-           focus:outline-none focus:border-fg-3;
+           focus:outline-hidden focus:border-fg-3;
   }
   select.input {
     @apply pr-8 appearance-none bg-no-repeat;
@@ -158,7 +231,7 @@
   }
 
   .kbd {
-    @apply font-mono text-[11px] text-fg-2 bg-surface-2 border border-line rounded px-1.5 py-px;
+    @apply font-mono text-[11px] text-fg-2 bg-surface-2 border border-line rounded-sm px-1.5 py-px;
   }
 
   /* Section heading: small, quiet, with room for a count. */
@@ -168,7 +241,7 @@
   .section-count { @apply text-xs font-normal text-fg-3 tabular-nums; }
 
   .skeleton {
-    @apply rounded animate-shimmer;
+    @apply rounded-sm animate-shimmer;
     background: linear-gradient(90deg, var(--surface-2) 25%, var(--border) 37%, var(--surface-2) 63%);
     background-size: 400% 100%;
   }
