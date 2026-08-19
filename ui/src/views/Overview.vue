@@ -129,8 +129,9 @@ const status = computed(() => {
       <!-- ------------------------------------------------ status hero -->
       <section class="card px-6 py-6 md:px-7 flex flex-col md:flex-row md:items-center gap-6">
         <div class="flex-1 min-w-0">
-          <StatusDot :state="status.state" size="lg" :label="status.title" />
-          <p class="text-[13px] text-fg-2 mt-2 ml-[22.5px] max-w-[52ch] leading-relaxed">{{ status.sub }}</p>
+          <StatusDot :state="status.state" size="lg" :label="status.title" avatar>
+            <p class="text-[13px] text-fg-2 mt-2 ml-[22.5px] max-w-[52ch] leading-relaxed">{{ status.sub }}</p>
+          </StatusDot>
         </div>
         <!-- Admitted and denied stand side by side, in the same weight and the
              same colour, because they are two halves of one measurement: the
