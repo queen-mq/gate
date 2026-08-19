@@ -34,14 +34,27 @@ fn scope_of(data: &serde_json::Value) -> Vec<(Dim, String)> {
         .collect()
 }
 
+/// One runner for one lane, or one shard of one lane.
+///
+/// `shard` names a partition of the push queue, and the partition lease is the
+/// entire correctness argument: it makes each counter single-writer. Two runners
+/// on one partition would lose updates in silence, which is why the source is
+/// pinned and `max_partitions` is one — and why sharding is expressed as more
+/// partitions rather than as more runners on the same one.
 pub async fn spawn(
     queen: &Queen,
     meter: Arc<Meter>,
     target: Arc<TargetRuntime>,
     lane: Arc<LaneRuntime>,
+    shard: u32,
 ) -> Result<()> {
     let spec: TargetSpec = target.spec.clone();
     let lane_name = lane.name.clone();
+    // The push partition, which IS the lane name when the target is not sharded.
+    let partition = spec.push_partition(&lane_name, shard);
+    let shards_of_lane = spec.shard_count().max(1);
+
+
     let cost_field = spec.cost.field.clone();
     let cost_default = spec.cost.default;
 
@@ -54,23 +67,42 @@ pub async fn spawn(
     let gate_target = target.clone();
     let handle_target = target.clone();
     let gate_lane_name = lane_name.clone();
+    // The gate mirrors its state out per partition, not per lane: a shard is its
+    // own document and folding them together would report one shard's spend as the
+    // node's.
+    let gate_state_key = partition.clone();
     let gate_meter = meter.clone();
     let gate_pools = target.pools.clone();
     let gate_target_name = spec.key();
 
     let source = queen
         .queue(spec.push_queue())
-        // Pinned: this runner sees one lane and nothing else, so its budget,
-        // its batch, its deny parking and its lease are all its own.
-        .partition(lane_name.clone())
+        // Pinned: this runner sees one lane (one shard of one lane, when the
+        // target is sharded) and nothing else, so its budget, its batch, its deny
+        // parking and its lease are all its own.
+        .partition(partition.clone())
         .lease_seconds(spec.pacing.lease_seconds as i32);
+
 
     let stream = Stream::from(source)
         .gate(move |rec, ctx| {
             let op = rec.text("op").unwrap_or("").to_string();
             let cost = rec.number(&cost_field).unwrap_or(cost_default);
             let item = Item { op, cost, scope: scope_of(&rec.data) };
-            let cap = *gate_lane.effective_cap.read();
+            // The lane's rate cap, divided by the shards it is spread over.
+            //
+            // `effective_cap` is a RATE (cost per second) and every shard runner holds
+            // its own copy of the counter it is applied to, so handing the whole
+            // figure to each of 64 shards would enforce it 64 times — the same
+            // multiplication that makes lanes divide a ceiling instead of replicating
+            // it. Declared budgets need no such division: a sharded target's budgets
+            // are all keyed by the shard dimension (`shard-scope`), so each cap is per
+            // key and a key lives in exactly one shard.
+            let cap = gate_lane
+                .effective_cap
+                .read()
+                .map(|rate| rate / shards_of_lane as f64);
+
 
             // The lane's slice of every target budget. Each lane is its own
             // partition with its own copy of the counters, so a ceiling handed
@@ -109,8 +141,9 @@ pub async fn spawn(
                     // utilisation without a round trip to Postgres. The
                     // authority is always the gate's own state; this is a copy,
                     // and a stale one between cycles is fine for a gauge.
-                    *gate_target.last_state.write().entry(gate_lane_name.clone()).or_default() =
+                    *gate_target.last_state.write().entry(gate_state_key.clone()).or_default() =
                         ctx.state.clone();
+
                     true
                 }
                 Decision::Deny(d) => {
@@ -136,8 +169,22 @@ pub async fn spawn(
             gate_core::PartitionBy::Connection => bucket(v.get("connection"), partitions),
         });
 
+    // One query id per lane, shared by that lane's shards: the stream's state is
+    // keyed `(query_id, partition_id)`, so pinned runners on different partitions
+    // already have different rows, and the registration is idempotent under the
+    // same operator chain.
     let mut opts = RunOptions::new(spec.query_id(&lane_name));
+
     opts.batch_size = spec.pacing.batch as i32;
+    // `all`, and this one is not a nicety: a stream's consumer group is created at
+    // its first poll, and the broker's default puts a new cursor at the TAIL. Every
+    // message pushed between a target being declared and its gate's first poll was
+    // silently skipped — the push queue showed it settled, the budget never saw it,
+    // and the item never reached a consumer. Measured on a single push into a
+    // freshly declared target: one message in, nothing admitted, nothing pending,
+    // no error anywhere.
+    opts.subscription_mode = Some(queen_mq::SubscriptionMode::All);
+
     // One partition each, because the source is pinned.
     opts.max_partitions = 1;
     opts.max_wait = std::time::Duration::from_millis(250);
@@ -157,10 +204,8 @@ pub async fn spawn(
 /// less, which is the only safe direction to be wrong in.
 fn bucket(v: Option<&serde_json::Value>, n: u64) -> String {
     let s = v.and_then(|v| v.as_str()).unwrap_or("default");
-    let mut h: u64 = 1469598103934665603;
-    for b in s.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(1099511628211);
-    }
-    format!("p{}", h % n.max(1))
+    // The same hash the push route shards on, from the same place, so a value
+    // cannot land in one bucket here and another there.
+    format!("p{}", gate_core::shard_index(s, n.min(u32::MAX as u64) as u32))
 }
+

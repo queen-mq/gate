@@ -22,6 +22,8 @@ const groups = [
     items: [
       { to: '/', label: 'Overview', icon: 'gauge', key: 'overview' },
       { to: '/targets', label: 'Targets', icon: 'target', key: 'targets' },
+      { to: '/graphs', label: 'Graphs', icon: 'graph', key: 'graphs' },
+
       { to: '/budgets', label: 'Shared budgets', icon: 'budget', key: 'budgets' },
       { to: '/traces', label: 'Traces', icon: 'trace', key: 'traces' },
     ],

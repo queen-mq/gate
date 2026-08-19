@@ -152,22 +152,51 @@ impl Meter {
     /// is the 99% of the volume that carries none of the interest. Kept whole,
     /// never sampled, for the same reason.
     pub fn record_denial(&self, target: &str, lane: &str, op: &str, budget_id: &str, now_ms: i64) {
+        self.record_outcome(target, lane, op, "denied", Some(budget_id), now_ms);
+    }
+
+    /// Any outcome the server itself observed rather than the caller reporting: a
+    /// denial, a breached item sent back to an entry, one that had used up its
+    /// attempts. None of these arrive on the `calls` queue — no call was made — so
+    /// without this path they would leave no evidence at all.
+    ///
+    /// A `throttled` outcome is kept in the breach ring too, for the same reason the
+    /// caller's own is: it is the only record that the cap we enforce is looser than
+    /// the one the vendor does.
+    pub fn record_outcome(
+        &self,
+        target: &str,
+        lane: &str,
+        op: &str,
+        outcome: &str,
+        budget_id: Option<&str>,
+        now_ms: i64,
+    ) {
         let (application, tname) = split_key(target);
-        let mut t = self.traces.write();
-        t.push_back(Trace {
+        let trace = Trace {
             at: now_ms,
             application,
             target: tname,
             lane: lane.to_string(),
             op: op.to_string(),
-            outcome: "denied".to_string(),
-            budget_id: Some(budget_id.to_string()),
+            outcome: outcome.to_string(),
+            budget_id: budget_id.map(|b| b.to_string()),
             calls: 0,
-        });
+        };
+        if outcome == "throttled" || outcome == "exhausted" {
+            let mut b = self.breaches.write();
+            b.push_back(trace.clone());
+            while b.len() > KEEP_TRACES {
+                b.pop_front();
+            }
+        }
+        let mut t = self.traces.write();
+        t.push_back(trace);
         while t.len() > KEEP_TRACES {
             t.pop_front();
         }
     }
+
 
     /// Fold the gate's own counters into the current minute. The gate counts
     /// admissions and denials; the `calls` queue counts what left. Both belong
@@ -404,6 +433,12 @@ pub fn spawn(
             let msgs = match queen
                 .queue(&queue)
                 .group("gate.meter")
+                // Same reason as everywhere else a group is named: a cursor created
+                // at the tail would drop every call event pushed before this task's
+                // first poll, and the meter would under-read exactly when a target
+                // is busiest — at the moment it was declared.
+                .subscription_mode(queen_mq::SubscriptionMode::All)
+
                 .batch(200)
                 .wait(true)
                 .poll_timeout(std::time::Duration::from_millis(1000))

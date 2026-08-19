@@ -5,11 +5,13 @@
 //! and what the console needs to answer "how close are we".
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-use gate_core::TargetSpec;
+use gate_core::{GraphSpec, TargetSpec};
 use serde_json::Value;
+
 
 /// Counters a lane accumulates between meter windows. Not the budget — the
 /// budget is in the gate's own state, in Postgres, where the single writer is.
@@ -19,8 +21,13 @@ pub struct LaneStats {
     pub denied: u64,
     pub calls: u64,
     pub throttled: u64,
+    /// Items a breach rule sent back to an entry node to be paced again.
+    pub retried: u64,
+    /// Items that had used up `maxAttempts` and were settled instead.
+    pub exhausted: u64,
     pub last_denial_budget: Option<String>,
 }
+
 
 pub struct LaneRuntime {
     pub name: String,
@@ -38,7 +45,24 @@ pub struct LaneRuntime {
 
 pub struct TargetRuntime {
     pub spec: TargetSpec,
+    /// `application/graph` when this target is a graph node rather than a
+    /// standalone target.
+    ///
+    /// Two things hang off it. A node is never reaped by a target sync — the
+    /// caller's target list does not name it, and reaping it would tear down half
+    /// a graph. And a node's spec is not in the target store: the graph document
+    /// is the authority, so the reconcile loop restores the graph and the graph
+    /// provisions the node.
+    pub graph: Option<String>,
+    /// Whether this spec is known to be in the durable store.
+    ///
+    /// The reconcile loop removes a target the store no longer holds, which is
+    /// how a delete on one replica reaches the others. A declare whose persist
+    /// failed would look exactly like that, so it is marked instead and the
+    /// reconcile retries the save rather than tearing down a live target.
+    pub persisted: AtomicBool,
     pub lanes: HashMap<String, Arc<LaneRuntime>>,
+
     /// Last state document seen by the gate, per lane. A copy, for reading
     /// utilisation without a round trip; the authority is always Postgres.
     pub last_state: RwLock<HashMap<String, Value>>,
@@ -52,10 +76,58 @@ pub struct TargetRuntime {
     pub pools: Vec<Arc<crate::shared::Pool>>,
 }
 
+/// One merge relay: the tasks that move work INTO one node, from every node that
+/// has an edge to it.
+///
+/// One per destination rather than one per edge, because priority is only real
+/// where the streams meet. Two independent relays into one queue would each
+/// forward as fast as they could and the destination's FIFO would decide the
+/// order by arrival — which is exactly the thing priority is supposed to
+/// override.
+pub struct RelayRuntime {
+    /// The node work is relayed into, as declared (not the target name).
+    pub dest: String,
+    /// `(source node, priority)`, lowest priority first — the order it drains in.
+    pub sources: Vec<(String, u32)>,
+    /// How many items the destination's push queue may hold before this relay
+    /// stops forwarding. The bottleneck queue stays shallow, so priority at the
+    /// entrance is priority in fact.
+    pub window: u64,
+    pub forwarded: AtomicU64,
+    /// Items a relay could not route: a destination sharded by a dimension the
+    /// item does not carry. Nacked with a reason rather than dropped.
+    pub unroutable: AtomicU64,
+    pub cancel: queen_mq::Cancel,
+}
+
+impl RelayRuntime {
+    pub fn forwarded(&self) -> u64 {
+        self.forwarded.load(Ordering::Relaxed)
+    }
+    pub fn unroutable(&self) -> u64 {
+        self.unroutable.load(Ordering::Relaxed)
+    }
+}
+
+/// A declared graph and the relays that make its edges real.
+///
+/// The nodes are NOT here: they are targets in the target map, because a node is
+/// a target and every route, queue and gate runner they need already exists. This
+/// holds the document and the tasks that no target has.
+pub struct GraphRuntime {
+    pub spec: GraphSpec,
+    pub relays: Vec<Arc<RelayRuntime>>,
+    /// `application/name` of every node target, in declared order.
+    pub node_keys: Vec<String>,
+    pub persisted: AtomicBool,
+}
+
 #[derive(Default)]
 pub struct Registry {
     targets: RwLock<HashMap<String, Arc<TargetRuntime>>>,
+    graphs: RwLock<HashMap<String, Arc<GraphRuntime>>>,
 }
+
 
 impl Registry {
     /// Keyed on `application/name`: two teams may both own something they call
@@ -99,4 +171,61 @@ impl Registry {
     pub fn all(&self) -> Vec<Arc<TargetRuntime>> {
         self.targets.read().values().cloned().collect()
     }
+
+    /// Standalone targets only — what a target sync owns and may reap. A graph
+    /// node is owned by its graph document and reaping it would tear down half a
+    /// topology.
+    pub fn standalone_of_app(&self, app: &str) -> Vec<Arc<TargetRuntime>> {
+        self.of_app(app)
+            .into_iter()
+            .filter(|rt| rt.graph.is_none())
+            .collect()
+    }
+
+    // ------------------------------------------------------------------ graphs
+
+    pub fn graph(&self, app: &str, name: &str) -> Option<Arc<GraphRuntime>> {
+        self.graphs.read().get(&format!("{app}/{name}")).cloned()
+    }
+
+    pub fn put_graph(&self, g: Arc<GraphRuntime>) -> Option<Arc<GraphRuntime>> {
+        self.graphs.write().insert(g.spec.key(), g)
+    }
+
+    pub fn remove_graph(&self, app: &str, name: &str) -> Option<Arc<GraphRuntime>> {
+        self.graphs.write().remove(&format!("{app}/{name}"))
+    }
+
+    /// By `application/name`, which is what a target runtime carries as its owner.
+    pub fn graph_by_key(&self, key: &str) -> Option<Arc<GraphRuntime>> {
+        self.graphs.read().get(key).cloned()
+    }
+
+    pub fn graphs(&self) -> Vec<Arc<GraphRuntime>> {
+
+        let mut v: Vec<Arc<GraphRuntime>> = self.graphs.read().values().cloned().collect();
+        v.sort_by_key(|g| g.spec.key());
+        v
+    }
+
+    pub fn graphs_of_app(&self, app: &str) -> Vec<Arc<GraphRuntime>> {
+        self.graphs()
+            .into_iter()
+            .filter(|g| g.spec.application == app)
+            .collect()
+    }
+
+    /// The graph that owns a target name in this application, if one does.
+    ///
+    /// G10: a node is the target `{graph}.{node}`, so a standalone target of that
+    /// name would be a second owner of one queue family. Asked at both declares.
+    pub fn graph_owning_target(&self, app: &str, name: &str) -> Option<Arc<GraphRuntime>> {
+        self.graphs_of_app(app).into_iter().find(|g| {
+            g.spec
+                .nodes
+                .keys()
+                .any(|n| g.spec.node_target_name(n) == name)
+        })
+    }
 }
+

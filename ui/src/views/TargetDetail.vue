@@ -24,6 +24,7 @@ import Icon from '../components/Icon.vue'
 import {
   api, num, pct, period, ago, utilisation,
   isAdmin, READ_ONLY_NOTE, targetApi, targetPath, DEFAULT_APP,
+
 } from '../lib/api.js'
 import { fetchRollups, perMinute, budgetSeries } from '../lib/rollups.js'
 import { usePoll } from '../lib/poll.js'
@@ -88,7 +89,25 @@ watch(() => [props.app, props.name], () => {
   load()
 })
 
+/* `graph` on the target says who owns it: a node is declared in a graph
+   document, so this page reads it and links there rather than offering an editor
+   the server will refuse. */
+const graphOf = computed(() => {
+  const key = target.value?.graph
+  if (!key) return null
+  const at = String(key).indexOf('/')
+  return at === -1
+    ? { application: application.value, name: String(key) }
+    : { application: key.slice(0, at), name: key.slice(at + 1) }
+})
+const graphPath = computed(() =>
+  graphOf.value
+    ? `/apps/${encodeURIComponent(graphOf.value.application)}/graphs/${encodeURIComponent(graphOf.value.name)}`
+    : '',
+)
+
 const budgets = computed(() => target.value?.budgets ?? [])
+
 const lanes = computed(() => target.value?.lanes ?? [])
 
 const binding = computed(() => {
@@ -178,7 +197,15 @@ async function remove() {
           <span class="chip">{{ application }}</span>
           <span class="chip">v{{ target.version }}</span>
           <span v-if="target.egress" class="chip">egress {{ target.egress }}</span>
-          <template v-if="isAdmin">
+          <span v-if="target.shards > 1" class="chip">×{{ target.shards }} by {{ target.shardBy }}</span>
+          <!-- A graph node is declared in its graph document and nowhere else, so
+               the buttons that would edit or delete it are not offered: the server
+               refuses both, and an enabled button that 409s teaches an operator to
+               distrust the ones that work. -->
+          <RouterLink v-if="graphOf" :to="graphPath" class="btn">
+            <Icon name="graph" :size="14" /> {{ graphOf.name }}
+          </RouterLink>
+          <template v-if="isAdmin && !graphOf">
             <RouterLink :to="targetPath(application, name, '/edit')" class="btn">
               <Icon name="edit" :size="14" /> Edit
             </RouterLink>
@@ -190,7 +217,12 @@ async function remove() {
       </PageHeader>
 
       <!-- One quiet sentence rather than disabled buttons nobody can explain. -->
-      <p v-if="!isAdmin" class="-mt-4 mb-6 text-[12px] text-fg-3">{{ READ_ONLY_NOTE }}</p>
+      <p v-if="!isAdmin && !graphOf" class="-mt-4 mb-6 text-[12px] text-fg-3">{{ READ_ONLY_NOTE }}</p>
+      <p v-if="graphOf" class="-mt-4 mb-6 text-[12px] text-fg-3">
+        A node of graph <RouterLink :to="graphPath" class="text-link hover:underline">{{ graphOf.name }}</RouterLink>:
+        it is declared there, with the edges and the terminals that give it its meaning.
+      </p>
+
 
       <!-- --------------------------------------------------- headline -->
       <section class="card px-6 py-6 flex flex-col md:flex-row md:items-center gap-6">

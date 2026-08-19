@@ -88,9 +88,15 @@ impl Pool {
             self.window.store(w, Ordering::Relaxed);
             self.allowance.store(0, Ordering::Relaxed);
         }
-        if self.allowance.load(Ordering::Relaxed) >= chunk / 2 {
+        // `max(1)`, because integer division made this a deadlock: a budget whose
+        // chunk is one has a threshold of zero, "at least zero left" is always
+        // true, and the top-up never fires — the pool admits nothing for ever.
+        // Validation refuses such a spec now (`kv-chunk`), and this holds for the
+        // ones already in the store.
+        if self.allowance.load(Ordering::Relaxed) >= (chunk / 2).max(1) {
             return;
         }
+
         if reserve(queen, &self.budget, chunk, now_ms).await.unwrap_or(false) {
             self.allowance.fetch_add(chunk, Ordering::Relaxed);
         }

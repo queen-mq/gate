@@ -75,8 +75,15 @@ pub enum Reason {
 /// tail of the previous window. Three small numbers per counter, because the
 /// state document is re-read in full on every cycle and every field is paid for
 /// on each one.
+/// The lane cap is applied as one more rolling budget, so it composes with the
+/// declared ones instead of being a special case. Its cell is swept like any
+/// other, which is why the name is a constant rather than a literal in two
+/// places.
+pub const LANE_BUDGET: &str = "@lane";
+
 #[derive(Clone, Copy)]
 struct Cell {
+
     w: f64,
     u: f64,
     p: f64,
@@ -110,6 +117,62 @@ fn write_cell(state: &mut Value, budget: &str, key: &str, cell: Cell) {
         key.to_string(),
         json!({ "w": cell.w, "u": cell.u, "p": cell.p }),
     );
+}
+
+/// Where the last cycle's clock is remembered, so the sweep below runs once per
+/// cycle rather than once per message.
+///
+/// A plain name on purpose: the `__` prefix belongs to the stream runtime, and a
+/// field this code invents does not go in somebody else's namespace.
+const CYCLE_FIELD: &str = "t";
+
+/// How long a counter cell survives after its window closes.
+///
+/// Nothing else prunes: the state document is rewritten whole every cycle and a
+/// scope key written once lives forever, so a budget keyed on an entity grows the
+/// document without bound — `maxKeys` is checked at declare time and never
+/// again. A cell is readable only in its own window (both alignments) and in the
+/// one after it (rolling carries the previous window's spend as a decaying tail),
+/// so anything older than that cannot change a decision and is dropped.
+fn expire(spec: &TargetSpec, state: &mut Value, now_ms: i64) {
+    if !state.is_object() {
+        *state = Value::Object(Map::new());
+    }
+    let root = state.as_object_mut().expect("object");
+    root.insert(CYCLE_FIELD.to_string(), json!(now_ms));
+
+    let lease_ms = spec.pacing.lease_seconds.max(1) * 1000;
+    let period_of = |budget_id: &str| -> Option<i64> {
+        if budget_id == LANE_BUDGET {
+            return Some(lease_ms);
+        }
+        spec.budgets
+            .iter()
+            .find(|b| b.id == budget_id)
+            .map(|b| (b.period_seconds.max(1)) * 1000)
+    };
+
+    let Some(budgets) = root.get_mut("b").and_then(|v| v.as_object_mut()) else {
+        return;
+    };
+    budgets.retain(|budget_id, cells| {
+        // A budget the spec no longer declares can never be read again — nothing
+        // asks for a counter by a name that is not in the spec — so the whole
+        // slot goes rather than one cell at a time.
+        let Some(period_ms) = period_of(budget_id) else {
+            return false;
+        };
+        let Some(map) = cells.as_object_mut() else {
+            return false;
+        };
+        let current = now_ms / period_ms;
+        map.retain(|_, c| {
+            c.get("w")
+                .and_then(|v| v.as_f64())
+                .is_some_and(|w| (w as i64) >= current - 1)
+        });
+        !map.is_empty()
+    });
 }
 
 /// The counter key inside a budget: `-` when the budget has no scope, otherwise
@@ -255,7 +318,16 @@ pub fn decide_with_share(
 ) -> Decision {
     let mut pending: Vec<Pending> = Vec::new();
 
+    // Once per cycle, before anything is charged. The gate fn runs per message
+    // but its clock is sampled once per cycle, so a changed clock IS a new cycle
+    // — and a cycle that ends up denying everything discards this write along
+    // with the rest, which costs one repeated sweep and nothing else.
+    if state.get(CYCLE_FIELD).and_then(|v| v.as_i64()) != Some(now_ms) {
+        expire(spec, state, now_ms);
+    }
+
     // Pass one: evaluate everything, mutate nothing.
+
     for budget in spec.budgets_for(&item.op) {
         // A kv-backed budget is not this function's business: it crosses
         // partitions, so the server settles it out of band before we are called.
@@ -271,7 +343,8 @@ pub fn decide_with_share(
 
     if let Some(rate) = lane_cap_per_sec {
         let synthetic = Budget {
-            id: "@lane".to_string(),
+            id: LANE_BUDGET.to_string(),
+
             cap: (rate * spec.pacing.lease_seconds as f64).max(item.cost),
             period_seconds: spec.pacing.lease_seconds.max(1),
             alignment: Alignment::Rolling,
@@ -306,6 +379,36 @@ fn scale(budget: &Budget, share: f64, cost: f64) -> Budget {
     let mut b = budget.clone();
     b.cap = (budget.cap * share).max(cost);
     b
+}
+
+/// The busiest counter this budget holds, across every scope key in the document.
+///
+/// A scoped budget has no `-` cell, so asking for one reports a per-listing limit
+/// at 0% while it is refusing work. The worst key is the honest number: a budget
+/// is as spent as the key closest to being refused.
+pub fn utilisation_max(budget: &Budget, state: &Value, now_ms: i64) -> f64 {
+    let Some(cells) = state
+        .get("b")
+        .and_then(|b| b.get(&budget.id))
+        .and_then(|v| v.as_object())
+    else {
+        return 0.0;
+    };
+    cells
+        .keys()
+        .map(|k| utilisation(budget, state, k, now_ms))
+        .fold(0.0f64, f64::max)
+}
+
+/// How many scope keys this budget's counter holds right now — the number
+/// `maxKeys` was a promise about, and the one the expiry sweep bounds.
+pub fn key_count(budget: &Budget, state: &Value) -> usize {
+    state
+        .get("b")
+        .and_then(|b| b.get(&budget.id))
+        .and_then(|v| v.as_object())
+        .map(|m| m.len())
+        .unwrap_or(0)
 }
 
 /// Live utilisation of one budget's counter, for the console and the meter.

@@ -36,7 +36,25 @@ pub struct TargetSpec {
     pub pacing: Pacing,
     #[serde(default)]
     pub admitted: Admitted,
+    /// Split this target's push queue by a scope dimension: `shards` partitions
+    /// per lane, each with its own gate runner, its own partition lease and its
+    /// own state document.
+    ///
+    /// This is what makes a per-key limit expressible at a cardinality one state
+    /// document could never hold: the document is re-read whole every cycle, so
+    /// 200,000 keys in one is 200,000 keys re-read every cycle. Sharded, it is
+    /// `maxKeys / shards` per document, and the single-writer argument survives
+    /// because a key hashes to exactly one shard — never two.
+    ///
+    /// The dimension must appear in the `scope` of EVERY budget in the target
+    /// (`shard-scope`): an unscoped budget in a sharded target is one counter per
+    /// shard, which is the ceiling enforced `shards` times.
+    #[serde(default, rename = "shardBy", skip_serializing_if = "Option::is_none")]
+    pub shard_by: Option<Dim>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shards: Option<u32>,
 }
+
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -292,13 +310,89 @@ impl TargetSpec {
     pub fn query_id(&self, lane: &str) -> String {
         format!("gate.{}.{}.{}", self.application, self.name, lane)
     }
+
+    // ------------------------------------------------------------- sharding
+
+    pub fn is_sharded(&self) -> bool {
+        self.shard_by.is_some()
+    }
+
+    /// One for an unsharded target, so every caller can multiply by it without
+    /// branching.
+    pub fn shard_count(&self) -> u32 {
+        if self.is_sharded() {
+            self.shards.unwrap_or(1).max(1)
+        } else {
+            1
+        }
+    }
+
+    /// Which shard a dimension value belongs to. A fixed ring: an unmeasured
+    /// cardinality cannot become an unbounded partition count, and a collision
+    /// serialises two keys that need not have been — never the reverse.
+    pub fn shard_of(&self, value: &str) -> u32 {
+        shard_index(value, self.shard_count())
+    }
+
+    /// The push-queue partition one lane's work goes to. Unsharded this IS the
+    /// lane name, which is why nothing about an existing target changes when this
+    /// field is absent.
+    pub fn push_partition(&self, lane: &str, shard: u32) -> String {
+        if self.is_sharded() {
+            format!("{lane}:{shard}")
+        } else {
+            lane.to_string()
+        }
+    }
+
+    /// Every push partition a lane owns — one gate runner each.
+    pub fn lane_partitions(&self, lane: &str) -> Vec<String> {
+        (0..self.shard_count())
+            .map(|s| self.push_partition(lane, s))
+            .collect()
+    }
 }
+
+/// FNV-1a, modulo the ring size. Written out rather than pulled from a hasher
+/// crate because the same number has to come out of the server's push route and
+/// the gate's own partitioner, in this process and in the next release.
+pub fn shard_index(value: &str, shards: u32) -> u32 {
+    let mut h: u64 = 1469598103934665603;
+    for b in value.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(1099511628211);
+    }
+    (h % shards.max(1) as u64) as u32
+}
+
 
 impl Budget {
     pub fn rate_per_sec(&self) -> f64 {
         self.cap / self.period_seconds as f64
     }
 }
+
+/// How many consumers a lane assumes when nobody said. Only ever a default for
+/// the batch size of a `next`, so it is a comfort number rather than a limit.
+pub const DEFAULT_CONCURRENCY: u32 = 8;
+
+impl Lane {
+    /// The single lane a target gets when it declares none.
+    ///
+    /// One, never two: lanes DIVIDE a ceiling rather than replicate it (see
+    /// [`TargetSpec::lane_share`]), so an implicit second lane would halve a
+    /// limit nobody asked to halve.
+    pub fn sole() -> Self {
+        Self {
+            name: "default".to_string(),
+            cap: CapPolicy::Ceiling,
+            concurrency: DEFAULT_CONCURRENCY,
+            floor: 0.0,
+            default: true,
+        }
+    }
+}
+
 
 impl TargetSpec {
     /// The fraction of every target budget a lane may spend.

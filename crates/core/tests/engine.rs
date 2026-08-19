@@ -34,8 +34,11 @@ fn spec(budgets: Vec<Budget>) -> TargetSpec {
         cost: Cost { field: "cost".into(), default: 1.0, max: 1.0 },
         pacing: Pacing::default(),
         admitted: Admitted::default(),
+        shard_by: None,
+        shards: None,
     }
 }
+
 
 fn item(op: &str, cost: f64) -> Item {
     Item { op: op.into(), cost, scope: vec![] }
@@ -328,4 +331,111 @@ fn two_teams_may_both_own_something_called_airbnb() {
     assert_ne!(a.query_id("bulk"), b.query_id("bulk"));
     assert_ne!(a.calls_queue(), b.calls_queue());
     assert_eq!(a.push_queue(), "gate.channel-manager.airbnb.push");
+}
+
+/// Nothing pruned the state document. `maxKeys` is checked once, at declare
+/// time, and never again — so a budget keyed on a listing wrote one cell per
+/// listing and kept every one of them for ever, in a document that is re-read
+/// whole on every cycle.
+#[test]
+fn cells_whose_window_has_closed_stop_being_carried() {
+    let mut b = budget("weekly", 100.0, 60, Alignment::Rolling);
+    b.scope = vec![Dim::Entity];
+    b.max_keys = Some(1000);
+    let s = spec(vec![b.clone()]);
+
+    let mut state = json!({});
+    let period = 60_000i64;
+    // Three listings spend in window W.
+    for key in ["listing-1", "listing-2", "listing-3"] {
+        let it = Item {
+            op: "photo.delete".into(),
+            cost: 1.0,
+            scope: vec![(Dim::Entity, key.to_string())],
+        };
+        assert!(decide(&s, None, &mut state, period * 10, &it).is_admit());
+    }
+    assert_eq!(key_count(&b, &state), 3);
+
+    // Two periods on, one live listing spends again. The three stale cells can no
+    // longer change any decision — a rolling window reads its own window and the
+    // one before — so they go.
+    let live = Item {
+        op: "photo.delete".into(),
+        cost: 1.0,
+        scope: vec![(Dim::Entity, "listing-9".to_string())],
+    };
+    assert!(decide(&s, None, &mut state, period * 12, &live).is_admit());
+    assert_eq!(key_count(&b, &state), 1, "stale cells: {state}");
+    assert!(state["b"]["weekly"].get("listing-9").is_some());
+
+    // And the previous window is NOT stale: a rolling budget carries its tail.
+    let mut state = json!({});
+    let it = Item {
+        op: "photo.delete".into(),
+        cost: 40.0,
+        scope: vec![(Dim::Entity, "listing-1".to_string())],
+    };
+    assert!(decide(&s, None, &mut state, period * 10, &it).is_admit());
+    let next_window = Item { cost: 1.0, ..it.clone() };
+    assert!(decide(&s, None, &mut state, period * 11, &next_window).is_admit());
+    assert_eq!(
+        key_count(&b, &state),
+        1,
+        "the previous window still decides, so its cell must survive"
+    );
+    assert!(utilisation(&b, &state, "listing-1", period * 11) > 0.0);
+}
+
+/// The sweep runs once per cycle, not once per message: the gate's clock is
+/// sampled per cycle, so a whole batch shares it.
+#[test]
+fn the_sweep_costs_one_pass_per_cycle_and_leaves_the_live_batch_alone() {
+    let s = spec(vec![budget("b", 100.0, 60, Alignment::Rolling)]);
+    let mut state = json!({});
+    let now = 60_000i64 * 5;
+    for _ in 0..50 {
+        assert!(decide(&s, None, &mut state, now, &item("x", 1.0)).is_admit());
+    }
+    assert_eq!(state["b"]["b"]["-"]["u"], json!(50.0));
+    // The cycle clock is remembered in a plain field, because `__` belongs to the
+    // stream runtime.
+    assert_eq!(state["t"], json!(now));
+}
+
+/// A budget the spec no longer declares can never be read again: nothing asks
+/// for a counter by a name that is not in the spec, so the slot is dead weight.
+#[test]
+fn a_budget_that_left_the_spec_takes_its_counters_with_it() {
+    let s = spec(vec![budget("b", 100.0, 60, Alignment::Rolling)]);
+    let mut state = json!({ "b": { "b": { "-": { "w": 5.0, "u": 1.0, "p": 0.0 } },
+                                   "gone": { "-": { "w": 5.0, "u": 90.0, "p": 0.0 } } } });
+    assert!(decide(&s, None, &mut state, 60_000 * 5, &item("x", 1.0)).is_admit());
+    assert!(state["b"].get("gone").is_none(), "{state}");
+    assert!(state["b"].get("b").is_some());
+}
+
+/// A scoped budget has no `-` cell, so asking for one reported 0% while the
+/// budget was refusing work. The worst key is the honest number.
+#[test]
+fn the_busiest_key_is_what_a_scoped_budget_is_spending() {
+    let mut b = budget("per-listing", 10.0, 60, Alignment::Calendar);
+    b.scope = vec![Dim::Entity];
+    b.max_keys = Some(100);
+    let s = spec(vec![b.clone()]);
+    let mut state = json!({});
+    let now = 60_000i64 * 3;
+    for (key, n) in [("a", 2), ("b", 9)] {
+        for _ in 0..n {
+            let it = Item {
+                op: "x".into(),
+                cost: 1.0,
+                scope: vec![(Dim::Entity, key.to_string())],
+            };
+            assert!(decide(&s, None, &mut state, now, &it).is_admit());
+        }
+    }
+    assert_eq!(utilisation(&b, &state, "-", now), 0.0);
+    assert!((utilisation_max(&b, &state, now) - 0.9).abs() < 1e-9);
+    assert_eq!(key_count(&b, &state), 2);
 }

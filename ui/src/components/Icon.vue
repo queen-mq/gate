@@ -24,6 +24,10 @@ const paths = {
   x: ['M5 5l14 14', 'M19 5L5 19'],
   clock: ['M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z', 'M12 8v4.5l3 2'],
   link: ['M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1', 'M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1'],
+  // Two nodes and an edge: the graph, which is a path work takes rather than a
+  // place it sits.
+  graph: ['M6 7.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5z', 'M18 21.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5z', 'M6 7.5v4a4 4 0 0 0 4 4h4a4 4 0 0 1 4 4v-.5'],
+
 }
 defineProps({
   name: { type: String, required: true },

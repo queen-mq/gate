@@ -25,34 +25,71 @@ impl std::fmt::Display for Problem {
 /// re-read, every time. High cardinality goes to kv, which is one row per key.
 pub const GATE_MAX_KEYS: u64 = 5_000;
 
+/// One gate runner, one partition lease and one state document per shard, so the
+/// count is a resource number and not a taste one. Sixty-four is the working
+/// figure; this is the wall.
+pub const GATE_MAX_SHARDS: u32 = 256;
+
+/// What a caller is allowed to relax, and nothing more.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ValidateOpts {
+    /// A graph node with out-edges may hold no budget of its own: it exists to
+    /// isolate a traffic class and to carry a priority, and the limit it is
+    /// checked against lives downstream. A standalone target with no budget
+    /// limits nothing, which is why this is off by default.
+    pub allow_empty_budgets: bool,
+}
+
+/// One lowercase segment: what a queue name and a kv key can carry without
+/// quoting.
+fn ok_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && s.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+}
+
+/// A single segment: applications, lanes and graph names.
+pub fn ok_name(s: &str) -> bool {
+    s.len() <= 63 && ok_segment(s)
+}
+
+/// A target name, which may be dotted because a graph node IS a target called
+/// `{graph}.{node}`. Each segment is still a segment, so nothing that reaches a
+/// queue name or a kv key changes shape.
+pub fn ok_target_name(s: &str) -> bool {
+    s.len() <= 63 && !s.is_empty() && s.split('.').all(ok_segment)
+}
+
 pub fn validate(spec: &TargetSpec) -> Vec<Problem> {
+    validate_with(spec, ValidateOpts::default())
+}
+
+pub fn validate_with(spec: &TargetSpec, opts: ValidateOpts) -> Vec<Problem> {
     let mut out = Vec::new();
     let p = |rule, detail: String| Problem { rule, detail };
 
-    // The application and the name both become queue names and kv keys, so both
-    // are constrained rather than trusted.
-    let ok_name = |s: &str| {
-        !s.is_empty()
-            && s.len() <= 63
-            && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-            && s.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
-    };
     if !ok_name(&spec.application) {
+
         out.push(p(
             "application",
             format!("`{}` is not a usable application name: lowercase, digits and dashes", spec.application),
         ));
     }
-    if !ok_name(&spec.name) {
+    if !ok_target_name(&spec.name) {
         out.push(p(
             "name",
-            format!("`{}` is not a usable target name: lowercase, digits and dashes", spec.name),
+            format!(
+                "`{}` is not a usable target name: lowercase, digits, dashes, and a dot only \
+                 between segments (a graph node is the target `{{graph}}.{{node}}`)",
+                spec.name
+            ),
         ));
     }
 
-    if spec.budgets.is_empty() {
+    if spec.budgets.is_empty() && !opts.allow_empty_budgets {
         out.push(p("budgets", "a target with no budget does not limit anything".into()));
     }
+
     if spec.lanes.is_empty() {
         out.push(p("lanes", "a target needs at least one lane".into()));
     }
@@ -112,6 +149,43 @@ pub fn validate(spec: &TargetSpec) -> Vec<Problem> {
             ),
         ));
     }
+    // The other end of the same rule, and the one that validated clean until
+    // now. With NO lane claiming the ceiling, the residual belongs to nobody —
+    // and `ceiling-minus-measured` reads the residual as its own, so two derived
+    // lanes each take everything the other did not reserve and the ceiling is
+    // enforced twice. `takers == 1` closes it because the residual then has an
+    // owner.
+    if takers == 0 && reserved < 1.0 - 1e-9 {
+        out.push(p(
+            "lane-shares",
+            format!(
+                "no lane claims the ceiling and the reservations only add up to {reserved:.2}: \
+                 the remaining {:.2} has no owner, and a `ceiling-minus-measured` lane would \
+                 claim all of it. Give one lane `ceiling`, or make the reservations sum to 1.0",
+                1.0 - reserved
+            ),
+        ));
+    }
+    // The property, checked directly rather than inferred from the rules above:
+    // whatever the lanes declare, their shares of one ceiling must not add up to
+    // more than that ceiling. Measured with no meter reading, which is the
+    // largest a derived lane can ever be (the meter may only shrink it).
+    let allocated: f64 = spec
+        .lanes
+        .iter()
+        .map(|l| spec.lane_share(&l.name, None))
+        .sum();
+    if allocated > 1.0 + 1e-9 {
+        out.push(p(
+            "lane-shares",
+            format!(
+                "the lanes divide {allocated:.2} of one ceiling between them: each lane is its own \
+                 partition with its own copy of the counters, so anything above 1.0 is the ceiling \
+                 enforced more than once"
+            ),
+        ));
+    }
+
     if spec.lanes.len() > 1 {
         for l in &spec.lanes {
             if matches!(l.cap, CapPolicy::CeilingMinusMeasured) && l.floor <= 0.0 {
@@ -162,16 +236,86 @@ pub fn validate(spec: &TargetSpec) -> Vec<Problem> {
             ));
         }
         if let Some(max) = b.max_keys {
-            if b.store == Store::Gate && max > GATE_MAX_KEYS {
+            // Per SHARD, because a shard is a state document: the bound that
+            // matters is what one cycle re-reads, and sharding is the only way a
+            // high-cardinality budget fits. Never kv — see `kv-scope` below for
+            // why that recommendation was wrong.
+            let shards = spec.shard_count() as u64;
+            let per_shard = max.div_ceil(shards.max(1));
+            if b.store == Store::Gate && per_shard > GATE_MAX_KEYS {
                 out.push(p(
                     "store-fits",
                     format!(
-                        "budget `{}` declares {max} keys in the gate state; above {GATE_MAX_KEYS} it belongs on kv",
+                        "budget `{}` declares {max} keys over {shards} shard(s), {per_shard} per gate \
+                         state document; above {GATE_MAX_KEYS} the document is re-read whole every \
+                         cycle at that size. Shard the target (`shardBy` on the scope dimension, more \
+                         `shards`) or narrow the scope — kv cannot hold a scoped budget",
                         b.id
                     ),
                 ));
             }
         }
+
+        // ---- kv quarantine. Everything a `store: kv` budget silently is not.
+        if b.store == Store::Kv {
+            if !b.scope.is_empty() {
+                out.push(p(
+                    "kv-scope",
+                    format!(
+                        "budget `{}` is `store: kv` with a scope: the shared pool keys on \
+                         `(application, id)` alone and DROPS the scope, so every key would spend one \
+                         counter — the per-key limit would not exist. Shard the target instead",
+                        b.id
+                    ),
+                ));
+            }
+            if b.matcher.is_some() {
+                out.push(p(
+                    "kv-match",
+                    format!(
+                        "budget `{}` is `store: kv` with a `match`: the pool is spent from a local \
+                         lease before any op is looked at, so it charges every op and the selector \
+                         would not exist",
+                        b.id
+                    ),
+                ));
+            }
+            // The lease is a chunk of one second's worth of the budget, topped up
+            // when less than half remains. At `cap < 2 x periodSeconds` the chunk
+            // is one, half of it is zero, the top-up never fires and the budget
+            // admits nothing for ever.
+            let chunk = (b.cap / b.period_seconds.max(1) as f64).floor();
+            if b.cap < 2.0 * b.period_seconds as f64 {
+                out.push(p(
+                    "kv-chunk",
+                    format!(
+                        "budget `{}` is `store: kv` with cap {} over {}s: the shared lease is a \
+                         chunk of one second's rate and needs at least 2 x periodSeconds of cap to \
+                         top itself up. Below that it deadlocks at zero",
+                        b.id, b.cap, b.period_seconds
+                    ),
+                ));
+            } else if chunk < spec.cost.max {
+                // `cost-fits` compares an item against the whole cap, which is the
+                // right test for a budget the gate holds in memory. A kv budget is
+                // never spent from its cap: it is spent from a local lease of one
+                // second's rate, so an item costing more than that lease can never
+                // be admitted — and it blocks the head of its lane for ever, which
+                // is exactly the failure `cost-fits` exists to prevent.
+                out.push(p(
+                    "kv-chunk",
+                    format!(
+                        "budget `{}` is `store: kv` and leases {chunk} per top-up (cap {} over {}s), \
+                         but a single item may cost {}: that item can never be spent from the shared \
+                         lease and would block the lane for ever. Raise the cap, shorten the period, \
+                         or lower cost.max",
+                        b.id, b.cap, b.period_seconds, spec.cost.max
+                    ),
+                ));
+            }
+
+        }
+
 
         if b.confidence == Confidence::Documented && (b.source.is_none() || b.as_of.is_none()) {
             out.push(p(
@@ -212,8 +356,51 @@ pub fn validate(spec: &TargetSpec) -> Vec<Problem> {
         out.push(p("pacing", "leaseSeconds is an integer of at least 1".into()));
     }
 
+    // ---- sharding. A shard is a partition, and a partition is a counter.
+    if let Some(dim) = spec.shard_by {
+        let shards = spec.shards.unwrap_or(0);
+        if shards < 1 {
+            out.push(p(
+                "shard-count",
+                format!("`shardBy: {}` needs `shards` of at least 1", dim.as_str()),
+            ));
+        }
+        if shards > GATE_MAX_SHARDS {
+            out.push(p(
+                "shard-count",
+                format!(
+                    "{shards} shards is above the {GATE_MAX_SHARDS} this build runs: each one is a \
+                     gate runner holding a partition lease"
+                ),
+            ));
+        }
+        for b in spec.budgets.iter().filter(|b| b.store == Store::Gate) {
+            if !b.scope.contains(&dim) {
+                out.push(p(
+                    "shard-scope",
+                    format!(
+                        "budget `{}` does not carry `{}` in its scope, but the target is sharded by \
+                         it: the budget would get one counter per shard and its cap would be \
+                         enforced {} times over. Scope it by `{}`, or move it to a node that is not \
+                         sharded",
+                        b.id,
+                        dim.as_str(),
+                        spec.shard_count(),
+                        dim.as_str()
+                    ),
+                ));
+            }
+        }
+    } else if spec.shards.is_some() {
+        out.push(p(
+            "shard-count",
+            "`shards` without `shardBy` shards nothing: name the dimension".into(),
+        ));
+    }
+
     out
 }
+
 
 /// Fields whose change re-founds the state and therefore needs a version bump:
 /// a new `partition_id` is a counter that restarts at zero, and changing a
@@ -222,6 +409,13 @@ pub fn needs_version_bump(old: &TargetSpec, new: &TargetSpec) -> bool {
     if old.admitted.partition_by != new.admitted.partition_by {
         return true;
     }
+    // Re-sharding moves keys between shards, and a shard is a counter: the same
+    // listing would land on a document that has never seen it and start from
+    // zero, while the document that holds its spend is no longer consulted.
+    if old.shard_by != new.shard_by || old.shard_count() != new.shard_count() {
+        return true;
+    }
+
     if old.lanes.len() > new.lanes.len()
         || old.lanes.iter().any(|l| new.lane(&l.name).is_none())
     {

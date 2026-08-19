@@ -59,7 +59,13 @@ const router = createRouter({
     { path: '/targets/:name/lanes/:lane', component: NeverRendered, beforeEnter: resolveApplication, meta: { nav: 'targets' } },
     { path: '/targets/:name/budgets/:budget', component: NeverRendered, beforeEnter: resolveApplication, meta: { nav: 'targets' } },
 
+    // A graph is declared whole and drawn whole: the pair is in the path for the
+    // same reason a target's is, because two teams may both own an `airbnb`.
+    { path: '/graphs', component: () => import('./views/Graphs.vue'), meta: { nav: 'graphs' } },
+    { path: '/apps/:app/graphs/:name', component: () => import('./views/GraphDetail.vue'), props: true, meta: { nav: 'graphs' } },
+
     { path: '/budgets', component: () => import('./views/SharedBudgets.vue'), meta: { nav: 'budgets' } },
+
     { path: '/traces', component: () => import('./views/Traces.vue'), meta: { nav: 'traces' } },
     { path: '/:pathMatch(.*)*', redirect: '/' },
   ],

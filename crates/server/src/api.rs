@@ -16,12 +16,13 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use queen_mq::{Message, Queen};
-use gate_core::{utilisation, TargetSpec};
+use queen_mq::{Message, Queen, SubscriptionMode, TxnPushItem};
+use gate_core::{utilisation_max, GraphSpec, TargetSpec, GATE_META};
+
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::registry::Registry;
+use crate::registry::{Registry, TargetRuntime};
 use crate::supervisor;
 
 pub struct App {
@@ -33,7 +34,32 @@ pub struct App {
     pub history: Option<Arc<crate::history::History>>,
     pub queen_url: String,
     pub started_ms: i64,
+    /// Held by every declare, every delete and every pass of the reconcile loop.
+    ///
+    /// Provisioning is stop-then-start, so two of them on one target interleave
+    /// into a target that is registered under one spec and running under another.
+    /// The reconcile loop makes that a certainty rather than a race, because it
+    /// declares on a timer without anybody asking.
+    pub declare_lock: tokio::sync::Mutex<()>,
 }
+
+impl App {
+    /// Everything a declare needs, so a test can build one without the listeners.
+    pub fn new(queen: Queen, queen_url: String) -> Self {
+        Self {
+            auth: None,
+            queen,
+            registry: Default::default(),
+            meter: Arc::new(crate::meter::Meter::default()),
+            depths: Arc::new(crate::depth::Depths::default()),
+            history: None,
+            queen_url,
+            started_ms: now_ms(),
+            declare_lock: tokio::sync::Mutex::new(()),
+        }
+    }
+}
+
 
 pub type Shared = Arc<App>;
 
@@ -73,9 +99,26 @@ fn routes() -> Router<Shared> {
         .route("/v1/targets/:name", put(put_target).get(get_target).delete(delete_target))
         .route("/v1/targets/:name/lanes/:lane/push", post(push))
         .route("/v1/targets/:name/lanes/:lane/next", get(next))
+        // Graphs. A node is a target and a caller never names one: it pushes into
+        // an entry and pops a terminal, exactly as it pushed and popped a target.
+        .route(
+            "/v1/apps/:app/graphs/:name",
+            put(put_graph).get(get_graph).delete(del_graph),
+        )
+        .route("/v1/apps/:app/graphs/:graph/nodes/:node/push", post(graph_push))
+        .route("/v1/apps/:app/graphs/:graph/nodes/:node/next", get(graph_next))
+        .route("/v1/graphs/:name", put(put_graph_default).get(get_graph_default).delete(del_graph_default))
+        .route("/v1/graphs/:graph/nodes/:node/push", post(graph_push_default))
+        .route("/v1/graphs/:graph/nodes/:node/next", get(graph_next_default))
         .route("/v1/leases/ack", post(ack))
         .route("/v1/leases/nack", post(nack))
         .route("/v1/leases/renew", post(renew))
+        .route("/api/graphs", get(list_graphs))
+        .route("/api/graphs/:name", get(get_graph_default))
+        .route("/api/graphs/:name/topology", get(graph_topology_default))
+        .route("/api/apps/:app/graphs/:name", get(get_graph))
+        .route("/api/apps/:app/graphs/:name/topology", get(graph_topology))
+
         .route("/api/overview", get(overview))
         .route("/api/targets", get(list_targets))
         .route("/api/targets/:name", get(get_target))
@@ -188,6 +231,14 @@ async fn list_apps(State(st): State<Shared>) -> ApiResult {
 }
 
 async fn declare(app: &Shared, spec: TargetSpec) -> ApiResult {
+    let _guard = app.declare_lock.lock().await;
+    declare_locked(app, spec).await
+}
+
+/// The declare itself. Separate because `do_sync` declares a whole set and must
+/// hold the lock across all of them — a reconcile pass landing between two of them
+/// would see half a configuration and reap the other half.
+async fn declare_locked(app: &Shared, spec: TargetSpec) -> ApiResult {
     let name = spec.name.clone();
 
     let problems = gate_core::validate(&spec);
@@ -198,31 +249,116 @@ async fn declare(app: &Shared, spec: TargetSpec) -> ApiResult {
         ));
     }
 
-    if let Some(old) = app.registry.get(&spec.application, &name) {
-        if gate_core::needs_version_bump(&old.spec, &spec) && spec.version <= old.spec.version {
+    // G10, from the target side: a graph node IS the target `{graph}.{node}`, so
+    // declaring that name standalone would put two owners on one queue family and
+    // whichever declared last would be the one enforcing.
+    if let Some(g) = app.registry.graph_owning_target(&spec.application, &name) {
+        return Err(Fail(
+            StatusCode::CONFLICT,
+            format!(
+                "`{name}` is a node of graph `{}`: it is declared there, not as a standalone target",
+                g.spec.name
+            ),
+        ));
+    }
+    // And the same question of the STORE, because a declare lands on one replica: a
+    // graph declared a second ago on another pod is not in this registry yet, and
+    // without this the two would each accept an owner for one queue family and
+    // disagree until the reconcile loop noticed. A store that will not answer is not
+    // a reason to refuse — the local check still stands.
+    if let Ok(stored) = crate::store::try_load_graphs(&app.queen).await {
+        if let Some(g) = stored.items.iter().find(|g| {
+            g.application == spec.application
+                && g.nodes.keys().any(|n| g.node_target_name(n) == name)
+        }) {
             return Err(Fail(
                 StatusCode::CONFLICT,
                 format!(
-                    "this change re-founds the counters (a new partition starts at zero): bump version above {}",
-                    old.spec.version
+                    "`{name}` is a node of graph `{}` (declared on another replica): it is declared \
+                     there, not as a standalone target",
+                    g.name
                 ),
             ));
         }
-        supervisor::stop_with(&app.queen, &old).await;
     }
 
-    let rt = supervisor::start(&app.queen, app.meter.clone(), app.history.clone(), spec.clone())
-        .await
-        .map_err(|e| Fail(StatusCode::BAD_GATEWAY, format!("provisioning failed: {e}")))?;
-    app.registry.put(rt);
+
+    let old = app.registry.get(&spec.application, &name);
+    if let Some(old) = &old {
+        if gate_core::needs_version_bump(&old.spec, &spec) && spec.version <= old.spec.version {
+            // Sharding is named specially because it moves the QUEUES as well as the
+            // counters: work already waiting in the old partitions has no runner in
+            // the new layout, and nothing migrates it.
+            let resharding = old.spec.shard_by != spec.shard_by
+                || old.spec.shard_count() != spec.shard_count();
+            return Err(Fail(
+                StatusCode::CONFLICT,
+                format!(
+                    "this change re-founds the counters (a new partition starts at zero): bump version \
+                     above {}{}",
+                    old.spec.version,
+                    if resharding {
+                        ". It also re-partitions the push queue: drain this target before applying it, \
+                         because work already waiting in the old partitions has no runner in the new \
+                         layout"
+                    } else {
+                        ""
+                    }
+                ),
+            ));
+        }
+
+    }
+
+    // Stop-then-start, with the old spec put back if the new one cannot be
+    // provisioned. Without that restore the target is left stopped and still
+    // registered: it accepts pushes and admits nothing, for ever, which is the one
+    // failure an operator cannot recover from without knowing this code.
+    let rt = match supervisor::swap(
+        &app.queen,
+        app.meter.clone(),
+        app.history.clone(),
+        old.as_ref(),
+        spec.clone(),
+        None,
+    )
+    .await
+    {
+        Ok(rt) => rt,
+        Err(failed) => {
+            let detail = match failed.restored {
+                Some(rt) => {
+                    let version = rt.spec.version;
+                    app.registry.put(rt);
+                    format!("provisioning failed: {}; still serving version {version}", failed.error)
+                }
+                None => {
+                    // Nothing is serving it. Unregister, so a push is refused —
+                    // recoverable — rather than accepted into a queue nobody drains.
+                    app.registry.remove(&spec.application, &name);
+                    format!(
+                        "provisioning failed: {}; the old runtime could not be restarted either, so \
+                         `{name}` is unregistered and will refuse pushes until a declare succeeds",
+                        failed.error
+                    )
+                }
+            };
+            return Err(Fail(StatusCode::BAD_GATEWAY, detail));
+        }
+    };
+    app.registry.put(rt.clone());
     // Persisted only after the gates are actually up: a spec saved for a target
     // that failed to provision would come back on the next boot and fail again,
     // for ever.
-    if let Err(e) = crate::store::save(&app.queen, &spec).await {
-        tracing::warn!(target_name = %spec.name, error = %e, "declared but not persisted");
+    match crate::store::save(&app.queen, &spec).await {
+        Ok(()) => rt.persisted.store(true, std::sync::atomic::Ordering::Relaxed),
+        // NOT persisted, and marked as such: the reconcile loop removes a target
+        // the store no longer holds, and it must not read this as a delete.
+        Err(e) => tracing::warn!(target_name = %spec.name, error = %e, "declared but not persisted"),
     }
 
     Ok(Json(json!({
+
         "ok": true,
         "resolved": {
             "pushQueue": spec.push_queue(),
@@ -251,6 +387,7 @@ async fn declare(app: &Shared, spec: TargetSpec) -> ApiResult {
 /// deleted, so a target the caller has stopped declaring stops coming back on
 /// every boot.
 async fn do_sync(st: &Shared, application: &str, specs: Vec<TargetSpec>) -> ApiResult {
+    let _guard = st.declare_lock.lock().await;
     let declared: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
 
     let mut applied = Vec::new();
@@ -258,23 +395,36 @@ async fn do_sync(st: &Shared, application: &str, specs: Vec<TargetSpec>) -> ApiR
     for mut spec in specs {
         spec.application = application.to_string();
         let name = spec.name.clone();
-        match declare(st, spec).await {
+        match declare_locked(st, spec).await {
             Ok(_) => applied.push(name),
             Err(Fail(_, msg)) => refused.push(json!({ "target": name, "error": msg })),
         }
     }
 
+
     // Reap, and ONLY inside this application. The flat version of this reaped
     // everything the cell held, so two teams syncing against one deployment
     // would delete each other's targets — including from the durable store.
     // Done after the declares, so a sync that fails half way removes nothing.
+    // Graph nodes are exempt: the caller's target list does not name them, they are
+    // owned by a graph document, and reaping one would tear down half a topology
+    // while its entry node kept accepting pushes.
     let mut removed = Vec::new();
-    for rt in st.registry.of_app(application) {
+    for rt in st.registry.standalone_of_app(application) {
         if !declared.contains(&rt.spec.name) {
+
             let name = rt.spec.name.clone();
+            // The stored declaration goes first here too: a reap that stops the
+            // runners and leaves the spec behind is undone by the next reconcile, on
+            // this replica and on every other one.
+            if let Err(e) = crate::store::forget(&st.queen, application, &name).await {
+                tracing::warn!(target_name = %name, error = %e,
+                               "sync: not reaped, the stored spec could not be removed");
+                refused.push(json!({ "target": name, "error": format!("not reaped: {e}") }));
+                continue;
+            }
             supervisor::stop_with(&st.queen, &rt).await;
             st.registry.remove(application, &name);
-            let _ = crate::store::forget(&st.queen, application, &name).await;
             removed.push(name);
         }
     }
@@ -303,12 +453,15 @@ async fn target_view(app: &Shared, application: &str, name: &str) -> ApiResult {
         .budgets
         .iter()
         .map(|b| {
-            // The worst lane is the honest one: a budget is as spent as its
-            // busiest lane has made it.
+            // The worst lane, shard and scope key is the honest one: a budget is as
+            // spent as the counter closest to refusing. Asking for the unscoped `-`
+            // cell reported a per-listing limit at 0% while it was refusing work.
             let used = states
                 .values()
-                .map(|s| utilisation(b, s, "-", now))
+                .map(|s| utilisation_max(b, s, now))
                 .fold(0.0f64, f64::max);
+            let keys: usize = states.values().map(|s| gate_core::key_count(b, s)).sum();
+
             json!({
                 "id": b.id,
                 "cap": b.cap,
@@ -320,11 +473,14 @@ async fn target_view(app: &Shared, application: &str, name: &str) -> ApiResult {
                 "source": b.source,
                 "as_of": b.as_of,
                 "match": b.matcher,
+                "maxKeys": b.max_keys,
+                "keys": keys,
                 "used": used * b.cap,
                 "utilisation": used,
             })
         })
         .collect();
+
 
     let lanes: Vec<Value> = rt
         .spec
@@ -360,7 +516,13 @@ async fn target_view(app: &Shared, application: &str, name: &str) -> ApiResult {
         "name": rt.spec.name,
         "version": rt.spec.version,
         "egress": rt.spec.egress,
+        // Named, so the console does not offer an edit button for a target whose
+        // owner is a graph document.
+        "graph": rt.graph,
+        "shardBy": rt.spec.shard_by,
+        "shards": rt.spec.shard_count(),
         "spec": rt.spec,
+
         "budgets": budgets,
         "lanes": lanes,
         "last_breach_budget": breach.as_ref().map(|(b, _)| b.clone()),
@@ -374,18 +536,53 @@ async fn delete_target(State(st): State<Shared>, Path(name): Path<String>) -> Ap
 }
 
 async fn remove_target(app: &Shared, application: &str, name: &str) -> ApiResult {
+    let _guard = app.declare_lock.lock().await;
+    // A node is deleted by declaring the graph without it, never on its own: half a
+    // graph accepts work at its entry and drops it at the hole.
+    if let Some(rt) = app.registry.get(application, name) {
+        if let Some(g) = &rt.graph {
+            return Err(Fail(
+                StatusCode::CONFLICT,
+                format!(
+                    "`{name}` is a node of graph `{g}`: delete the graph, or declare it without this \
+                     node"
+                ),
+            ));
+        }
+    }
+    if app.registry.get(application, name).is_none() {
+        return Err(Fail(
+            StatusCode::NOT_FOUND,
+            format!("no target `{application}/{name}`"),
+        ));
+    }
+    // The store FIRST, and a failure there refuses the delete.
+    //
+    // The store is what the fleet reconciles against: a target dropped from this
+    // registry but still in the store comes back here within one interval and never
+    // left the other replicas at all — so a 200 would be a lie that takes fifteen
+    // seconds to expose itself.
+    crate::store::forget(&app.queen, application, name)
+        .await
+        .map_err(|e| {
+            Fail(
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "`{application}/{name}` was not deleted: the stored declaration could not be \
+                     removed ({e}), and it would come back on the next reconcile"
+                ),
+            )
+        })?;
     match app.registry.remove(application, name) {
         Some(rt) => {
             supervisor::stop_with(&app.queen, &rt).await;
-            let _ = crate::store::forget(&app.queen, application, name).await;
             Ok(Json(json!({ "ok": true })).into_response())
         }
-        None => Err(Fail(
-            StatusCode::NOT_FOUND,
-            format!("no target `{application}/{name}`"),
-        )),
+        None => Ok(Json(json!({ "ok": true })).into_response()),
     }
 }
+
+
 
 // ---------------------------------------------------------------- data plane
 
@@ -403,7 +600,12 @@ struct PushBody {
     txn: Option<String>,
     #[serde(default)]
     payload: Value,
+    /// Which lane, when the route does not carry one (the graph push routes take a
+    /// node, not a lane). Defaults to the node's default lane.
+    #[serde(default)]
+    lane: Option<String>,
 }
+
 
 async fn push(
     State(st): State<Shared>,
@@ -424,6 +626,48 @@ async fn do_push(
         .registry
         .get(application, name)
         .ok_or_else(|| Fail(StatusCode::NOT_FOUND, format!("no target `{application}/{name}`")))?;
+    refuse_graph_node(&rt, "pushed into")?;
+    push_into(app, &rt, lane, body, None).await
+}
+
+/// A graph node is reachable by its target name — `{graph}.{node}` — and the
+/// target routes would serve it like any other target. They must not.
+///
+/// The graph routes exist to enforce two rules the target routes know nothing
+/// about: only an ENTRY may be pushed into (anywhere else skips every budget
+/// upstream of it) and only a TERMINAL may be popped (anywhere else steals from
+/// the relay, and the item is then executed by the caller AND forwarded by the
+/// graph). Reaching a node through the target path would bypass both, and the
+/// entry stamp a breach rule reads.
+fn refuse_graph_node(rt: &Arc<TargetRuntime>, verb: &str) -> Result<(), Fail> {
+    match &rt.graph {
+        None => Ok(()),
+        Some(key) => {
+            let graph = key.split_once('/').map(|(_, g)| g).unwrap_or(key);
+            Err(Fail(
+                StatusCode::CONFLICT,
+                format!(
+                    "`{}` is a node of graph `{graph}` and cannot be {verb} as a target: the graph \
+                     routes are what enforce which node may be pushed to and which may be popped. \
+                     Use /v1/apps/{}/graphs/{graph}/nodes/…",
+                    rt.spec.name, rt.spec.application
+                ),
+            ))
+        }
+    }
+}
+
+
+/// The one push. Everything above it decides which target, which lane and what
+/// envelope; this decides the partition and hands the item to the broker.
+async fn push_into(
+    app: &Shared,
+    rt: &Arc<TargetRuntime>,
+    lane: &str,
+    body: PushBody,
+    meta: Option<Value>,
+) -> ApiResult {
+    let name = &rt.spec.name;
     if rt.spec.lane(lane).is_none() {
         return Err(Fail(StatusCode::NOT_FOUND, format!("no lane `{lane}` on `{name}`")));
     }
@@ -446,14 +690,45 @@ async fn do_push(
     if let Some(k) = &body.key {
         obj.insert("key".into(), json!(k));
     }
+    // Where this item entered the graph, and how many times it has been retried.
+    // Stamped at the first push and carried by every relay, because a breach has to
+    // send it back to the entry it came in at — a re-entry anywhere else spends a
+    // path it never paid for.
+    if let Some(m) = meta {
+        obj.insert(GATE_META.to_string(), m);
+    }
 
-    let lane_for_push = lane.to_string();
-    let q = app.queen.queue(rt.spec.push_queue()).partition(lane);
+    // A shard is a partition, and the partition IS the lane when the target is not
+    // sharded. A missing dimension is refused rather than defaulted: a counter keyed
+    // on an absent value measures the wrong thing, and the gate would deny the item
+    // for ever at the head of its lane.
+    let partition = match rt.spec.shard_by {
+        None => lane.to_string(),
+        Some(dim) => match item.get(dim.as_str()).and_then(|v| v.as_str()) {
+            Some(v) => rt.spec.push_partition(lane, rt.spec.shard_of(v)),
+            None => {
+                return Err(Fail(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!(
+                        "`{name}` is sharded by `{}` and this push carries no `{}`: there is no shard \
+                         it could belong to",
+                        dim.as_str(),
+                        dim.as_str()
+                    ),
+                ))
+            }
+        },
+    };
+
+    let q = app
+        .queen
+        .queue(rt.spec.push_queue())
+        .partition(partition.clone());
     let res = match body.txn {
         Some(t) => {
             q.push_items(vec![queen_mq::PushItem {
                 queue: rt.spec.push_queue(),
-                partition: Some(lane_for_push.clone()),
+                partition: Some(partition),
                 payload: item,
                 transaction_id: Some(t),
             }])
@@ -466,13 +741,18 @@ async fn do_push(
     Ok(Json(json!({ "ok": true, "pushed": res.len() })).into_response())
 }
 
+
 #[derive(Deserialize)]
 struct NextQuery {
     #[serde(default)]
     batch: Option<i32>,
     #[serde(default)]
     wait_ms: Option<u64>,
+    /// Which lane to pop, for the graph routes, which name a node instead.
+    #[serde(default)]
+    lane: Option<String>,
 }
+
 
 async fn next(
     State(st): State<Shared>,
@@ -493,6 +773,13 @@ async fn do_next(
         .registry
         .get(application, name)
         .ok_or_else(|| Fail(StatusCode::NOT_FOUND, format!("no target `{application}/{name}`")))?;
+    refuse_graph_node(&rt, "popped")?;
+    next_from(app, &rt, lane, q).await
+}
+
+/// The pop itself, with no ownership rule attached: a graph route has already
+/// decided that this node is one a caller may consume.
+async fn next_from(app: &Shared, rt: &Arc<TargetRuntime>, lane: &str, q: NextQuery) -> ApiResult {
     let l = rt
         .spec
         .lane(lane)
@@ -506,8 +793,14 @@ async fn do_next(
         .queen
         .queue(rt.spec.admitted_queue(lane))
         .group(format!("gate.exec.{}", lane))
+        // `all`, always. A group created at the tail skips every message already
+        // admitted and waiting — a consumer that starts after the gate has been
+        // running would silently abandon the backlog, and the broker's own default
+        // is `new` unless the deployment says otherwise.
+        .subscription_mode(SubscriptionMode::All)
         .batch(q.batch.unwrap_or(l.concurrency as i32).max(1))
-        .partitions(rt.spec.admitted.partitions as i32)
+        .partitions(rt.spec.admitted.partitions.max(1) as i32)
+
         .wait(true)
         .poll_timeout(std::time::Duration::from_millis(wait))
         .pop()
@@ -558,10 +851,38 @@ struct AckBody {
     /// caller's classifier could tell.
     #[serde(default)]
     budget_id: Option<String>,
+    /// The vendor's HTTP status, when the caller kept it. A `breach` rule may match
+    /// on it; `outcome: throttled` is what a 429 looks like when it did not.
+    #[serde(default)]
+    status: Option<i64>,
+    /// Override the entry a breached item re-enters at. Validated against the
+    /// graph — an entry node or `origin-entry`, never an interior node, because a
+    /// re-entry that skips upstream budgets spends a path it never paid for.
+    #[serde(default, rename = "retryTo")]
+    retry_to: Option<String>,
+    /// WHICH items of this lease the outcome is about, by message id.
+    ///
+    /// `outcome` is one field for a whole lease, so a consumer that runs a batch and
+    /// acks once cannot otherwise say "one of these fifty was throttled" — and a
+    /// breach rule applied to all fifty would re-enter forty-nine calls the vendor
+    /// accepted. Absent, the outcome is taken to be about every item settled by this
+    /// ack, which is what a one-item ack means.
+    #[serde(default)]
+    breached: Option<Vec<String>>,
+
+}
+
+
+/// The broker's own classification for "this transaction id is already in that
+/// queue's dedup window". Matched on the message because the SDK surfaces the
+/// broker's `RAISE` text; the code is stable and documented (`QDUP`).
+fn is_duplicate(e: &queen_mq::Error) -> bool {
+    e.to_string().contains("QDUP")
 }
 
 fn default_outcome() -> String {
     "ok".to_string()
+
 }
 
 async fn ack(State(app): State<Shared>, Json(body): Json<AckBody>) -> ApiResult {
@@ -570,6 +891,25 @@ async fn ack(State(app): State<Shared>, Json(body): Json<AckBody>) -> ApiResult 
     }
     let n = body.up_to.unwrap_or(body.lease.len()).min(body.lease.len());
     let slice = &body.lease[..n];
+    let application = body
+        .application
+        .clone()
+        .unwrap_or_else(gate_core::default_application);
+    let rt = body
+        .target
+        .as_ref()
+        .and_then(|t| app.registry.get(&application, t));
+
+    // A vendor throttle routed back into the graph, paced instead of amplified.
+    //
+    // The item re-enters at the entry it came in at and WAITS FOR BUDGET — the
+    // pacing is the backoff, and no timer is involved. It re-pays every budget on
+    // its path, which is correct rather than harsh: the vendor counted the call that
+    // failed, so the retry is a new call and owes the whole path.
+    let retro = plan_retro(&app, &rt, &body, slice);
+
+
+
 
     // The cursor advance and the measurement event go in ONE transaction.
     // Split across two calls the failure is asymmetric and nasty: if the ack
@@ -577,12 +917,14 @@ async fn ack(State(app): State<Shared>, Json(body): Json<AckBody>) -> ApiResult 
     // counted, the meter under-reads, the derived cap rises, and the limiter
     // believes it has budget it does not — overshooting in silence exactly when
     // it is already in trouble.
+    //
+    // The retro pushes ride in the same transaction, for the same reason and one
+    // more: a retry that lands without its ack is a duplicate, and an ack that
+    // lands without its retry is a call the vendor refused and nobody will make
+    // again.
     let lane = body.lane.clone().unwrap_or_default();
-    let application = body
-        .application
-        .clone()
-        .unwrap_or_else(gate_core::default_application);
     let event = body.target.as_ref().map(|t| {
+
         json!({
             "target": t,
             "lane": lane,
@@ -594,22 +936,43 @@ async fn ack(State(app): State<Shared>, Json(body): Json<AckBody>) -> ApiResult 
         })
     });
 
-    match (
-        &event,
-        body.target
-            .as_ref()
-            .and_then(|t| app.registry.get(&application, t)),
-    ) {
-        (Some(ev), Some(rt)) => {
+    let mut already_re_entered = false;
+    match (&event, &rt) {
+        (Some(ev), Some(target)) => {
             let mut tx = app.queen.transaction();
             for m in slice {
                 tx = tx.ack(m);
             }
-            tx.push(rt.spec.calls_queue(), ev.clone())
-                .map_err(|e| Fail(StatusCode::BAD_GATEWAY, e.to_string()))?
-                .commit()
-                .await
+            tx = tx
+                .push(target.spec.calls_queue(), ev.clone())
                 .map_err(|e| Fail(StatusCode::BAD_GATEWAY, e.to_string()))?;
+            for item in &retro.pushes {
+                tx = tx
+                    .push_item(item.clone())
+                    .map_err(|e| Fail(StatusCode::BAD_GATEWAY, e.to_string()))?;
+            }
+            match tx.commit().await {
+                Ok(_) => {}
+                // A re-entry this ack has already made.
+                //
+                // A duplicate transaction id is a soft verdict for a plain push and a
+                // HARD one inside a transaction — the broker raises `QDUP` and rolls
+                // the whole bundle back (queen `005_log_ack.sql`: "a duplicate is a
+                // SOFT verdict for plain pushes but a HARD error inside a
+                // transaction"). The retro push is keyed `{txn}:r{attempt}`, so this
+                // means exactly one thing: this ack has been sent before, the retry is
+                // already waiting for budget, and all that is left to do is settle.
+                // Failing here instead would leave a caller retrying an ack that can
+                // never succeed until its lease lapses — and then doing the work again.
+                Err(e) if is_duplicate(&e) => {
+                    already_re_entered = true;
+                    app.queen
+                        .ack_all(slice)
+                        .await
+                        .map_err(|e| Fail(StatusCode::BAD_GATEWAY, e.to_string()))?;
+                }
+                Err(e) => return Err(Fail(StatusCode::BAD_GATEWAY, e.to_string())),
+            }
         }
         _ => {
             app.queen
@@ -619,11 +982,8 @@ async fn ack(State(app): State<Shared>, Json(body): Json<AckBody>) -> ApiResult 
         }
     }
 
-    if let Some(t) = body
-        .target
-        .as_ref()
-        .and_then(|t| app.registry.get(&application, t))
-    {
+    if let Some(t) = &rt {
+
         // The lane is told to us, not guessed. It used to be inferred from the
         // message's partition, which is a hash bucket (`p0`..`pN`) and never
         // matched a lane name, so every ack landed on whichever lane happened to
@@ -634,15 +994,238 @@ async fn ack(State(app): State<Shared>, Json(body): Json<AckBody>) -> ApiResult 
             if body.outcome == "throttled" {
                 s.throttled += 1;
             }
+            s.retried += if already_re_entered { 0 } else { retro.pushes.len() as u64 };
+
+            s.exhausted += retro.exhausted;
         }
         if body.outcome == "throttled" {
             *t.last_breach.write() =
                 Some((body.budget_id.clone().unwrap_or_else(|| "unattributed".into()), now_ms()));
         }
+        // Traces, because a retry that is paced looks like nothing at all from the
+        // outside: the queue simply takes longer to drain. These are the only record
+        // that a vendor refused work this gate had admitted and what became of it.
+        for outcome in retro.traces {
+            app.meter.record_outcome(
+                &t.spec.key(),
+                &lane,
+                &body.op.clone().unwrap_or_default(),
+                &outcome,
+                body.budget_id.as_deref(),
+                now_ms(),
+            );
+        }
     }
 
-    Ok(Json(json!({ "ok": true, "acked": n })).into_response())
+    Ok(Json(json!({
+        "ok": true,
+        "acked": n,
+        // Named, because a caller that acks `throttled` and sees `retried: 0` is
+        // looking at a graph with no breach rule, and that is worth knowing.
+        // Zero when the re-entry was already made by an earlier copy of this same
+        // ack: the caller is not being told a retry happened twice.
+        "retried": if already_re_entered { 0 } else { retro.pushes.len() },
+        "exhausted": retro.exhausted,
+        "unroutable": retro.unroutable,
+        "refused": if already_re_entered {
+            Some("this ack had already been settled; its re-entry is already waiting for budget"
+                .to_string())
+        } else {
+            retro.refused.clone()
+        },
+
+    }))
+
+    .into_response())
 }
+
+/// What a breach rule does to one settled batch.
+#[derive(Default)]
+struct Retro {
+    /// One push per item that re-enters, already carrying its bumped attempt count.
+    pushes: Vec<TxnPushItem>,
+    /// Items that had used up `maxAttempts` and are settled instead.
+    exhausted: u64,
+    /// Items a rule matched but that had nowhere to go — no entry could be resolved,
+    /// or the entry could never admit them. Settled, counted and traced, never
+    /// silently dropped.
+    unroutable: u64,
+    /// Why nothing was retried, when the caller asked for something this graph
+    /// cannot do. Reported in the ack's answer rather than as a failed ack: the work
+    /// has already been done, and refusing to settle it would have it done again.
+    refused: Option<String>,
+    traces: Vec<String>,
+}
+
+/// Work out the re-entries for an ack, without touching the broker.
+///
+/// Everything it needs is already in hand: the lease carries the payloads (a `next`
+/// hands them back verbatim), the payload carries the entry it came in at and its
+/// attempt count, and the graph document carries the rules. So a retry costs no
+/// round trip and no state — it is the ack's own transaction with one more push in
+/// it.
+fn plan_retro(
+    app: &Shared,
+    rt: &Option<Arc<TargetRuntime>>,
+    body: &AckBody,
+    slice: &[Message],
+) -> Retro {
+    let mut out = Retro::default();
+    let Some(rt) = rt else { return out };
+    let Some(graph_key) = rt.graph.clone() else {
+        // A standalone target has no graph to re-enter, and inventing one would be a
+        // retry loop on the same queue with no budget between the attempts.
+        if body.retry_to.is_some() {
+            out.refused = Some(format!(
+                "`{}` is not a graph node: there is no entry to retry to",
+                rt.spec.name
+            ));
+        }
+        return out;
+    };
+    let Some(g) = app.registry.graph_by_key(&graph_key) else {
+        return out;
+    };
+
+    // A rule has to MATCH this ack, whether or not the caller also named a
+    // `retryTo`. An override chooses the door; it does not decide that a breach
+    // happened — otherwise an `outcome: ok` with a stray `retryTo` would re-enter
+    // work that succeeded.
+    let Some(declared) = g.spec.breach_for(&body.outcome, body.status) else {
+        if body.retry_to.is_some() {
+            out.refused = Some(format!(
+                "no breach rule of graph `{}` matches outcome `{}`{}: a retryTo names the door, it \
+                 does not declare the breach",
+                g.spec.name,
+                body.outcome,
+                body.status.map(|s| format!(" / status {s}")).unwrap_or_default(),
+            ));
+        }
+        return out;
+    };
+    let rule = match &body.retry_to {
+        None => declared.clone(),
+        Some(to) => {
+            let mut r = declared.clone();
+            r.retry_to = to.clone();
+            if r.retry_to != gate_core::ORIGIN_ENTRY && !g.spec.is_entry(&r.retry_to) {
+                out.refused = Some(format!(
+                    "`retryTo: {to}` is not an entry of `{}`: a re-entry that skips the upstream \
+                     budgets spends a path it never paid for. Entries: {}",
+                    g.spec.name,
+                    g.spec.entries().join(", ")
+                ));
+                return out;
+            }
+            r
+        }
+    };
+
+    // Which items the breach is about.
+    //
+    // `outcome` is ONE field for a whole lease, and a consumer that runs a batch of
+    // fifty and acks once would otherwise re-enter all fifty because one of them was
+    // refused — forty-nine duplicate calls, in the name of not amplifying retries.
+    // So a caller that batches names the ids it is talking about; without them the
+    // rule applies to the settled slice, which is exactly right for the one-item ack
+    // and is what a caller asked for by not narrowing it.
+    let breached: Option<std::collections::HashSet<&str>> = body
+        .breached
+        .as_ref()
+        .map(|ids| ids.iter().map(|s| s.as_str()).collect());
+
+    for m in slice {
+        if let Some(only) = &breached {
+            if !only.contains(m.id.as_str()) {
+                continue;
+            }
+        }
+        let meta = m.data.get(GATE_META);
+        let attempt = meta
+            .and_then(|v| v.get("attempt"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let origin = meta.and_then(|v| v.get("entry")).and_then(|v| v.as_str());
+        let next = attempt + 1;
+
+        if next > rule.max_attempts as u64 {
+            out.exhausted += 1;
+            out.traces.push("exhausted".to_string());
+            continue;
+        }
+        let Some(entry) = g.spec.retry_entry(&rule, origin) else {
+            // No stamp and more than one entry: we do not guess which door it came
+            // in at, because the wrong one skips a budget.
+            out.unroutable += 1;
+            out.traces.push("unroutable".to_string());
+            continue;
+        };
+        let Some(ns) = g.spec.node_spec(&entry) else {
+            out.unroutable += 1;
+            out.traces.push("unroutable".to_string());
+            continue;
+        };
+        let Some(lane) = ns.default_lane().map(|l| l.name.clone()) else {
+            out.unroutable += 1;
+            out.traces.push("unroutable".to_string());
+            continue;
+        };
+        // The same check the push route makes, for the same reason: an item costing
+        // more than the entry's `cost.max` can never be admitted there, and it would
+        // sit at the head of that lane for ever without ever reaching a DLQ.
+        // Validation (`retry-cost`) refuses the topologies where this is possible, so
+        // reaching it means a document changed under work already in flight.
+        let cost = m
+            .data
+            .get(&ns.cost.field)
+            .and_then(|v| v.as_f64())
+            .unwrap_or(ns.cost.default);
+        if cost > ns.cost.max {
+            out.unroutable += 1;
+            out.traces.push("unroutable".to_string());
+            continue;
+        }
+        let partition = match ns.shard_by {
+            None => lane,
+            Some(dim) => match m.data.get(dim.as_str()).and_then(|v| v.as_str()) {
+                Some(v) => ns.push_partition(&lane, ns.shard_of(v)),
+                None => {
+                    out.unroutable += 1;
+                    out.traces.push("unroutable".to_string());
+                    continue;
+                }
+            },
+        };
+
+        let mut payload = m.data.clone();
+        if let Some(obj) = payload.as_object_mut() {
+            let mut meta = obj
+                .get(GATE_META)
+                .cloned()
+                .unwrap_or_else(|| json!({ "graph": g.spec.name }));
+            if let Some(mo) = meta.as_object_mut() {
+                mo.insert("attempt".into(), json!(next));
+                mo.insert("entry".into(), json!(entry));
+            }
+            obj.insert(GATE_META.to_string(), meta);
+        }
+
+        out.pushes.push(TxnPushItem {
+            queue: ns.push_queue(),
+            partition: Some(partition),
+            payload,
+            // The attempt is IN the id, so a replayed ack re-pushes the same
+            // re-entry and the broker's dedup collapses it — while a genuine second
+            // attempt is a different id and is not mistaken for one.
+            transaction_id: Some(format!("{}:r{next}", m.transaction_id)),
+            trace_id: None,
+        });
+        out.traces.push("retried".to_string());
+    }
+    out
+}
+
+
 
 #[derive(Deserialize)]
 struct NackBody {
@@ -692,7 +1275,350 @@ async fn renew(State(app): State<Shared>, Json(body): Json<RenewBody>) -> ApiRes
     Ok(Json(json!({ "ok": true, "renewed": renewed })).into_response())
 }
 
+// --------------------------------------------------------------------- graphs
+
+async fn put_graph(
+    State(st): State<Shared>,
+    Path((application, name)): Path<(String, String)>,
+    Json(mut spec): Json<GraphSpec>,
+) -> ApiResult {
+    spec.application = application;
+    spec.name = name;
+    declare_graph(&st, spec).await
+}
+
+async fn put_graph_default(
+    State(st): State<Shared>,
+    Path(name): Path<String>,
+    Json(mut spec): Json<GraphSpec>,
+) -> ApiResult {
+    spec.name = name;
+    declare_graph(&st, spec).await
+}
+
+async fn declare_graph(st: &Shared, spec: GraphSpec) -> ApiResult {
+    let _guard = st.declare_lock.lock().await;
+    let rt = crate::graph::declare(st, spec).await.map_err(|r| match r {
+        crate::graph::Refusal::Invalid(m) => Fail(StatusCode::UNPROCESSABLE_ENTITY, m),
+        crate::graph::Refusal::Conflict(m) => Fail(StatusCode::CONFLICT, m),
+        crate::graph::Refusal::Gateway(m) => Fail(StatusCode::BAD_GATEWAY, m),
+    })?;
+
+    // The resolved topology, so a caller can see what its document became without
+    // learning the naming rules: which node is pushable, which is poppable, and
+    // which queues the relays own.
+    let nodes: Vec<Value> = rt
+        .spec
+        .nodes
+        .keys()
+        .map(|n| {
+            let ns = rt.spec.node_spec(n).expect("declared");
+            json!({
+                "name": n,
+                "target": ns.name,
+                "entry": rt.spec.is_entry(n),
+                "consume": rt.spec.is_consume(n),
+                "pushQueue": ns.push_queue(),
+                "shards": ns.shard_count(),
+                "admittedQueues": ns.lanes.iter().map(|l| ns.admitted_queue(&l.name))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "ok": true,
+        "resolved": {
+            "nodes": nodes,
+            "edges": rt.spec.edges,
+            "relays": rt.relays.iter().map(|r| json!({
+                "dest": r.dest,
+                "sources": r.sources.iter().map(|(n, p)| json!({ "node": n, "priority": p }))
+                    .collect::<Vec<_>>(),
+                // How deep the destination's push queue is allowed to get. Shallow
+                // is what makes priority at the entrance priority in fact.
+                "window": r.window,
+            })).collect::<Vec<_>>(),
+            "consume": rt.spec.consume,
+        },
+        "warnings": gate_core::graph_warnings(&rt.spec).iter().map(|p| p.to_string())
+            .collect::<Vec<_>>(),
+    }))
+    .into_response())
+}
+
+/// The flat form resolves a graph by name: the default application first, then a
+/// unique match anywhere. Several owners of one name is the one case we refuse to
+/// guess at.
+fn resolve_graph(
+    st: &Shared,
+    application: Option<&str>,
+    name: &str,
+) -> Result<Arc<crate::registry::GraphRuntime>, Fail> {
+    if let Some(app) = application {
+        return st
+            .registry
+            .graph(app, name)
+            .ok_or_else(|| Fail(StatusCode::NOT_FOUND, format!("no graph `{app}/{name}`")));
+    }
+    if let Some(g) = st.registry.graph(&gate_core::default_application(), name) {
+        return Ok(g);
+    }
+    let matches: Vec<_> = st
+        .registry
+        .graphs()
+        .into_iter()
+        .filter(|g| g.spec.name == name)
+        .collect();
+    match matches.len() {
+        0 => Err(Fail(StatusCode::NOT_FOUND, format!("no graph `{name}`"))),
+        1 => Ok(matches.into_iter().next().expect("one")),
+        _ => Err(Fail(
+            StatusCode::CONFLICT,
+            format!(
+                "`{name}` is declared by {} applications; name one: /v1/apps/:app/graphs/{name}",
+                matches.len()
+            ),
+        )),
+    }
+}
+
+async fn get_graph(
+    State(st): State<Shared>,
+    Path((application, name)): Path<(String, String)>,
+) -> ApiResult {
+    let g = resolve_graph(&st, Some(&application), &name)?;
+    Ok(Json(crate::graph::view(&st, &g).await).into_response())
+}
+
+async fn get_graph_default(State(st): State<Shared>, Path(name): Path<String>) -> ApiResult {
+    let g = resolve_graph(&st, None, &name)?;
+    Ok(Json(crate::graph::view(&st, &g).await).into_response())
+}
+
+async fn del_graph(
+    State(st): State<Shared>,
+    Path((application, name)): Path<(String, String)>,
+) -> ApiResult {
+    remove_graph(&st, &application, &name).await
+}
+
+async fn del_graph_default(State(st): State<Shared>, Path(name): Path<String>) -> ApiResult {
+    let g = resolve_graph(&st, None, &name)?;
+    let application = g.spec.application.clone();
+    remove_graph(&st, &application, &name).await
+}
+
+async fn remove_graph(st: &Shared, application: &str, name: &str) -> ApiResult {
+    let _guard = st.declare_lock.lock().await;
+    match crate::graph::remove(st, application, name).await {
+        Ok(true) => Ok(Json(json!({ "ok": true })).into_response()),
+        Ok(false) => Err(Fail(
+            StatusCode::NOT_FOUND,
+            format!("no graph `{application}/{name}`"),
+        )),
+        Err(crate::graph::Refusal::Invalid(m)) => Err(Fail(StatusCode::UNPROCESSABLE_ENTITY, m)),
+        Err(crate::graph::Refusal::Conflict(m)) => Err(Fail(StatusCode::CONFLICT, m)),
+        Err(crate::graph::Refusal::Gateway(m)) => Err(Fail(StatusCode::BAD_GATEWAY, m)),
+    }
+}
+
+
+async fn graph_push(
+    State(st): State<Shared>,
+    Path((application, graph, node)): Path<(String, String, String)>,
+    Json(body): Json<PushBody>,
+) -> ApiResult {
+    do_graph_push(&st, Some(&application), &graph, &node, body).await
+}
+
+async fn graph_push_default(
+    State(st): State<Shared>,
+    Path((graph, node)): Path<(String, String)>,
+    Json(body): Json<PushBody>,
+) -> ApiResult {
+    do_graph_push(&st, None, &graph, &node, body).await
+}
+
+async fn do_graph_push(
+    st: &Shared,
+    application: Option<&str>,
+    graph: &str,
+    node: &str,
+    body: PushBody,
+) -> ApiResult {
+    let g = resolve_graph(st, application, graph)?;
+    if !g.spec.nodes.contains_key(node) {
+        return Err(Fail(
+            StatusCode::NOT_FOUND,
+            format!("graph `{graph}` has no node `{node}`"),
+        ));
+    }
+    // An interior node's push queue belongs to its in-edges. A caller pushing there
+    // would inject work that has paid none of the upstream budgets — which is the
+    // whole point of the path it skipped.
+    if !g.spec.is_entry(node) {
+        return Err(Fail(
+            StatusCode::CONFLICT,
+            format!(
+                "`{node}` is not an entry of `{graph}`: its push queue is fed by {} and pushing there \
+                 would skip every budget upstream of it. Entries: {}",
+                g.spec
+                    .in_edges(node)
+                    .iter()
+                    .map(|e| e.from.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                g.spec.entries().join(", ")
+            ),
+        ));
+    }
+
+    let ns = g.spec.node_spec(node).expect("declared");
+    let rt = st
+        .registry
+        .get(&ns.application, &ns.name)
+        .ok_or_else(|| Fail(StatusCode::SERVICE_UNAVAILABLE, format!("node `{node}` is not running")))?;
+    let lane = match &body.lane {
+        Some(l) => l.clone(),
+        None => ns
+            .default_lane()
+            .map(|l| l.name.clone())
+            .ok_or_else(|| Fail(StatusCode::CONFLICT, format!("node `{node}` has no default lane")))?,
+    };
+
+    let meta = json!({ "graph": g.spec.name, "entry": node, "attempt": 0 });
+    push_into(st, &rt, &lane, body, Some(meta)).await
+}
+
+async fn graph_next(
+    State(st): State<Shared>,
+    Path((application, graph, node)): Path<(String, String, String)>,
+    Query(q): Query<NextQuery>,
+) -> ApiResult {
+    do_graph_next(&st, Some(&application), &graph, &node, q).await
+}
+
+async fn graph_next_default(
+    State(st): State<Shared>,
+    Path((graph, node)): Path<(String, String)>,
+    Query(q): Query<NextQuery>,
+) -> ApiResult {
+    do_graph_next(&st, None, &graph, &node, q).await
+}
+
+async fn do_graph_next(
+    st: &Shared,
+    application: Option<&str>,
+    graph: &str,
+    node: &str,
+    q: NextQuery,
+) -> ApiResult {
+    let g = resolve_graph(st, application, graph)?;
+    if !g.spec.nodes.contains_key(node) {
+        return Err(Fail(
+            StatusCode::NOT_FOUND,
+            format!("graph `{graph}` has no node `{node}`"),
+        ));
+    }
+    // An interior node's admitted queue is the relay's source. A caller popping it
+    // steals from the graph: two consumers on one queue split the work at random and
+    // the item never reaches the node that was supposed to pace it.
+    if !g.spec.is_consume(node) {
+        return Err(Fail(
+            StatusCode::CONFLICT,
+            format!(
+                "`{node}` is not consumable: its admitted queue is drained by the relay into {}. Pop \
+                 one of: {}",
+                g.spec
+                    .out_edges(node)
+                    .iter()
+                    .map(|e| e.to.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                g.spec.consume.join(", ")
+            ),
+        ));
+    }
+
+    let ns = g.spec.node_spec(node).expect("declared");
+    let lane = match &q.lane {
+        Some(l) => l.clone(),
+        None => ns
+            .default_lane()
+            .map(|l| l.name.clone())
+            .ok_or_else(|| Fail(StatusCode::CONFLICT, format!("node `{node}` has no default lane")))?,
+    };
+    let rt = st
+        .registry
+        .get(&ns.application, &ns.name)
+        .ok_or_else(|| Fail(StatusCode::SERVICE_UNAVAILABLE, format!("node `{node}` is not running")))?;
+    next_from(st, &rt, &lane, q).await
+}
+
+
+async fn list_graphs(State(st): State<Shared>) -> ApiResult {
+    let mut out = Vec::new();
+    for g in st.registry.graphs() {
+        let mut nodes = Vec::new();
+        for (name, ns) in g.spec.node_specs() {
+            let waiting: u64 = st
+                .depths
+                .pending(&st.queen, &ns.push_queue())
+                .await
+                .values()
+                .sum();
+            let rt = st.registry.get(&ns.application, &ns.name);
+            let (mut admitted, mut denied) = (0u64, 0u64);
+            if let Some(rt) = &rt {
+                for l in rt.lanes.values() {
+                    let s = l.stats.read();
+                    admitted += s.admitted;
+                    denied += s.denied;
+                }
+            }
+            nodes.push(json!({
+                "name": name,
+                "target": ns.name,
+                "entry": g.spec.is_entry(&name),
+                "consume": g.spec.is_consume(&name),
+                "running": rt.is_some(),
+                "budgets": ns.budgets.len(),
+                "shards": ns.shard_count(),
+                "waiting_for_budget": waiting,
+                "admitted": admitted,
+                "denied": denied,
+            }));
+        }
+        out.push(json!({
+            "application": g.spec.application,
+            "name": g.spec.name,
+            "version": g.spec.version,
+            "nodes": nodes,
+            "edges": g.spec.edges,
+            "consume": g.spec.consume,
+            "breach": g.spec.breach,
+            "forwarded": g.relays.iter().map(|r| r.forwarded()).sum::<u64>(),
+        }));
+    }
+    Ok(Json(json!(out)).into_response())
+}
+
+async fn graph_topology(
+    State(st): State<Shared>,
+    Path((application, name)): Path<(String, String)>,
+) -> ApiResult {
+    let g = resolve_graph(&st, Some(&application), &name)?;
+    Ok(Json(crate::graph::topology(&g)).into_response())
+}
+
+async fn graph_topology_default(State(st): State<Shared>, Path(name): Path<String>) -> ApiResult {
+    let g = resolve_graph(&st, None, &name)?;
+    Ok(Json(crate::graph::topology(&g)).into_response())
+}
+
 // -------------------------------------------------------------- console read
+
 
 #[derive(Deserialize)]
 struct RollupQuery {
@@ -999,7 +1925,17 @@ async fn app_metrics(State(app): State<Shared>, Path(application): Path<String>)
                 .await
                 .values()
                 .sum();
-            let budget_pending = push.get(&lane.name).copied().unwrap_or(0);
+            // Every partition this lane owns. A sharded target's push partitions are
+            // `{lane}:{shard}`, and looking only for the bare lane name reported a
+            // sharded target as having nothing waiting — which is the one number this
+            // endpoint exists to answer.
+            let shard_prefix = format!("{}:", lane.name);
+            let budget_pending: u64 = push
+                .iter()
+                .filter(|(p, _)| *p == &lane.name || p.starts_with(&shard_prefix))
+                .map(|(_, n)| *n)
+                .sum();
+
 
             // A rate, not a lifetime total: dividing a running counter by an
             // uptime the caller does not know would be a number that is wrong in
@@ -1033,10 +1969,11 @@ async fn app_metrics(State(app): State<Shared>, Path(application): Path<String>)
             .map(|b| {
                 let u = states
                     .values()
-                    .map(|s| utilisation(b, s, "-", now))
+                    .map(|s| utilisation_max(b, s, now))
                     .fold(0.0f64, f64::max);
                 (b, u)
             })
+
             .fold(None::<(&gate_core::Budget, f64)>, |acc, x| match acc {
                 Some(a) if a.1 >= x.1 => Some(a),
                 _ => Some(x),
@@ -1162,8 +2099,9 @@ async fn list_targets(State(app): State<Shared>) -> ApiResult {
             for b in &rt.spec.budgets {
                 let u = states
                     .values()
-                    .map(|s| utilisation(b, s, "-", now))
+                    .map(|s| utilisation_max(b, s, now))
                     .fold(0.0f64, f64::max);
+
                 if u >= worst_u {
                     worst_id = b.id.clone();
                     worst_u = u;
@@ -1181,7 +2119,9 @@ async fn list_targets(State(app): State<Shared>) -> ApiResult {
                 "application": rt.spec.application,
                 "name": rt.spec.name,
                 "version": rt.spec.version,
+                "graph": rt.graph,
                 "lanes": rt.spec.lanes.iter().map(|l| json!({"name": l.name})).collect::<Vec<_>>(),
+
                 "budgets_total": rt.spec.budgets.len(),
                 "assumed_budgets": rt.spec.budgets.iter()
                     .filter(|b| b.confidence == gate_core::Confidence::Assumed).count(),
