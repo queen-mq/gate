@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96" role="img" aria-label="Gate">
+  <!-- The console's own mark, lifted out of ui/src/App.vue: two posts and a bar.
+       A gate, which is what the thing does — it does not slow traffic down, it
+       decides what goes through.
+
+       Explicit colours rather than `currentColor`: an SVG referenced by <img>
+       cannot inherit the page's, and this has to stay legible on GitHub's light
+       theme and its dark one. -->
+  <rect x="2" y="2" width="92" height="92" rx="22" fill="#141416" stroke="#2f2f35" stroke-width="2"/>
+  <g fill="none" stroke="#fafafa" stroke-width="5.7" stroke-linecap="round">
+    <path d="M31 29v38"/>
+    <path d="M65 29v38"/>
+    <path d="M42 48h12"/>
+  </g>
+</svg>
