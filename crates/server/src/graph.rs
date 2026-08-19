@@ -376,6 +376,14 @@ pub async fn remove(app: &Shared, application: &str, name: &str) -> Result<bool,
             ))
         })?;
     if let Some(g) = app.registry.remove_graph(application, name) {
+        // Every node's cancel first: a runner notices one between polls, so the
+        // serial stops below then wait out ONE poll window between them all
+        // instead of one each.
+        for (_, ns) in g.spec.node_specs() {
+            if let Some(rt) = app.registry.get(application, &ns.name) {
+                supervisor::cancel(&rt);
+            }
+        }
         edge::stop_all(&g.relays).await;
         for (_, ns) in g.spec.node_specs() {
             if let Some(rt) = app.registry.remove(application, &ns.name) {
@@ -391,6 +399,13 @@ pub async fn remove(app: &Shared, application: &str, name: &str) -> Result<bool,
 /// Stop a graph's relays and nodes without forgetting the document — what the
 /// reconcile loop does before re-provisioning from a changed one.
 pub async fn stop(app: &Shared, g: &Arc<GraphRuntime>) {
+    // Cancel-all first — same reason as `remove`: serial stops after one
+    // cancel pass cost the longest poll window, not the sum.
+    for (_, ns) in g.spec.node_specs() {
+        if let Some(rt) = app.registry.get(&ns.application, &ns.name) {
+            supervisor::cancel(&rt);
+        }
+    }
     edge::stop_all(&g.relays).await;
     for (_, ns) in g.spec.node_specs() {
         if let Some(rt) = app.registry.remove(&ns.application, &ns.name) {

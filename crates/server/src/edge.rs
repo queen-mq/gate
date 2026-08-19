@@ -149,6 +149,18 @@ pub fn spawn(queen: Queen, depths: Arc<Depths>, plan: Plan) -> Arc<RelayRuntime>
         let pace = std::time::Duration::from_millis(
             ((plan.dest.pacing.lease_seconds.max(1) as u64 * 1000) / 4).clamp(50, 500),
         );
+        // What an IDLE relay may slow to. The depth probe is not free — it is the
+        // console's own queue detail, two admin-grade queries per call — and at
+        // `pace` an idle graph paid it four times a second for nothing. The cap is
+        // the same two seconds depth.rs argues its cache TTL from ("shorter than
+        // any sane poll interval"), and it bounds what backing off can cost: the
+        // first item after a quiet spell waits at most one extra cap here, on a
+        // path whose latency floor is already a lease per hop. The backoff applies
+        // ONLY when nothing moved and nothing is waiting — a probe that shows the
+        // destination mid-drain keeps the full pace, because that is when a stale
+        // depth either overshoots the window or starves the gate.
+        let idle_cap = std::time::Duration::from_millis(2_000);
+        let mut idle = pace;
         let dest_lane = plan
             .dest
             .default_lane()
@@ -166,14 +178,26 @@ pub fn spawn(queen: Queen, depths: Arc<Depths>, plan: Plan) -> Arc<RelayRuntime>
                     dest = %plan.dest_node,
                     "relay: the destination's depth is unknown; holding until it answers"
                 );
-                tokio::time::sleep(pace).await;
+                // Back off here too: an admin API that did not answer is not
+                // helped by being asked four times a second.
+                idle = (idle * 2).min(idle_cap);
+                tokio::select! {
+                    _ = tokio::time::sleep(idle) => {}
+                    _ = task.cancel.cancelled() => {}
+                }
                 continue;
             };
             let pending: u64 = depth.values().sum();
             let mut allowance = window.saturating_sub(pending);
 
             if allowance == 0 {
-                tokio::time::sleep(pace).await;
+                // The destination is full, which means it is draining: freshness
+                // is exactly what the refill depends on, so no backoff.
+                idle = pace;
+                tokio::select! {
+                    _ = tokio::time::sleep(pace) => {}
+                    _ = task.cancel.cancelled() => {}
+                }
                 continue;
             }
 
@@ -414,7 +438,17 @@ pub fn spawn(queen: Queen, depths: Arc<Depths>, plan: Plan) -> Arc<RelayRuntime>
             }
 
             if moved == 0 {
-                tokio::time::sleep(pace).await;
+                // Nothing moved. If the destination still holds work the gate is
+                // mid-drain and the next refill wants a fresh depth — keep pace.
+                // If it is empty too, the graph is quiet, and quiet is the one
+                // state that can be re-checked lazily.
+                idle = if pending == 0 { (idle * 2).min(idle_cap) } else { pace };
+                tokio::select! {
+                    _ = tokio::time::sleep(idle) => {}
+                    _ = task.cancel.cancelled() => {}
+                }
+            } else {
+                idle = pace;
             }
         }
     });

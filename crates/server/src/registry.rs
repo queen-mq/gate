@@ -80,6 +80,11 @@ pub struct TargetRuntime {
     /// runner, and stopping is what the cancel token is for.
     pub handles: RwLock<Vec<queen_mq::streams::StreamHandle>>,
     pub meter_cancel: RwLock<Option<queen_mq::Cancel>>,
+    /// The meter loop's task, so stop() can wait for it the way it waits for
+    /// the runners. The meter is the one caller of Pool::top_up: released
+    /// pools must not be observable by a still-parked meter, or the top-up
+    /// re-reserves a chunk of the shared window that nobody will ever spend.
+    pub meter_task: RwLock<Option<tokio::task::JoinHandle<()>>>,
     /// One local lease per cross-target budget. Shared by every lane of this
     /// target, because the budget is shared by every lane of this target.
     pub pools: Vec<Arc<crate::shared::Pool>>,

@@ -20,6 +20,26 @@ use gate_core::{Decision, Dim, Item, TargetSpec};
 use crate::meter::Meter;
 use crate::registry::{LaneRuntime, TargetRuntime};
 
+/// How long an empty poll parks on the broker before coming home.
+///
+/// A push wakes a parked poll at once — broker-side, through the queue's wake
+/// gate — so this number buys no latency on the admit path; it is purely the
+/// cadence at which an IDLE lane re-asks a question whose answer has not
+/// changed. It used to be 250ms, which read as responsiveness and was in fact
+/// the opposite: each empty poll runs the pop SP against Postgres at least
+/// once, and a window that short returns before the broker's own empty-poll
+/// backoff (100ms initial, escalating past three parks) ever escalates — the
+/// re-poll counter is per REQUEST, so short requests pinned it at the floor.
+/// Measured on the fleet that motivated the change: a 64-shard node is 64
+/// runners asking 3 times per 250ms window each, ~8 SP calls/s per runner of
+/// pure silence, and the dashboard's fill ratio read the silence as collapse.
+///
+/// The ceiling on this value is shutdown, not latency: the runner notices its
+/// cancel token BETWEEN polls, so a spec swap waits out whatever poll is in
+/// flight (supervisor::stop awaits the handles for exactly this long). Five
+/// seconds keeps a redeclare humane while cutting the idle chatter ~15x.
+pub(crate) const STREAM_MAX_WAIT: std::time::Duration = std::time::Duration::from_millis(5_000);
+
 /// Read the scope dimensions a budget may key on off the pushed payload.
 fn scope_of(data: &serde_json::Value) -> Vec<(Dim, String)> {
     const DIMS: [(Dim, &str); 5] = [
@@ -187,7 +207,7 @@ pub async fn spawn(
 
     // One partition each, because the source is pinned.
     opts.max_partitions = 1;
-    opts.max_wait = std::time::Duration::from_millis(250);
+    opts.max_wait = STREAM_MAX_WAIT;
     opts.cancel = Some(lane.cancel.clone());
     opts.reset = true;
 

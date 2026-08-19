@@ -92,6 +92,7 @@ pub async fn start(
         last_breach: RwLock::new(None),
         handles: RwLock::new(Vec::new()),
         meter_cancel: RwLock::new(None),
+        meter_task: RwLock::new(None),
         pools: spec
             .budgets
             .iter()
@@ -120,9 +121,13 @@ pub async fn start(
         for shard in 0..spec.shard_count() {
             if let Err(e) = gate::spawn(queen, meter.clone(), rt.clone(), lane.clone(), shard).await
             {
-                for l in rt.lanes.values() {
-                    l.cancel.cancel();
-                }
+                // Stop what already started — and WAIT for it, exactly as a
+                // normal stop does. Cancels alone left the spawned runners
+                // parked in their polls while the caller's restore start()
+                // re-registered the same query ids with `reset: true`: a dying
+                // runner's late commit could clobber the freshly reset state —
+                // the same two-writers race stop() closes, on the failure path.
+                stop(&rt).await;
                 return Err(e);
             }
         }
@@ -134,10 +139,15 @@ pub async fn start(
 
 
 pub async fn stop_with(queen: &Queen, rt: &Arc<TargetRuntime>) {
+    // Runners first, refund second. Released the other way round, a runner
+    // still unwinding sees its pool's allowance swapped to zero and spends the
+    // rest of its last batch on denials — harmless, but a lie in the denial
+    // stats. Stopped first, nothing can observe the pool between the refund
+    // and the runtime going away.
+    stop(rt).await;
     for pool in &rt.pools {
         pool.release(queen, crate::now_ms()).await;
     }
-    stop(rt).await;
 }
 
 /// Stop the old runtime and start a new spec in its place, keeping the target
@@ -200,7 +210,13 @@ pub struct SwapFailed {
     pub restored: Option<Arc<TargetRuntime>>,
 }
 
-pub async fn stop(rt: &Arc<TargetRuntime>) {
+/// Fire every cancel a runtime owns, without waiting for anything.
+///
+/// Split out of [`stop`] so a caller tearing down MANY targets can cancel them
+/// all first and only then await: the runners notice a cancel between polls,
+/// so N stops after one cancel-all pass cost the longest single poll window,
+/// not the sum of N of them.
+pub fn cancel(rt: &Arc<TargetRuntime>) {
     // Before the cancels, so nothing can observe a runtime whose runners are going away
     // and still believe it is serving.
     rt.stopped
@@ -208,15 +224,40 @@ pub async fn stop(rt: &Arc<TargetRuntime>) {
     for lane in rt.lanes.values() {
         lane.cancel.cancel();
     }
-
-
     if let Some(c) = rt.meter_cancel.read().as_ref() {
         c.cancel();
     }
-    // Give the runners a cycle to notice; they hold a lease each, and leaving
-    // one held only delays the next holder by its own duration.
-    tokio::time::sleep(std::time::Duration::from_millis(
-        (rt.spec.pacing.lease_seconds as u64 * 1000).min(2_000),
-    ))
-    .await;
+}
+
+pub async fn stop(rt: &Arc<TargetRuntime>) {
+    cancel(rt);
+    // Await the runners themselves rather than sleeping a guess. The old fixed
+    // sleep was sized for a 250ms poll window; the moment the window grew it
+    // stopped covering it, and a swap could start the NEW runner while the old
+    // one was still parked in a poll — two writers on one state document, with
+    // `reset: true` on the new one for the old one's late commit to clobber.
+    // A runner notices its cancel between polls, so each await here is bounded
+    // by one poll window plus one cycle; the timeout is a wedge guard (a black-
+    // holed poll), and on expiry the loop task is merely detached — it still
+    // exits at its next is_stopped check, which is the old behaviour.
+    let handles: Vec<_> = std::mem::take(&mut *rt.handles.write());
+    for h in handles {
+        let _ = tokio::time::timeout(
+            crate::gate::STREAM_MAX_WAIT + std::time::Duration::from_secs(2),
+            h.stop(),
+        )
+        .await;
+    }
+    // The meter too — it is the one caller of Pool::top_up, so stop_with's
+    // refund must not run while it can still observe the pools. Its poll is a
+    // second long and it re-checks its cancel right after the poll, so this
+    // await is short; the timeout is the same wedge guard as above.
+    let meter_task = rt.meter_task.write().take();
+    if let Some(t) = meter_task {
+        let _ = tokio::time::timeout(
+            crate::gate::STREAM_MAX_WAIT + std::time::Duration::from_secs(2),
+            t,
+        )
+        .await;
+    }
 }

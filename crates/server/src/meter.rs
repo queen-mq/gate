@@ -424,8 +424,9 @@ pub fn spawn(
     let queue = target.spec.calls_queue();
     let cancel = queen_mq::Cancel::new();
     *target.meter_cancel.write() = Some(cancel.clone());
+    let holder = target.clone();
 
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         loop {
             if cancel.is_cancelled() {
                 return;
@@ -441,6 +442,18 @@ pub fn spawn(
 
                 .batch(200)
                 .wait(true)
+                // ONE SECOND, and it is load-bearing — do not raise it the way
+                // the gate runners' STREAM_MAX_WAIT was raised. This poll is not
+                // just a wait for call events: every iteration of this loop is
+                // also the kv top_up below, and a chunk is one second of the
+                // shared budget's rate, so the refill only matches the declared
+                // cap if an iteration happens about once a second. Call events
+                // arrive only on acks — a graph's interior nodes, drained by the
+                // relay, never produce one — so on exactly the targets that need
+                // the top_up most this poll parks its full length, and a longer
+                // window would cap their shared-budget spend at chunk-per-window.
+                // The same cadence drains the denied-traces ring (sized for ~1s)
+                // and closes history minutes.
                 .poll_timeout(std::time::Duration::from_millis(1000))
                 .pop()
                 .await
@@ -451,6 +464,19 @@ pub fn spawn(
                     continue;
                 }
             };
+            // The poll outlives a cancel by up to its full window, so re-check
+            // HERE, before touching anything. Past this point the body tops up
+            // pools and folds lane counters into the shared meter — a runtime
+            // being stopped must do neither: its pools may already be refunded
+            // (top_up would re-reserve a chunk nobody will spend), and its
+            // successor may already have re-founded the counters (one late
+            // fold would book this runtime's lifetime totals as a spike in the
+            // live minute). The claimed messages are not acked, so the
+            // successor's meter re-reads them; `ev.at` puts them back in their
+            // own minute.
+            if cancel.is_cancelled() {
+                return;
+            }
 
             let now = crate::now_ms();
             let key = target.spec.key();
@@ -518,4 +544,5 @@ pub fn spawn(
             }
         }
     });
+    *holder.meter_task.write() = Some(task);
 }

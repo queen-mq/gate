@@ -700,9 +700,15 @@ async fn a_shard_serialises_one_key_and_lets_another_through() {
           "entry": true,
           "shardBy": "entity",
           "shards": 8,
+          // Rolling, and that matters: a CALENDAR window rotates on the wall clock, so
+          // an admission landing late in a minute releases the held item seconds later
+          // and the "nothing more arrives" check below sees it. Rolling measures from
+          // the spend, so the second push for a listing is held for a full period no
+          // matter when the first one landed.
           "budgets": [{ "id": "per-listing", "cap": 1, "periodSeconds": 60,
-                        "alignment": "calendar", "scope": ["entity"], "maxKeys": 20000,
+                        "alignment": "rolling", "scope": ["entity"], "maxKeys": 20000,
                         "confidence": "inferred" }],
+
           "cost": { "field": "httpCost", "default": 1, "max": 1 }
         }
       },
