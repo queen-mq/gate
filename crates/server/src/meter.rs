@@ -312,6 +312,42 @@ impl Meter {
         }
     }
 
+    /// What one item of this lane charges a budget, as measured.
+    ///
+    /// The numerator is the DECLARED cost and not the calls the work turned out
+    /// to make: the gate charges `cost_estimated` and an ETA is arithmetic about
+    /// budgets, so the drift between the two — which is the signal that the cost
+    /// model is broken — belongs in the model's own report and not in this
+    /// number.
+    ///
+    /// This replica's own ring, and only where there is no table to ask. The two
+    /// halves come from different populations: `admitted` is this replica's gate
+    /// counters, whole, while `cost_estimated` is this replica's SHARE of the
+    /// call events, because the meter consumes them under one group across the
+    /// fleet. On several replicas the ratio is therefore biased low, which is
+    /// why `History::avg_cost` is preferred wherever it exists.
+    pub fn avg_cost(&self, target: &str, lane: &str, now_ms: i64) -> Option<f64> {
+        let r = self.rollups.read();
+        let series = r.get(target)?;
+        let since = minute_of(now_ms) - 5 * 60_000;
+        let (mut cost, mut items) = (0.0f64, 0u64);
+        for (t, lanes) in series.iter().rev() {
+            if *t < since {
+                break;
+            }
+            if let Some(b) = lanes.get(lane) {
+                cost += b.cost_estimated;
+                items += b.admitted;
+            }
+        }
+        // Nothing acked yet says nothing about cost, and a zero here would say
+        // the backlog is free. The caller falls back to the declared default.
+        if items == 0 || cost <= 0.0 {
+            return None;
+        }
+        Some(cost / items as f64)
+    }
+
     /// The same shape `History::flow` returns, from this replica's own ring:
     /// (application, target, minute, admitted). Used only when no database is
     /// configured.

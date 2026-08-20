@@ -247,6 +247,83 @@ impl Harness {
         out
     }
 
+    async fn put_target(&self, name: &str, spec: Value) -> (u16, Value) {
+        self.send(
+            reqwest::Method::PUT,
+            &format!("/v1/apps/{}/targets/{name}", self.application),
+            Some(spec),
+        )
+        .await
+    }
+
+    async fn push_target(&self, name: &str, lane: &str, body: Value) -> (u16, Value) {
+        self.send(
+            reqwest::Method::POST,
+            &format!(
+                "/v1/apps/{}/targets/{name}/lanes/{lane}/push",
+                self.application
+            ),
+            Some(body),
+        )
+        .await
+    }
+
+    async fn eta(&self, name: &str, lane: &str) -> (u16, Value) {
+        self.send(
+            reqwest::Method::GET,
+            &format!(
+                "/v1/apps/{}/targets/{name}/eta?lane={lane}",
+                self.application
+            ),
+            None,
+        )
+        .await
+    }
+
+    async fn node_eta(&self, graph: &str, node: &str) -> (u16, Value) {
+        self.send(
+            reqwest::Method::GET,
+            &format!(
+                "/v1/apps/{}/graphs/{graph}/nodes/{node}/eta",
+                self.application
+            ),
+            None,
+        )
+        .await
+    }
+
+    /// Poll the ETA until `done` accepts it, so a test asserts on a settled
+    /// answer rather than on whichever moment it happened to ask in.
+    async fn eta_until(
+        &self,
+        name: &str,
+        lane: &str,
+        within: Duration,
+        done: impl Fn(&Value) -> bool,
+    ) -> Value {
+        let started = Instant::now();
+        let mut last = json!(null);
+        while started.elapsed() < within {
+            let (status, body) = self.eta(name, lane).await;
+            if status == 200 && done(&body) {
+                return body;
+            }
+            last = body;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        last
+    }
+
+    async fn cleanup_target(&self, name: &str) {
+        let _ = self
+            .send(
+                reqwest::Method::DELETE,
+                &format!("/v1/apps/{}/targets/{name}", self.application),
+                None,
+            )
+            .await;
+    }
+
     async fn cleanup(&self, graph: &str) {
         let _ = self
             .send(
@@ -2196,4 +2273,202 @@ async fn a_depth_the_broker_will_not_report_falls_back_to_the_last_one() {
         .delete(format!("{base}/v1/apps/{application}/targets/airbnb"))
         .send()
         .await;
+}
+
+/// The question a product asks on behalf of somebody waiting: *when does this go
+/// out*, and *what is holding it*.
+///
+/// A calendar budget of two per ten minutes, and ten items pushed at it. Two
+/// leave, eight sit on the push queue, and the honest answer is not a rate — the
+/// lane is measuring zero admissions per second precisely because its window is
+/// spent. It is the schedule: this window is finished, the next one takes two,
+/// and the eight behind you need four of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn an_eta_answers_from_the_declared_schedule_when_the_window_is_spent() {
+    let Some(h) = harness("etabudget").await else { return };
+    let (status, body) = h
+        .put_target(
+            "airbnb",
+            json!({
+              "name": "airbnb", "version": 1,
+              "budgets": [{ "id": "ip", "cap": 2, "periodSeconds": 600,
+                            "alignment": "calendar", "confidence": "inferred" }],
+              "lanes": [{ "name": "bulk", "cap": "ceiling", "concurrency": 2, "default": true }],
+              "cost": { "field": "httpCost", "default": 1, "max": 1 },
+              "pacing": { "leaseSeconds": 1, "batch": 10 }
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "declare: {body}");
+
+    for i in 0..10 {
+        let (status, out) = h
+            .push_target(
+                "airbnb",
+                "bulk",
+                json!({ "op": "listing.update", "txn": format!("e{i}"),
+                        "payload": { "connection": "c1" } }),
+            )
+            .await;
+        assert_eq!(status, 200, "push: {out}");
+    }
+
+    // Two admitted, eight held: the gate acks the allowed prefix and parks the
+    // rest, so the group's cursor has moved by exactly what left.
+    let body = h
+        .eta_until("airbnb", "bulk", Duration::from_secs(60), |b| {
+            b["waitingForBudget"] == json!(8)
+        })
+        .await;
+
+    assert_eq!(body["state"], json!("waiting-budget"), "{body}");
+    assert_eq!(body["waitingForBudget"], json!(8), "{body}");
+    assert_eq!(body["boundBy"], json!("ip"), "the budget that is holding it: {body}");
+    // Eight units at two per window: this window is spent, so the wait is the
+    // rest of it plus three whole ones. Never infinity, and never zero, which
+    // are the two things a measured rate would have said here.
+    let eta = body["etaSeconds"].as_f64().unwrap_or(-1.0);
+    assert!(
+        (1800.0..=2400.0).contains(&eta),
+        "expected the rest of this window plus three more, got {eta}: {body}"
+    );
+    assert_eq!(body["aheadCost"], json!(8.0), "eight items at the declared cost of one: {body}");
+
+    let resets = body["windowResetsAt"].as_i64().expect("a window edge");
+    let at = body["at"].as_i64().expect("an instant");
+    assert!(
+        resets > at && resets - at <= 600_000,
+        "the next edge is ahead and inside one period: {body}"
+    );
+    assert!(
+        body["assumes"].as_str().unwrap_or("").contains("no earlier than"),
+        "the answer must say it is a bound: {body}"
+    );
+
+    h.cleanup_target("airbnb").await;
+}
+
+/// The two backlogs have two owners, and telling them apart is the whole point:
+/// gate holding work back is not the caller's consumers falling behind, and only
+/// one of them is fixed by adding workers.
+///
+/// This also pins the name of the gate's own consumer group. The push queue here
+/// is drained to nothing, so `waitingForBudget` is zero — and it is zero only
+/// because the depth was read under the group the runner actually commits. A
+/// group the broker has never seen owes its whole retained range, so a near-miss
+/// on that string reports all twenty items as waiting for budget and looks
+/// entirely reasonable doing it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn an_eta_tells_a_budget_backlog_from_a_worker_one() {
+    let Some(h) = harness("etaworkers").await else { return };
+    let (status, body) = h
+        .put_target(
+            "airbnb",
+            json!({
+              "name": "airbnb", "version": 1,
+              "budgets": [wide("ip")],
+              "lanes": [{ "name": "bulk", "cap": "ceiling", "concurrency": 4, "default": true }],
+              "cost": { "field": "httpCost", "default": 1, "max": 1 }
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "declare: {body}");
+
+    const N: i64 = 20;
+    for i in 0..N {
+        let (status, out) = h
+            .push_target(
+                "airbnb",
+                "bulk",
+                json!({ "op": "listing.update", "txn": format!("w{i}"),
+                        "payload": { "connection": "c1" } }),
+            )
+            .await;
+        assert_eq!(status, 200, "push: {out}");
+    }
+
+    // Nothing pops the admitted queue, so everything the gate said yes to is
+    // waiting on workers that do not exist.
+    let body = h
+        .eta_until("airbnb", "bulk", Duration::from_secs(60), |b| {
+            b["waitingForWorkers"] == json!(N)
+        })
+        .await;
+
+    assert_eq!(body["waitingForWorkers"], json!(N), "{body}");
+    assert_eq!(
+        body["waitingForBudget"],
+        json!(0),
+        "the gate admitted all of it, so nothing is waiting for budget: {body}"
+    );
+    assert_eq!(body["state"], json!("waiting-workers"), "{body}");
+    assert_eq!(
+        body["boundBy"],
+        json!(null),
+        "no budget is between this caller and their answer: {body}"
+    );
+    assert_eq!(body["windowResetsAt"], json!(null), "{body}");
+
+    h.cleanup_target("airbnb").await;
+}
+
+/// An interior node's admitted queue is drained by the relay on its out-edge,
+/// never by a caller's workers, and the ETA has to ask the broker about the
+/// reader that actually exists. Asking under the executor group would name one
+/// that has never popped anything — which owes its whole retained range — and a
+/// leg that is keeping up perfectly would report every item it ever admitted as
+/// a worker backlog.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn an_interior_leg_is_measured_against_the_relay_that_drains_it() {
+    let Some(h) = harness("etanode").await else { return };
+    let (status, body) = h.put_graph("g", chain_doc()).await;
+    assert_eq!(status, 200, "declare: {body}");
+
+    const N: usize = 12;
+    for i in 0..N {
+        let (status, out) = h
+            .push(
+                "g",
+                "messages",
+                json!({ "op": "message.post", "txn": format!("n{i}"),
+                        "payload": { "connection": "c1", "n": i } }),
+            )
+            .await;
+        assert_eq!(status, 200, "push: {out}");
+    }
+
+    // Let the graph carry them through to the terminal, so the relay has moved
+    // everything off the interior node's admitted queue.
+    let got = h.drain("g", "ip", "g.ip", N, Duration::from_secs(90)).await;
+    assert_eq!(got.len(), N, "the graph did not deliver: {got:?}");
+
+    let started = Instant::now();
+    let mut body = json!(null);
+    while started.elapsed() < Duration::from_secs(30) {
+        let (status, b) = h.node_eta("g", "messages").await;
+        assert_eq!(status, 200, "eta: {b}");
+        body = b;
+        if body["waitingForWorkers"] == json!(0) && body["waitingForBudget"] == json!(0) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    assert_eq!(
+        body["waitingForWorkers"],
+        json!(0),
+        "the relay drained it, so nothing is waiting on workers: {body}"
+    );
+    assert_eq!(body["waitingForBudget"], json!(0), "{body}");
+    assert_eq!(body["target"], json!("g.messages"), "{body}");
+
+    // A terminal a caller does pop is measured against the caller's own group,
+    // and everything acked is gone from it too.
+    let (status, terminal) = h.node_eta("g", "ip").await;
+    assert_eq!(status, 200, "eta: {terminal}");
+    assert_eq!(terminal["target"], json!("g.ip"), "{terminal}");
+
+    h.cleanup("g").await;
 }

@@ -93,12 +93,14 @@ fn routes() -> Router<Shared> {
         .route("/v1/apps/:app/targets/:name", put(put_scoped).get(get_scoped).delete(del_scoped))
         .route("/v1/apps/:app/targets/:name/lanes/:lane/push", post(push_scoped))
         .route("/v1/apps/:app/targets/:name/lanes/:lane/next", get(next_scoped))
+        .route("/v1/apps/:app/targets/:name/eta", get(eta_scoped))
         // The flat forms resolve inside `default`, so a caller with one
         // application never has to learn the concept exists.
         .route("/v1/targets", put(sync_default))
         .route("/v1/targets/:name", put(put_target).get(get_target).delete(delete_target))
         .route("/v1/targets/:name/lanes/:lane/push", post(push))
         .route("/v1/targets/:name/lanes/:lane/next", get(next))
+        .route("/v1/targets/:name/eta", get(eta_default))
         // Graphs. A node is a target and a caller never names one: it pushes into
         // an entry and pops a terminal, exactly as it pushed and popped a target.
         .route(
@@ -107,9 +109,11 @@ fn routes() -> Router<Shared> {
         )
         .route("/v1/apps/:app/graphs/:graph/nodes/:node/push", post(graph_push))
         .route("/v1/apps/:app/graphs/:graph/nodes/:node/next", get(graph_next))
+        .route("/v1/apps/:app/graphs/:graph/nodes/:node/eta", get(graph_eta))
         .route("/v1/graphs/:name", put(put_graph_default).get(get_graph_default).delete(del_graph_default))
         .route("/v1/graphs/:graph/nodes/:node/push", post(graph_push_default))
         .route("/v1/graphs/:graph/nodes/:node/next", get(graph_next_default))
+        .route("/v1/graphs/:graph/nodes/:node/eta", get(graph_eta_default))
         .route("/v1/leases/ack", post(ack))
         .route("/v1/leases/nack", post(nack))
         .route("/v1/leases/renew", post(renew))
@@ -820,6 +824,16 @@ async fn do_next(
     next_from(app, &rt, lane, q).await
 }
 
+/// The consumer group a caller's own executors pop an admitted queue under.
+///
+/// One function, because the ETA read has to ask the broker how far behind THIS
+/// group is and a group that has never popped anything owes its whole retained
+/// range — so a second spelling of the name would not fail, it would report a
+/// quiet queue as an enormous one.
+pub(crate) fn exec_group(lane: &str) -> String {
+    format!("gate.exec.{lane}")
+}
+
 /// The pop itself, with no ownership rule attached: a graph route has already
 /// decided that this node is one a caller may consume.
 async fn next_from(app: &Shared, rt: &Arc<TargetRuntime>, lane: &str, q: NextQuery) -> ApiResult {
@@ -837,7 +851,7 @@ async fn next_from(app: &Shared, rt: &Arc<TargetRuntime>, lane: &str, q: NextQue
     let msgs = app
         .queen
         .queue(rt.spec.admitted_queue(lane))
-        .group(format!("gate.exec.{}", lane))
+        .group(exec_group(lane))
         // `all`, always. A group created at the tail skips every message already
         // admitted and waiting — a consumer that starts after the gate has been
         // running would silently abandon the backlog, and the broker's own default
@@ -873,6 +887,64 @@ async fn next_from(app: &Shared, rt: &Arc<TargetRuntime>, lane: &str, q: NextQue
         "lane": lane,
     }))
     .into_response())
+}
+
+/// Which lane to answer about. Absent means the default lane, the same way a
+/// push with no lane means it.
+#[derive(Deserialize)]
+struct LaneQuery {
+    #[serde(default)]
+    lane: Option<String>,
+}
+
+async fn eta_scoped(
+    State(st): State<Shared>,
+    Path((application, name)): Path<(String, String)>,
+    Query(q): Query<LaneQuery>,
+) -> ApiResult {
+    do_eta(&st, &application, &name, q.lane.as_deref()).await
+}
+
+async fn eta_default(
+    State(st): State<Shared>,
+    Path(name): Path<String>,
+    Query(q): Query<LaneQuery>,
+) -> ApiResult {
+    do_eta(&st, &gate_core::default_application(), &name, q.lane.as_deref()).await
+}
+
+async fn do_eta(app: &Shared, application: &str, name: &str, lane: Option<&str>) -> ApiResult {
+    let rt = app
+        .registry
+        .get(application, name)
+        .ok_or_else(|| Fail(StatusCode::NOT_FOUND, format!("no target `{application}/{name}`")))?;
+    // Not refused for a graph node, unlike a push or a pop: those change who
+    // owns a queue, and this only reads one. `target_view` takes the same line.
+    eta_of(app, &rt, lane).await
+}
+
+/// The answer itself, once a route has decided which target and which lane.
+async fn eta_of(app: &Shared, rt: &Arc<TargetRuntime>, lane: Option<&str>) -> ApiResult {
+    // A stopped runtime admits nothing, for ever, and an ETA is the one read
+    // that would turn that into a confident number: the backlog is real, the
+    // declared schedule is real, and nothing is draining either.
+    refuse_if_stopped(rt)?;
+    let lane = match lane {
+        Some(l) => rt
+            .spec
+            .lane(l)
+            .ok_or_else(|| Fail(StatusCode::NOT_FOUND, format!("no lane `{l}`")))?,
+        None => rt.spec.default_lane().ok_or_else(|| {
+            Fail(
+                StatusCode::CONFLICT,
+                format!(
+                    "`{}` has no default lane: name one with ?lane=",
+                    rt.spec.name
+                ),
+            )
+        })?,
+    };
+    Ok(Json(crate::eta::view(app, rt, &lane.name).await).into_response())
 }
 
 #[derive(Deserialize)]
@@ -1764,6 +1836,48 @@ async fn do_graph_next(
 }
 
 
+async fn graph_eta(
+    State(st): State<Shared>,
+    Path((application, graph, node)): Path<(String, String, String)>,
+    Query(q): Query<LaneQuery>,
+) -> ApiResult {
+    do_graph_eta(&st, Some(&application), &graph, &node, q.lane.as_deref()).await
+}
+
+async fn graph_eta_default(
+    State(st): State<Shared>,
+    Path((graph, node)): Path<(String, String)>,
+    Query(q): Query<LaneQuery>,
+) -> ApiResult {
+    do_graph_eta(&st, None, &graph, &node, q.lane.as_deref()).await
+}
+
+/// Every node, and not only the consumable ones a `next` is allowed on: "how
+/// far behind is the leg in the middle" is a fair question about a topology,
+/// and the answer knows that an interior node's admitted queue is drained by a
+/// relay rather than by anybody's workers.
+async fn do_graph_eta(
+    st: &Shared,
+    application: Option<&str>,
+    graph: &str,
+    node: &str,
+    lane: Option<&str>,
+) -> ApiResult {
+    let g = resolve_graph(st, application, graph)?;
+    if !g.spec.nodes.contains_key(node) {
+        return Err(Fail(
+            StatusCode::NOT_FOUND,
+            format!("graph `{graph}` has no node `{node}`"),
+        ));
+    }
+    let ns = g.spec.node_spec(node).expect("declared");
+    let rt = st
+        .registry
+        .get(&ns.application, &ns.name)
+        .ok_or_else(|| Fail(StatusCode::SERVICE_UNAVAILABLE, format!("node `{node}` is not running")))?;
+    eta_of(st, &rt, lane).await
+}
+
 async fn list_graphs(State(st): State<Shared>) -> ApiResult {
     let mut out = Vec::new();
     for g in st.registry.graphs() {
@@ -2217,7 +2331,7 @@ async fn app_metrics(State(app): State<Shared>, Path(application): Path<String>)
 /// `null` rather than infinity when nothing is moving: "we cannot say" is an
 /// honest answer and a product can render it, where a number that means forever
 /// would be rendered as a number.
-fn eta(waiting: u64, per_sec: f64) -> Option<u64> {
+pub(crate) fn eta(waiting: u64, per_sec: f64) -> Option<u64> {
     if waiting == 0 {
         return Some(0);
     }

@@ -95,13 +95,7 @@ impl Depths {
         match queen.admin().queue_depth(queue, None).await {
             Ok(v) => {
                 answered = true;
-                if let Some(parts) = v.get("partitions").and_then(|p| p.as_array()) {
-                    for p in parts {
-                        let name = p.get("partition").and_then(|n| n.as_str()).unwrap_or("");
-                        let pending = p.get("pending").and_then(|n| n.as_u64()).unwrap_or(0);
-                        out.insert(name.to_string(), pending);
-                    }
-                }
+                out = depth_route(&v);
             }
             // A 404 here is BOTH "this broker predates the route" and "no such
             // queue", and they cannot be told apart. The queue detail below
@@ -111,18 +105,7 @@ impl Depths {
             Err(e) if e.status() == Some(404) => {
                 if let Ok(v) = queen.admin().queue(queue).await {
                     answered = true;
-
-                    if let Some(parts) = v.get("partitions").and_then(|p| p.as_array()) {
-                        for p in parts {
-                            let name = p.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                            let pending = p
-                                .get("stats")
-                                .and_then(|s| s.get("pending"))
-                                .and_then(|n| n.as_u64())
-                                .unwrap_or(0);
-                            out.insert(name.to_string(), pending);
-                        }
-                    }
+                    out = queue_detail(&v);
                 }
             }
             Err(_) => {}
@@ -138,4 +121,87 @@ impl Depths {
             .insert(queue.to_string(), (out.clone(), Instant::now()));
         Some(out)
     }
+
+    /// The same read, scoped to ONE consumer group's own backlog.
+    ///
+    /// Queue-level pending answers "is anything waiting"; this answers "is
+    /// anything waiting for ME", and an ETA needs the second. The two differ
+    /// wherever a queue has more than one reader — an admitted queue drained by
+    /// a relay and never popped by a caller reads as a mountain of work under
+    /// the executor's group and as nothing under the relay's.
+    ///
+    /// Requires the depth route (broker >= 1.0.4). An older broker and an absent
+    /// queue both answer 404 and cannot be told apart, so both fall back to the
+    /// queue-level number — which is the WORST cursor across every group, and so
+    /// is at or above the group being asked about. The fallback can therefore
+    /// only make an ETA later, never earlier, which is the safe direction for an
+    /// answer that promises "no earlier than".
+    pub async fn pending_of_group(
+        &self,
+        queen: &Queen,
+        queue: &str,
+        group: &str,
+    ) -> HashMap<String, u64> {
+        // The group belongs in the cache key: two answers about one queue that
+        // mean different things must not serve each other's entry.
+        let key = format!("{queue}\u{1f}{group}");
+        if let Some((v, at)) = self.cache.read().get(&key) {
+            if at.elapsed() < TTL {
+                return v.clone();
+            }
+        }
+        match queen.admin().queue_depth(queue, Some(group)).await {
+            Ok(v) => {
+                let out = depth_route(&v);
+                self.cache.write().insert(key, (out.clone(), Instant::now()));
+                out
+            }
+            Err(e) if e.status() == Some(404) => self.pending(queen, queue).await,
+            // The broker did not answer. Serve the last thing it DID say, stamped,
+            // for the reason `pending` does it: an outage costs one round trip per
+            // TTL rather than one per caller.
+            Err(_) => {
+                let stale = self
+                    .cache
+                    .read()
+                    .get(&key)
+                    .map(|(v, _)| v.clone())
+                    .unwrap_or_default();
+                self.cache.write().insert(key, (stale.clone(), Instant::now()));
+                stale
+            }
+        }
+    }
+}
+
+/// `{partitions: [{partition, pending}]}` — what the depth route answers, with
+/// or without a group.
+fn depth_route(v: &serde_json::Value) -> HashMap<String, u64> {
+    let mut out = HashMap::new();
+    if let Some(parts) = v.get("partitions").and_then(|p| p.as_array()) {
+        for p in parts {
+            let name = p.get("partition").and_then(|n| n.as_str()).unwrap_or("");
+            let pending = p.get("pending").and_then(|n| n.as_u64()).unwrap_or(0);
+            out.insert(name.to_string(), pending);
+        }
+    }
+    out
+}
+
+/// `{partitions: [{name, stats: {pending}}]}` — the console-grade queue detail,
+/// which every broker version has and which knows nothing about groups.
+fn queue_detail(v: &serde_json::Value) -> HashMap<String, u64> {
+    let mut out = HashMap::new();
+    if let Some(parts) = v.get("partitions").and_then(|p| p.as_array()) {
+        for p in parts {
+            let name = p.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            let pending = p
+                .get("stats")
+                .and_then(|s| s.get("pending"))
+                .and_then(|n| n.as_u64())
+                .unwrap_or(0);
+            out.insert(name.to_string(), pending);
+        }
+    }
+    out
 }

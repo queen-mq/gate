@@ -8,6 +8,7 @@ pub mod api;
 pub mod auth;
 pub mod depth;
 pub mod edge;
+pub mod eta;
 pub mod gate;
 pub mod graph;
 pub mod history;

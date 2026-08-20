@@ -194,6 +194,11 @@ pub async fn spawn(
     // already have different rows, and the registration is idempotent under the
     // same operator chain.
     let mut opts = RunOptions::new(spec.query_id(&lane_name));
+    // Explicit, and identical to what the SDK would derive from the query id on
+    // its own. Named here because the ETA read has to ask the broker for THIS
+    // group's backlog, and an unset option makes that string an SDK detail
+    // rather than something this crate states once.
+    opts.consumer_group = Some(consumer_group(&spec, &lane_name));
 
     opts.batch_size = spec.pacing.batch as i32;
     // `all`, and this one is not a nicety: a stream's consumer group is created at
@@ -229,3 +234,16 @@ fn bucket(v: Option<&serde_json::Value>, n: u64) -> String {
     format!("p{}", gate_core::shard_index(s, n.min(u32::MAX as u64) as u32))
 }
 
+
+/// The consumer group this runner reads its push queue under.
+///
+/// Not the query id, though it is derived from one: `RunOptions` leaves
+/// `consumer_group` unset and the SDK then defaults it to `streams.{query_id}`.
+/// It is set explicitly here, and read from here by anything that needs to name
+/// it, because a near-miss does not fail loudly — the broker's depth route
+/// answers a group that has no cursor with the queue's WHOLE retained range, so
+/// an ETA built on the wrong string would report every message ever pushed as
+/// waiting for budget and look entirely plausible doing it.
+pub fn consumer_group(spec: &TargetSpec, lane: &str) -> String {
+    format!("streams.{}", spec.query_id(lane))
+}

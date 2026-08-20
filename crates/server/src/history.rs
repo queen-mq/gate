@@ -222,6 +222,43 @@ impl History {
         }
     }
 
+    /// What one item of this lane charges a budget, measured over the last few
+    /// minutes: declared cost over items admitted.
+    ///
+    /// From the table rather than a replica's ring, and for the usual reason
+    /// plus one of its own: the meter consumes `calls` under a single group
+    /// across the fleet, so a replica holds its own gate counters whole but only
+    /// a share of the cost events, and its ratio of the two is biased by
+    /// however the events happened to split. The row sums both halves.
+    pub async fn avg_cost(
+        &self,
+        app: &str,
+        target: &str,
+        lane: &str,
+        now_ms: i64,
+    ) -> Option<f64> {
+        let client = self.pool.get().await.ok()?;
+        let current = now_ms / 60_000 * 60_000;
+        let row = client
+            .query_opt(
+                "SELECT COALESCE(SUM(cost_est), 0)::DOUBLE PRECISION,
+                        COALESCE(SUM(admitted), 0)::BIGINT
+                   FROM gate.rollups
+                  WHERE application=$1 AND target=$2 AND lane=$3 AND minute >= $4",
+                &[&app, &target, &lane, &(current - 5 * 60_000)],
+            )
+            .await
+            .ok()??;
+        let cost: f64 = row.try_get(0).ok()?;
+        let items: i64 = row.try_get(1).ok()?;
+        // Nothing acked yet says nothing about cost, and a zero here would say
+        // the backlog is free. The caller falls back to the declared default.
+        if items <= 0 || cost <= 0.0 {
+            return None;
+        }
+        Some(cost / items as f64)
+    }
+
     /// The share of the ceiling the OTHER lanes spent in the last complete
     /// minute — the input to `ceiling-minus-measured`.
     ///

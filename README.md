@@ -462,6 +462,43 @@ and a drain ETA. Enough for another product to render limit status on its own
 frontend. The two backlogs are kept apart because they have different owners: one is
 Gate holding work back on purpose, the other is your consumers not keeping up.
 
+### When
+
+```http
+GET /v1/apps/{app}/targets/{name}/eta?lane=bulk
+GET /v1/apps/{app}/graphs/{graph}/nodes/{node}/eta
+
+→ { "state": "waiting-budget", "aheadCost": 250.0, "etaSeconds": 99,
+    "boundBy": "ip-per-minute", "windowResetsAt": 1787222700000,
+    "waitingForBudget": 250, "waitingForWorkers": 150,
+    "assumes": "no earlier than: the backlog that is there right now, …" }
+```
+
+One lane, one question: *how long until my work leaves, and what is holding it.*
+`?lane=` is optional and means the default lane.
+
+`state` says which backlog the answer is about, and the two halves are computed from
+different things on purpose.
+
+**`waiting-budget`** is paced by a schedule you DECLARED, so that is what the answer
+reads: `cap`, `periodSeconds`, `alignment`, and where the window currently stands. Not
+the measured rate — a lane whose window is spent is measuring zero per second, and zero
+per second answers "never" at exactly the moment somebody is asking. What is true is
+"nothing until :00, and 150/s from there", which the declaration knows and no
+measurement can see. `boundBy` names the budget that admits your backlog last and
+`windowResetsAt` is when its window next rotates.
+
+**`waiting-workers`** is the opposite: nothing declares how fast your own consumers
+drain what Gate already admitted, so there the measured rate is the only honest input.
+`boundBy` is `null` — no budget is between you and your answer — and `etaSeconds` is
+`null` where the workers have stopped, because that really does mean "we cannot say".
+
+It is a bound and not a promise, and `assumes` spells out which caveats apply to the
+target you asked about: a higher-priority leg can arrive in front of your work at a
+merge, a `store: kv` budget is spent by other targets you cannot see here, a breached
+call re-enters at its entry to be paced again, and a sharded target is answered against
+its worst shard. Nothing here touches a counter or a decision — it is all read-side.
+
 ---
 
 ## The graph API
