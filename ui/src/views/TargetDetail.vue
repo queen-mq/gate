@@ -227,18 +227,19 @@ async function remove() {
       <!-- --------------------------------------------------- headline -->
       <section class="card px-6 py-6 flex flex-col md:flex-row md:items-center gap-6">
         <div class="flex-1 min-w-0">
-          <StatusDot :state="state" size="lg" />
-          <p v-if="target.last_breach_at" class="text-[13px] text-fg-2 mt-2 ml-[22.5px] max-w-[52ch] leading-relaxed">
-            Last throttled {{ ago(target.last_breach_at) }} on
-            <span class="font-mono">{{ target.last_breach_budget || 'an unattributed call' }}</span>.
-            A breach means the enforced cap is higher than the real one.
-          </p>
-          <p v-else-if="state === 'blind'" class="text-[13px] text-fg-2 mt-2 ml-[22.5px] max-w-[52ch] leading-relaxed">
-            At least one cap below is a guess. Everything on this page is arithmetic on top of it.
-          </p>
-          <p v-else class="text-[13px] text-fg-2 mt-2 ml-[22.5px] max-w-[52ch] leading-relaxed">
-            No vendor throttle has been recorded against this target.
-          </p>
+          <StatusDot :state="state" size="lg" avatar>
+            <p v-if="target.last_breach_at" class="text-[13px] text-fg-2 mt-2 ml-[22.5px] max-w-[52ch] leading-relaxed">
+              Last throttled {{ ago(target.last_breach_at) }} on
+              <span class="font-mono">{{ target.last_breach_budget || 'an unattributed call' }}</span>.
+              A breach means the enforced cap is higher than the real one.
+            </p>
+            <p v-else-if="state === 'blind'" class="text-[13px] text-fg-2 mt-2 ml-[22.5px] max-w-[52ch] leading-relaxed">
+              At least one cap below is a guess. Everything on this page is arithmetic on top of it.
+            </p>
+            <p v-else class="text-[13px] text-fg-2 mt-2 ml-[22.5px] max-w-[52ch] leading-relaxed">
+              No vendor throttle has been recorded against this target.
+            </p>
+          </StatusDot>
         </div>
         <!-- `calls` is the count the caller reported at ack time — the real
              number of HTTP requests the admitted work produced. Where it drifts
