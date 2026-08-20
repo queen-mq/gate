@@ -11,7 +11,7 @@ gate-core = { path = "../core" }
 # The PUBLISHED client, not a path into a sibling checkout. Gate is its own
 # repository: a path dependency means it only builds on a laptop that happens
 # to have queen cloned next to it, and the container build cannot work at all.
-queen-mq = "1.0.3"
+queen-mq = "1.0.5"
 
 serde.workspace = true
 serde_json.workspace = true

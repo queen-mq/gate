@@ -87,20 +87,45 @@ impl Depths {
         let mut out = HashMap::new();
         let mut answered = false;
 
-        if let Ok(v) = queen.admin().queue(queue).await {
-            answered = true;
-
-            if let Some(parts) = v.get("partitions").and_then(|p| p.as_array()) {
-                for p in parts {
-                    let name = p.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                    let pending = p
-                        .get("stats")
-                        .and_then(|s| s.get("pending"))
-                        .and_then(|n| n.as_u64())
-                        .unwrap_or(0);
-                    out.insert(name.to_string(), pending);
+        // The depth route first (broker >= 1.0.4): watermark arithmetic only —
+        // measured at ~1ms on a gate-sized queue, against two console-grade
+        // queries for the detail below. No group, on purpose: queue-level
+        // pending under the worst-cursor precedence is exactly what the old
+        // detail reported, so the relay's window bound does not move.
+        match queen.admin().queue_depth(queue, None).await {
+            Ok(v) => {
+                answered = true;
+                if let Some(parts) = v.get("partitions").and_then(|p| p.as_array()) {
+                    for p in parts {
+                        let name = p.get("partition").and_then(|n| n.as_str()).unwrap_or("");
+                        let pending = p.get("pending").and_then(|n| n.as_u64()).unwrap_or(0);
+                        out.insert(name.to_string(), pending);
+                    }
                 }
             }
+            // A 404 here is BOTH "this broker predates the route" and "no such
+            // queue", and they cannot be told apart. The queue detail below
+            // answers both the same way this function always has — it exists
+            // on every broker version, and it 404s a missing queue too — so
+            // one fallback covers both, at the old price only on old brokers.
+            Err(e) if e.status() == Some(404) => {
+                if let Ok(v) = queen.admin().queue(queue).await {
+                    answered = true;
+
+                    if let Some(parts) = v.get("partitions").and_then(|p| p.as_array()) {
+                        for p in parts {
+                            let name = p.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                            let pending = p
+                                .get("stats")
+                                .and_then(|s| s.get("pending"))
+                                .and_then(|n| n.as_u64())
+                                .unwrap_or(0);
+                            out.insert(name.to_string(), pending);
+                        }
+                    }
+                }
+            }
+            Err(_) => {}
         }
         if !answered {
             // An absent queue answers, and answers zero — a target declared a moment
