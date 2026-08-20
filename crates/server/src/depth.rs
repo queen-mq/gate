@@ -156,7 +156,19 @@ impl Depths {
                 self.cache.write().insert(key, (out.clone(), Instant::now()));
                 out
             }
-            Err(e) if e.status() == Some(404) => self.pending(queen, queue).await,
+            Err(e) if e.status() == Some(404) => {
+                let out = self.pending(queen, queue).await;
+                // Stamped under the GROUP key as well, and not only under the
+                // queue's. Both reasons for a 404 here persist — a broker older
+                // than 1.0.4 stays old, and a queue that does not exist yet
+                // stays absent for as long as the target has had no push — so
+                // without this the probe is re-issued on every request for ever:
+                // one round trip per caller, which is the thing the TTL exists
+                // to stop. Re-probed once per TTL, so an upgrade or a first push
+                // is noticed two seconds later.
+                self.cache.write().insert(key, (out.clone(), Instant::now()));
+                out
+            }
             // The broker did not answer. Serve the last thing it DID say, stamped,
             // for the reason `pending` does it: an outage costs one round trip per
             // TTL rather than one per caller.

@@ -349,6 +349,8 @@ impl Harness {
 struct FaultyBroker {
     url: String,
     refuse: Arc<parking_lot::RwLock<Option<String>>>,
+    absent: Arc<parking_lot::RwLock<Option<String>>>,
+    seen: Arc<parking_lot::RwLock<Vec<String>>>,
 }
 
 impl FaultyBroker {
@@ -360,6 +362,22 @@ impl FaultyBroker {
     fn allow(&self) {
         *self.refuse.write() = None;
     }
+
+    /// Answer 404 for every path containing `marker`, which is how a broker that
+    /// predates a route behaves — the one failure a version fallback exists for,
+    /// and one no live broker can be asked to produce.
+    fn route_missing(&self, marker: &str) {
+        *self.absent.write() = Some(marker.to_string());
+    }
+
+    /// How many requests have gone through whose path contains `marker`.
+    fn hits(&self, marker: &str) -> usize {
+        self.seen.read().iter().filter(|p| p.contains(marker)).count()
+    }
+
+    fn forget(&self) {
+        self.seen.write().clear();
+    }
 }
 
 #[derive(Clone)]
@@ -367,14 +385,20 @@ struct ProxyState {
     real: String,
     http: reqwest::Client,
     refuse: Arc<parking_lot::RwLock<Option<String>>>,
+    absent: Arc<parking_lot::RwLock<Option<String>>>,
+    seen: Arc<parking_lot::RwLock<Vec<String>>>,
 }
 
 async fn faulty_broker(real: &str) -> FaultyBroker {
     let refuse = Arc::new(parking_lot::RwLock::new(None));
+    let absent = Arc::new(parking_lot::RwLock::new(None));
+    let seen = Arc::new(parking_lot::RwLock::new(Vec::new()));
     let state = ProxyState {
         real: real.trim_end_matches('/').to_string(),
         http: reqwest::Client::new(),
         refuse: refuse.clone(),
+        absent: absent.clone(),
+        seen: seen.clone(),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -384,7 +408,7 @@ async fn faulty_broker(real: &str) -> FaultyBroker {
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    FaultyBroker { url: format!("http://{addr}"), refuse }
+    FaultyBroker { url: format!("http://{addr}"), refuse, absent, seen }
 }
 
 async fn proxy(
@@ -397,6 +421,18 @@ async fn proxy(
         .await
         .unwrap_or_default();
     let path = parts.uri.to_string();
+    st.seen.write().push(path.clone());
+
+    if let Some(marker) = st.absent.read().clone() {
+        if path.contains(&marker) {
+            return (
+                axum::http::StatusCode::NOT_FOUND,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                r#"{"error":"no_such_route"}"#,
+            )
+                .into_response();
+        }
+    }
 
     if let Some(marker) = st.refuse.read().clone() {
         let text = String::from_utf8_lossy(&bytes);
@@ -2471,4 +2507,93 @@ async fn an_interior_leg_is_measured_against_the_relay_that_drains_it() {
     assert_eq!(terminal["target"], json!("g.ip"), "{terminal}");
 
     h.cleanup("g").await;
+}
+
+/// An ETA costs the broker one depth read per queue per TTL, and that has to hold
+/// on the version fallback too.
+///
+/// The depth route arrived in broker 1.0.4, and an older one answers 404 — the
+/// same 404 an absent queue answers, which is why one fallback covers both. But a
+/// 404 is an answer, and an answer that is not stamped is an answer asked for
+/// again by the next caller: on a broker that will never have the route, the
+/// probe repeats for ever, one round trip per request. A product polling this for
+/// a progress bar across a dozen targets is exactly the caller that would find
+/// out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn an_eta_against_an_older_broker_still_costs_one_probe_per_ttl() {
+    let Some(h) = harness("etattl").await else { return };
+    let broker = faulty_broker(&queen_url().expect("checked")).await;
+    let app = Arc::new(api::App::new(
+        Queen::connect(Config::new(&broker.url)).expect("connect"),
+        broker.url.clone(),
+    ));
+    let base = spawn_server(app.clone()).await;
+    let http = reqwest::Client::new();
+    let application = format!("{}-old", h.application);
+
+    let res = http
+        .put(format!("{base}/v1/apps/{application}/targets/airbnb"))
+        .json(&json!({
+          "name": "airbnb", "version": 1,
+          "budgets": [wide("ip")],
+          "lanes": [{ "name": "bulk", "cap": "ceiling", "concurrency": 2, "default": true }],
+          "cost": { "field": "httpCost", "default": 1, "max": 1 }
+        }))
+        .send()
+        .await
+        .expect("declare");
+    assert_eq!(res.status().as_u16(), 200);
+
+    for i in 0..4 {
+        let res = http
+            .post(format!("{base}/v1/apps/{application}/targets/airbnb/lanes/bulk/push"))
+            .json(&json!({ "op": "x", "txn": format!("t{i}"), "payload": { "connection": "c1" } }))
+            .send()
+            .await
+            .expect("push");
+        assert_eq!(res.status().as_u16(), 200);
+    }
+
+    // A broker that predates the route. Every depth read now 404s and falls back
+    // to the queue detail, which every version has.
+    broker.route_missing("/depth");
+    // Past any entry the declare and the pushes left behind.
+    tokio::time::sleep(Duration::from_millis(2_200)).await;
+    broker.forget();
+
+    const ASKS: usize = 6;
+    let started = Instant::now();
+    for _ in 0..ASKS {
+        let res = http
+            .get(format!("{base}/v1/apps/{application}/targets/airbnb/eta?lane=bulk"))
+            .send()
+            .await
+            .expect("eta");
+        assert_eq!(res.status().as_u16(), 200, "the fallback must still answer");
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "this has to fit inside one TTL to be measuring anything: took {:?}",
+        started.elapsed()
+    );
+
+    // Two queues are read — the push queue and the admitted one — so two probes
+    // and two fallbacks, once, and not six of each.
+    let probes = broker.hits("/depth");
+    let details = broker.hits("/resources/queues/") - probes;
+    assert!(
+        probes <= 4,
+        "{ASKS} asks inside one TTL cost {probes} depth probes: a 404 is being \
+         re-asked instead of remembered"
+    );
+    assert!(
+        details <= 4,
+        "{ASKS} asks inside one TTL cost {details} queue-detail reads"
+    );
+
+    let _ = http
+        .delete(format!("{base}/v1/apps/{application}/targets/airbnb"))
+        .send()
+        .await;
 }
