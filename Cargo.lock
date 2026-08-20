@@ -423,7 +423,7 @@ dependencies = [
 
 [[package]]
 name = "gate-bench"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "reqwest",
  "serde",
@@ -433,7 +433,7 @@ dependencies = [
 
 [[package]]
 name = "gate-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -441,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "gate-e2e"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "reqwest",
  "serde",
@@ -451,7 +451,7 @@ dependencies = [
 
 [[package]]
 name = "gate-server"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "axum",
  "deadpool-postgres",
