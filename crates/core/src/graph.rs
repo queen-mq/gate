@@ -659,6 +659,32 @@ pub fn graph_warnings(g: &GraphSpec) -> Vec<Problem> {
                 detail: format!("node `{name}`: {}", w.detail),
             });
         }
+        // A relay is sharded by its SOURCE's admitted partitions: one runner per
+        // partition, because a partition has one claimer and that is what keeps a
+        // connection's items in order. A source with one partition therefore gets
+        // one runner, and the edge moves at whatever one loop can move — measured
+        // on one machine at 3,639 items/s for a single partition against 4,949 for
+        // sixteen of them, draining the same backlog.
+        //
+        // A warning and not a refusal, because it is a legitimate choice: one
+        // partition is ONE order for the whole node, which is the only way to ask
+        // for strict global FIFO. What it must not be is a surprise.
+        if !g.out_edges(&name).is_empty() && spec.admitted.count() == 1 {
+            out.push(Problem {
+                rule: "relay-parallelism",
+                detail: format!(
+                    "node `{name}` has an out-edge and one admitted partition ({}), so the relay \
+                     that drains it is a single runner and the edge cannot go faster than one \
+                     loop. `partitionBy: connection` (or `entity`) with more `partitions` gives \
+                     the relay one runner per partition; one partition is the right answer only \
+                     if this node needs a single global order",
+                    match spec.admitted.partition_by {
+                        crate::spec::PartitionBy::None => "partitionBy: none".to_string(),
+                        _ => format!("partitions: {}", spec.admitted.partitions),
+                    }
+                ),
+            });
+        }
     }
     out
 }

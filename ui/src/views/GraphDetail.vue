@@ -140,7 +140,9 @@ function nodeState(n) {
       <p class="text-[12px] text-fg-3 mb-3">
         One per destination, draining its upstreams in strict priority order and stopping while the
         destination's queue is deeper than its window — a shallow bottleneck is what makes priority at the
-        entrance priority in fact.
+        entrance priority in fact. Each leg is drained by one runner per admitted partition of its source,
+        sixteen at a time: the number after the priority is how many runners, and it is raised by giving
+        the source more partitions.
       </p>
       <table class="w-full text-[12.5px]">
         <thead>
@@ -149,6 +151,7 @@ function nodeState(n) {
             <th class="font-normal pb-1.5">from</th>
             <th class="font-normal pb-1.5">window</th>
             <th class="font-normal pb-1.5">relayed</th>
+            <th class="font-normal pb-1.5">per txn</th>
             <th class="font-normal pb-1.5">unroutable</th>
             <th class="font-normal pb-1.5">already there</th>
 
@@ -158,10 +161,17 @@ function nodeState(n) {
           <tr v-for="r in relays" :key="r.dest" class="border-t border-line">
             <td class="py-2 font-mono">{{ r.dest }}</td>
             <td class="py-2 font-mono text-fg-2">
-              {{ r.sources.map((s) => `${s.node}(p${s.priority})`).join(', ') }}
+              {{ r.sources.map((s) => `${s.node}(p${s.priority}×${s.runners ?? 1})`).join(', ') }}
             </td>
             <td class="py-2 tabular-nums text-fg-2">{{ num(r.window) }}</td>
             <td class="py-2 tabular-nums text-fg-2">{{ num(r.forwarded) }}</td>
+            <!-- Items per committed transaction. The destination's push partition
+                 takes one row lock per transaction, so this is the multiplier on
+                 everything the runners do in parallel — a relay that has fallen to
+                 slivers is one whose source is arriving too thinly spread. -->
+            <td class="py-2 tabular-nums text-fg-2">
+              {{ r.commits ? (r.forwarded / r.commits).toFixed(0) : '—' }}
+            </td>
             <td class="py-2 tabular-nums" :class="r.unroutable ? 'text-bad' : 'text-fg-3'">
               {{ num(r.unroutable) }}
             </td>

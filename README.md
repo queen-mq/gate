@@ -218,7 +218,9 @@ POST /v1/apps/channel-manager/graphs/airbnb/nodes/prices/push
    message)` and `push(ip.push)` together. Never two calls: ack-then-push loses the
    item, push-then-ack duplicates it. The downstream push reuses the upstream message's
    transaction id, so a redelivered relay is refused as a duplicate rather than
-   doubling the work.
+   doubling the work. The runner that moves it is the one pinned to `p{n}` — the relay
+   runs one per partition of `prices.admitted`, forwarding at the same time, and this
+   item's connection belongs to exactly one of them.
 
 4. The `ip` gate evaluates all four IP budgets against one instant and charges them
    only if every one admits, then appends the item to `…ip.admitted.p{n}`. If any
@@ -268,9 +270,63 @@ somebody else has already re-claimed.
 **One relay per destination, not per edge.** Priority is only real where the streams
 meet: two independent relays into one queue would each forward as fast as they could,
 and the destination's FIFO would then order by arrival, which is exactly what a
-priority is meant to override. So the tasks feeding a node are one task, draining its
+priority is meant to override. So the tasks feeding a node are one relay, draining its
 upstreams in strict `priority` order: a leg is drained until it runs dry or the window
 closes, before the next one is looked at.
+
+**One runner per source partition, inside a leg.** One relay per destination is not one
+task: a leg is drained by one runner per partition of its source's admitted queue,
+several at a time, each popping only its own partition. It is the argument the admission
+gates already make — the partition is what makes a claimer the only claimer, so
+parallelism is expressed as more partitions rather than as more runners on one. A
+connection's items live in a single source partition, so a single runner holds them and
+per-connection ordering survives untouched. The count is derived and has no knob: it is
+the source's `admitted.partitions`, one each, and a source with one partition is warned
+about (`relay-parallelism`) rather than silently slow.
+
+**A cycle polls the partitions that hold something, sixteen at a time.** Sixteen,
+because past a handful the extra concurrency only queues on the destination's row
+lock. Only the ones holding something, because the cycle starts by asking the broker
+— one watermark read per queue — which partitions this relay's group still owes work
+in. That is not only economy: the window can be smaller than the ring (a node at 5/s
+allows ten items against sixty-four partitions), and a runner that reaches an
+exhausted window never polls at all, so a blind sweep reached a waiting partition
+about once in sixty cycles. A queue the broker will not answer for is polled anyway —
+silence is not emptiness.
+
+Measured on one laptop against a 1.0.5 broker, draining the same 300,000-item backlog
+with nothing else running: 2,064 items/s for the loop this replaced, 2,269 for a
+single-partition source (the control — one partition is still one runner), 2,516 for
+sixteen, and no further gain past four. That is 1.25x on the mean and 1.7x on a fresh
+broker's first ten seconds — the same sweep against 1.0.4, whose transaction wire
+re-scanned a partition's ack history once per ack group, put it at 2.8x. Most of what
+the old shape cost was that scan; what is left is a relay that no longer serialises
+against itself and runs at the broker's ceiling for the shape it has.
+
+Priority stays across legs and parallelism stays inside one, which is the same rule
+stated twice: two legs draining at once would order the merge by arrival, so the runners
+of a leg all finish before the next leg's start. A leg hands the window on only when it
+is **dry**, and dry means an empty read — a pop that errored is unknown, not empty, and
+a leg that treats unknown as empty gives away a window it was owed the moment the broker
+gets slow. The hold is bounded: a leg that has not drained for several cycles is broken
+rather than busy, and the window goes on down the legs with a line in the log.
+
+**A relay transaction is one source partition wide.** A queen transaction takes one row
+lock per partition it touches, so a batch popped across sixteen partitions and acked in
+one transaction serialises against every other transaction on that queue — measured at
+33 transactions a second with the machine 95% idle, against 603 for the same workers on
+disjoint partitions. The pin gives narrowness on the ack side for free, and the
+downstream pushes are grouped by destination partition with one transaction each: a
+batch that fans out becomes several narrow transactions, never one wide one.
+
+**Where the ceiling is now.** Not the relay: the destination's push queue is one
+partition per lane, because that partition *is* the node's counter and its gate runner,
+so every runner's transaction queues on that one row lock. Measured on one machine
+against 1.0.5: sixteen relay-shaped workers move 12,346 items/s into sixteen destination
+partitions and 2,953/s into one, with the transaction's own p50 going from 100ms to
+1,017ms. Gate's relay measures 2,516-2,579/s in that second shape — 85% of what a loader
+with no other job gets — because that is the shape a destination node has. Raising it
+means more destination nodes, not more runners.
 
 **A window keeps the bottleneck shallow.** The relay forwards only while the
 destination's push queue holds fewer than `2 × rate × leaseSeconds` items, where the
@@ -355,20 +411,24 @@ is a style check.
 | `relay-lane` | a second lane on a relayed node: a relay has nobody to ask which lane, so the other lane's share is capacity nothing can reach |
 | `cost-field` | two nodes reading the weight under different names; the downstream one silently charges its default |
 | `shard-scope`, `shard-entry`, `shard-count` | a cap enforced once per shard; a shard a relay cannot choose; an unbounded number of runners |
+| `admitted-partitions` | a ring with no buckets, or one so wide the relay runners it buys outnumber anything the broker should be asked for |
 | `store-fits`, `max-keys` | a state document re-read at a size nobody sized it for |
 | `lane-shares`, `lane-floor`, `default-lane` | a ceiling divided into more than one ceiling |
 | `cost-fits`, `batch-fits` | an item no budget can admit; a batch smaller than a lease's worth of budget, which makes the batch the limiter |
 | `kv-scope`, `kv-match`, `kv-chunk` | a shared budget pretending to be per-key, per-op, or large enough to lease |
 | `provenance` | a cap claiming to be `documented` with no source and no date |
 
-Two things are warned about rather than refused, because they are trade-offs and not
+Three things are warned about rather than refused, because they are trade-offs and not
 mistakes: `lease-beats-window` (a lease as long as the tightest window costs about a
-quarter of the ceiling) and `kv-rolling` (a shared budget is a fixed window whatever it
-declares, so a rolling one accepts up to twice its cap at the boundary).
+quarter of the ceiling), `kv-rolling` (a shared budget is a fixed window whatever it
+declares, so a rolling one accepts up to twice its cap at the boundary), and
+`relay-parallelism` (a node with an out-edge and one admitted partition is drained by one
+relay runner, which is the right answer only if that node needs a single global order).
 
-A change that re-founds a counter (a period, an alignment, a scope, a store, a
-partitioning, a re-shard, a rewiring) needs `version` bumped, or the declare is a `409`
-naming what it would have re-founded.
+A change that re-founds a counter or a claim (a period, an alignment, a scope, a store,
+a re-shard, a rewiring, or the width of a node's admitted ring — a relay names the
+partitions it runs on, so a narrower ring leaves what is in the old ones unclaimed)
+needs `version` bumped, or the declare is a `409` naming what it would have re-founded.
 
 ---
 
@@ -552,8 +612,8 @@ DELETE /v1/apps/{app}/graphs/{name}
 ```
 
 The declare answers with the resolved topology: which node is pushable, which is
-poppable, the queues each one owns, and the window every relay is holding its
-destination to.
+poppable, the queues each one owns, the window every relay is holding its destination
+to, and how many runners each relay leg is drained by.
 
 ### Acking a breach
 

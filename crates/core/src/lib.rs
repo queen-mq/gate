@@ -23,6 +23,7 @@ pub use spec::{
 };
 pub use validate::{
     effective_cap, needs_version_bump, ok_name, ok_target_name, pacing_warnings, validate,
-    validate_with, warnings, Problem, ValidateOpts, GATE_MAX_KEYS, GATE_MAX_SHARDS,
+    validate_with, warnings, Problem, ValidateOpts, GATE_MAX_ADMITTED_PARTITIONS,
+    GATE_MAX_KEYS, GATE_MAX_SHARDS,
 };
 

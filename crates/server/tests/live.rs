@@ -1888,6 +1888,483 @@ async fn a_relay_batch_poisoned_by_a_duplicate_still_settles_every_item() {
     h.cleanup("g").await;
 }
 
+/// A budget wide enough that nothing in a test is waiting for it: the relay runs at
+/// whatever the broker will do, which is the regime the sharded relay exists for.
+fn fast(id: &str) -> Value {
+    json!({ "id": id, "cap": 20000, "periodSeconds": 10, "alignment": "rolling",
+            "confidence": "inferred" })
+}
+
+/// A source whose admitted queue has `partitions` partitions is a relay of
+/// `partitions` runners. Everything below turns that knob.
+fn sharded_chain(partitions: u32) -> Value {
+    json!({
+      "version": 1,
+      "nodes": {
+        "messages": { "entry": true, "budgets": [fast("msg")],
+                      "cost": { "field": "httpCost", "default": 1, "max": 1 },
+                      "admitted": { "partitionBy": "connection", "partitions": partitions },
+                      "pacing": { "leaseSeconds": 1, "batch": 2000 } },
+        "ip": { "budgets": [fast("ip")],
+                "cost": { "field": "httpCost", "default": 1, "max": 1 },
+                "pacing": { "leaseSeconds": 1, "batch": 2000 } }
+      },
+      "edges": [{ "from": "messages", "to": "ip" }],
+      "consume": ["ip"]
+    })
+}
+
+/// Per-connection ordering, with the relay drained by one runner per source partition.
+///
+/// The guarantee is narrower than "the graph preserves order", and that is exactly why it
+/// survives being parallelised: work is partitioned by the declared `partitionBy`, so one
+/// connection's items live in ONE source partition, and one partition has ONE runner —
+/// pinned when the runner is built, so there is no path that can put a second one on it.
+/// Sixteen runners forwarding at once therefore reorder nothing a caller can observe.
+///
+/// A test with one connection would have passed before any of this existed, so this one
+/// uses sixteen, checks the relay really is running sixteen runners, and then checks that
+/// every connection came out in the order it went in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn a_connections_items_keep_their_order_across_parallel_relay_runners() {
+    let Some(h) = harness("relay-order").await else { return };
+    let (status, body) = h.put_graph("g", sharded_chain(16)).await;
+    assert_eq!(status, 200, "declare: {body}");
+    assert_eq!(body["warnings"], json!([]), "declare bought caveats: {body}");
+    // The mechanism, asserted before anything that depends on it: sixteen partitions on
+    // the source is sixteen runners on the edge. Without this the test could pass on a
+    // relay that never parallelised at all.
+    assert_eq!(
+        body["resolved"]["relays"][0]["sources"][0]["runners"].as_u64(),
+        Some(16),
+        "the relay is not sharded by the source's partitions: {body}"
+    );
+
+    const CONNECTIONS: usize = 16;
+    const EACH: usize = 15;
+    // Round-robin, so every partition has a stream in flight at the same time rather
+    // than one being filled and drained before the next is touched.
+    for i in 0..EACH {
+        for c in 0..CONNECTIONS {
+            let (status, out) = h
+                .push(
+                    "g",
+                    "messages",
+                    json!({ "op": "m.post", "txn": format!("o{c}-{i}"),
+                            "payload": { "connection": format!("c{c}"), "conn": c, "n": i } }),
+                )
+                .await;
+            assert_eq!(status, 200, "push: {out}");
+        }
+    }
+
+    let want = CONNECTIONS * EACH;
+    let got = h.drain("g", "ip", "g.ip", want, Duration::from_secs(90)).await;
+    assert_eq!(got.len(), want, "expected {want} through the graph, got {}", got.len());
+
+    // Order per connection, in arrival order at the terminal. Nothing is asserted about
+    // how two connections interleave — they are different partitions and the graph never
+    // promised anything about their relative order.
+    let mut last: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    for (at, payload) in got.iter().enumerate() {
+        let (Some(conn), Some(n)) = (payload["conn"].as_i64(), payload["n"].as_i64()) else {
+            panic!("an item arrived without its markers: {payload}");
+        };
+        if let Some(previous) = last.insert(conn, n) {
+            assert!(
+                n > previous,
+                "connection c{conn} arrived out of order: {n} came after {previous} \
+                 (position {at} of {want})"
+            );
+        }
+    }
+    assert_eq!(last.len(), CONNECTIONS, "not every connection arrived: {last:?}");
+
+    h.cleanup("g").await;
+}
+
+/// The exactly-once contract, on the transaction the sharded relay actually builds.
+///
+/// The relay carries the upstream message's transaction id into the downstream push, so a
+/// redelivered relay collapses instead of doubling the work. Sharding changed the shape of
+/// that transaction — one pinned source partition, pushes grouped by destination partition
+/// — so the property is re-checked on the new shape: claim under the relay's own group,
+/// pinned to one partition exactly as a runner does, commit the relay's transaction, then
+/// commit it again.
+///
+/// The destination is deliberately slow, which is what makes the claim below possible at
+/// all: a window of twenty against sixty-four items means most of them are still upstream
+/// when the test goes looking, rather than the test racing sixteen runners for the last
+/// message and losing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn a_redelivered_relay_is_refused_even_when_the_relay_is_sharded() {
+    let Some(h) = harness("relay-dup").await else { return };
+    let mut doc = sharded_chain(16);
+    // 10/s at the terminal: a window of 2 x 10 x 1s = 20.
+    doc["nodes"]["ip"]["budgets"] = json!([
+        { "id": "ip", "cap": 10, "periodSeconds": 1, "alignment": "rolling",
+          "confidence": "inferred" }
+    ]);
+    doc["nodes"]["ip"]["pacing"] = json!({ "leaseSeconds": 1, "batch": 20 });
+    let (status, body) = h.put_graph("g", doc).await;
+    assert_eq!(status, 200, "{body}");
+
+    const N: usize = 64;
+    for i in 0..N {
+        let (status, _) = h
+            .push(
+                "g",
+                "messages",
+                json!({ "op": "m.post", "txn": format!("d{i}"),
+                        "payload": { "connection": format!("c{}", i % 16), "n": i } }),
+            )
+            .await;
+        assert_eq!(status, 200);
+    }
+
+    let src = h.app.registry.get(&h.application, "g.messages").expect("node");
+    let dst = h.app.registry.get(&h.application, "g.ip").expect("node");
+    let group = gate_server::edge::group_of(&h.application, "g", "messages", "ip");
+    let partitions = src.spec.admitted.partition_names();
+    assert_eq!(partitions.len(), 16, "the source ring is not what was declared");
+
+    // Claim one the way a runner does: pinned to a single partition, under the edge's
+    // group. The real runners are competing for the same claims, so this sweeps the ring
+    // until it wins one.
+    let started = Instant::now();
+    let mut claimed = None;
+    while started.elapsed() < Duration::from_secs(60) && claimed.is_none() {
+        for partition in &partitions {
+            let msgs = h
+                .app
+                .queen
+                .queue(src.spec.admitted_queue("default"))
+                .partition(partition.clone())
+                .group(&group)
+                .subscription_mode(queen_mq::SubscriptionMode::All)
+                .batch(1)
+                .partitions(1)
+                .lease_seconds(30)
+                .wait(false)
+                .poll_timeout(Duration::from_millis(500))
+                .pop()
+                .await
+                .expect("pop");
+            if let Some(m) = msgs.into_iter().next() {
+                claimed = Some(m);
+                break;
+            }
+        }
+    }
+    let m = claimed.expect("no admitted message could be claimed under the relay's group");
+    // A runner acks only what it pops, and it pops one partition: the ack side of the
+    // transaction is one partition wide, which is the narrowness the throughput rests on.
+    assert!(
+        partitions.contains(&m.partition),
+        "claimed from `{}`, which is not one of this source's partitions",
+        m.partition
+    );
+
+    let relay_txn = || {
+        h.app
+            .queen
+            .transaction()
+            .ack(&m)
+            .push_item(queen_mq::TxnPushItem {
+                queue: dst.spec.push_queue(),
+                partition: Some("default".into()),
+                payload: m.data.clone(),
+                // Carried over rather than minted. That is the whole mechanism.
+                transaction_id: Some(m.transaction_id.clone()),
+                trace_id: None,
+            })
+            .expect("stage")
+    };
+    relay_txn().commit().await.expect("the first forward must land");
+    let err = relay_txn()
+        .commit()
+        .await
+        .expect_err("a redelivered relay transaction must not commit twice");
+    let text = err.to_string();
+    assert!(
+        text.contains("QDUP") || text.contains("QTXN") || text.contains("lease"),
+        "the broker should refuse the replay as a duplicate or a spent lease, said: {text}"
+    );
+
+    // And the graph still delivers every item exactly once, across all sixteen runners.
+    let got = h.drain("g", "ip", "g.ip", N, Duration::from_secs(90)).await;
+    let seen: HashSet<i64> = got.iter().filter_map(|p| p["n"].as_i64()).collect();
+    assert_eq!(seen.len(), N, "expected {N} distinct items, saw {}", seen.len());
+    assert_eq!(got.len(), N, "an item was delivered twice");
+
+    h.cleanup("g").await;
+}
+
+/// Priority is across legs; parallelism is inside one — and the window is shared.
+///
+/// Two things could have been broken by sharding the relay, and both are here:
+///
+/// * a priority-1 leg taking window from a priority-0 leg that still has work. The legs
+///   are drained one at a time, however many runners each has, so it cannot;
+/// * the window multiplied by the runner count. Each runner reading the destination's
+///   depth for itself would give sixteen runners sixteen windows — a bottleneck queue
+///   sixteen times deeper than the one that makes priority mean anything. The depth is
+///   probed once per cycle and the allowance it yields is one pool the runners claim
+///   from, so the bound is the window whatever the ring width.
+///
+/// Both legs are spread over sixteen connections, so both are genuinely many runners.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn priority_and_the_window_survive_the_relay_being_many_runners() {
+    let Some(h) = harness("relay-priority").await else { return };
+    // 5 per second at the terminal: a window of 2 x 5 x 1s = 10 items in front of the
+    // gate. Sixteen runners per leg against a window of ten is the interesting case —
+    // it is smaller than the runner count, so a per-runner slice would be visible.
+    let ring = json!({ "partitionBy": "connection", "partitions": 16 });
+    let doc = json!({
+      "version": 1,
+      "nodes": {
+        "prices": { "entry": true, "budgets": [], "admitted": ring,
+                    "cost": { "field": "httpCost", "default": 1, "max": 1 } },
+        "bulk": { "entry": true, "budgets": [], "admitted": ring,
+                  "cost": { "field": "httpCost", "default": 1, "max": 1 } },
+        "ip": { "budgets": [{ "id": "ip", "cap": 5, "periodSeconds": 1, "alignment": "rolling",
+                              "confidence": "inferred" }],
+                "cost": { "field": "httpCost", "default": 1, "max": 1 },
+                "pacing": { "leaseSeconds": 1, "batch": 20 } }
+      },
+      "edges": [{ "from": "prices", "to": "ip", "priority": 0 },
+                { "from": "bulk", "to": "ip", "priority": 1 }],
+      "consume": ["ip"]
+    });
+    let (status, body) = h.put_graph("g", doc).await;
+    assert_eq!(status, 200, "declare: {body}");
+    let window = body["resolved"]["relays"][0]["window"].as_u64().expect("window");
+    assert_eq!(window, 10, "2 x 5/s x 1s: {body}");
+    for leg in body["resolved"]["relays"][0]["sources"].as_array().expect("legs") {
+        assert_eq!(leg["runners"].as_u64(), Some(16), "leg {leg} is not sharded");
+    }
+
+    // A flood on the low-priority leg, spread over every partition of it.
+    for i in 0..200 {
+        let (status, _) = h
+            .push(
+                "g",
+                "bulk",
+                json!({ "op": "calendar.push", "txn": format!("b{i}"),
+                        "payload": { "connection": format!("c{}", i % 16), "kind": "bulk",
+                                     "n": i } }),
+            )
+            .await;
+        assert_eq!(status, 200);
+    }
+    // Let the flood take up all the room it is going to get.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let ip = h.app.registry.get(&h.application, "g.ip").expect("node");
+    let depth_before: u64 = h
+        .app
+        .depths
+        .pending_now(&h.app.queen, &ip.spec.push_queue())
+        .await
+        .values()
+        .sum();
+    assert!(
+        depth_before <= window + 20,
+        "sixteen runners filled the bottleneck queue {depth_before} deep against a window \
+         of {window}: the window is being applied per runner rather than shared"
+    );
+
+    let (status, _) = h
+        .push(
+            "g",
+            "prices",
+            json!({ "op": "price.push", "txn": "urgent",
+                    "payload": { "connection": "c9", "kind": "urgent" } }),
+        )
+        .await;
+    assert_eq!(status, 200);
+
+    // It has to overtake ~200 bulk items. At 5/s that would be 40 seconds if it queued
+    // behind them; priority is the difference between that and one window.
+    let started = Instant::now();
+    let mut urgent_after = None;
+    let mut drained = 0usize;
+    let mut worst_depth = depth_before;
+    while started.elapsed() < Duration::from_secs(60) && urgent_after.is_none() {
+        let (status, body) = h.next("g", "ip", 20, 500).await;
+        assert_eq!(status, 200, "{body}");
+        let items = body["items"].as_array().cloned().unwrap_or_default();
+        for (i, item) in items.iter().enumerate() {
+            if item["payload"]["kind"] == json!("urgent") {
+                urgent_after = Some(drained + i);
+            }
+        }
+        drained += items.len();
+        if !items.is_empty() {
+            let (status, ack) = h
+                .ack(json!({ "lease": body["lease"], "application": h.application,
+                             "target": "g.ip", "lane": "default", "op": "x" }))
+                .await;
+            assert_eq!(status, 200, "{ack}");
+        }
+        worst_depth = worst_depth.max(
+            h.app
+                .depths
+                .pending_now(&h.app.queen, &ip.spec.push_queue())
+                .await
+                .values()
+                .sum(),
+        );
+    }
+
+    let position = urgent_after.expect("the priority-0 item never arrived");
+    assert!(
+        position <= window as usize + 20,
+        "the urgent item came out behind {position} bulk items; the window is {window}, so \
+         a priority-1 leg took window a priority-0 leg was owed"
+    );
+    assert!(
+        worst_depth <= window + 20,
+        "the relay overshot its window across its runners: {worst_depth} > {window}"
+    );
+
+    h.cleanup("g").await;
+}
+
+/// A leg that cannot be READ is not a leg that is empty — and the relay must not
+/// confuse the two, or lose the graph to the difference.
+///
+/// The rule and both halves of it: a leg hands the rest of the window to the next
+/// priority only when it is DRY, and dry means an empty read. A pop that errored is
+/// unknown, and unknown keeps the window — that is what stops a priority-1 leg
+/// taking a window a priority-0 leg was owed the moment the broker gets slow, which
+/// is exactly how it was lost (188 of the first 300 items forwarded came from the
+/// low-priority leg while the high one held a backlog of 172).
+///
+/// Unbounded, though, that hold is the failure this codebase refuses everywhere
+/// else: one error stopping the graph for ever. So the hold has a length, and this
+/// checks it has both — the low-priority leg waits while the high one is failing,
+/// and then it does not wait for ever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn a_leg_that_is_not_dry_holds_its_window_but_not_for_ever() {
+    let Some(h) = harness("stall").await else { return };
+    let broker = faulty_broker(&queen_url().expect("checked")).await;
+    let app = Arc::new(api::App::new(
+        Queen::connect(Config::new(&broker.url)).expect("connect"),
+        broker.url.clone(),
+    ));
+    let base = spawn_server(app.clone()).await;
+    let http = reqwest::Client::new();
+    let application = format!("{}-stall", h.application);
+
+    // Four partitions a side, so a cycle is four pops and not sixty-four: this test
+    // spends its time waiting for cycles to pass, and the ring width is not what it
+    // is about.
+    let ring = json!({ "partitionBy": "connection", "partitions": 4 });
+    let doc = json!({
+      "version": 1,
+      "nodes": {
+        "prices": { "entry": true, "budgets": [], "admitted": ring,
+                    "cost": { "field": "httpCost", "default": 1, "max": 1 } },
+        "bulk": { "entry": true, "budgets": [], "admitted": ring,
+                  "cost": { "field": "httpCost", "default": 1, "max": 1 } },
+        "ip": { "budgets": [wide("ip")], "admitted": ring,
+                "cost": { "field": "httpCost", "default": 1, "max": 1 },
+                "pacing": { "leaseSeconds": 1, "batch": 200 } }
+      },
+      "edges": [{ "from": "prices", "to": "ip", "priority": 0 },
+                { "from": "bulk", "to": "ip", "priority": 1 }],
+      "consume": ["ip"]
+    });
+    let res = http
+        .put(format!("{base}/v1/apps/{application}/graphs/g"))
+        .json(&doc)
+        .send()
+        .await
+        .expect("declare");
+    assert_eq!(res.status().as_u16(), 200, "{}", res.text().await.unwrap_or_default());
+
+    // Every read of the high-priority leg's admitted queue now fails. Its runners do
+    // not come back empty — they come back with an error, which is the state the rule
+    // is about. Set BEFORE anything is pushed, so nothing can have been forwarded
+    // while the leg was healthy.
+    broker.refuse("prices.admitted");
+
+    for i in 0..20 {
+        let res = http
+            .post(format!(
+                "{base}/v1/apps/{application}/graphs/g/nodes/bulk/push"
+            ))
+            .json(&json!({ "op": "calendar.push", "txn": format!("s{i}"),
+                           "payload": { "connection": format!("c{}", i % 4), "n": i } }))
+            .send()
+            .await
+            .expect("push");
+        assert_eq!(res.status().as_u16(), 200);
+    }
+
+    let bulk = app.registry.get(&application, "g.bulk").expect("node");
+    let upstream = bulk.spec.admitted_queue("default");
+    let waiting = |queue: String| {
+        let app = app.clone();
+        async move { app.depths.pending_now(&app.queen, &queue).await.values().sum::<u64>() }
+    };
+    // What the relay has FORWARDED, not what is sitting at the destination: the
+    // terminal's own gate admits what arrives within the second, so a depth read
+    // there is zero whether the relay is holding or racing.
+    let forwarded = || {
+        app.registry
+            .graph(&application, "g")
+            .expect("graph")
+            .relays[0]
+            .forwarded()
+    };
+
+    // The low-priority leg has work and the destination has room, so the ONLY thing
+    // between them is the rule under test.
+    let started = Instant::now();
+    let mut admitted_upstream = 0;
+    while started.elapsed() < Duration::from_secs(30) && admitted_upstream == 0 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        admitted_upstream = waiting(upstream.clone()).await;
+    }
+    assert!(
+        admitted_upstream > 0,
+        "the bulk leg never had a backlog, so this test proved nothing"
+    );
+
+    // While the high-priority leg is failing, the low-priority one waits.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let held = forwarded();
+    assert_eq!(
+        held, 0,
+        "a leg whose pops are failing let the next priority through: {held} items were \
+         forwarded while the priority-0 leg could not be read at all"
+    );
+
+    // And then it stops waiting: a leg that has never drained is broken rather than
+    // busy, and the graph does not stop for it.
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(90) && forwarded() == 0 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(
+        forwarded() > 0,
+        "the low-priority leg never got the window: one unreadable leg stopped the \
+         graph for ever"
+    );
+
+    broker.allow();
+    let _ = http
+        .delete(format!("{base}/v1/apps/{application}/graphs/g"))
+        .send()
+        .await;
+}
+
 /// The reconcile LOOP, not just the pass it makes.
 ///
 /// The pass is well covered; its wiring was not — removing the spawn from `run()` left

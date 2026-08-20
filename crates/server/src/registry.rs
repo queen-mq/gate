@@ -98,16 +98,27 @@ pub struct TargetRuntime {
 /// forward as fast as they could and the destination's FIFO would decide the
 /// order by arrival — which is exactly the thing priority is supposed to
 /// override.
+///
+/// One RUNTIME per destination, not one task: inside it a leg is drained by one
+/// runner per partition of its source's admitted queue. The legs are still taken
+/// in strict priority order, one at a time — see `edge.rs` for why the
+/// parallelism goes inside a leg and never across two.
 pub struct RelayRuntime {
     /// The node work is relayed into, as declared (not the target name).
     pub dest: String,
-    /// `(source node, priority)`, lowest priority first — the order it drains in.
-    pub sources: Vec<(String, u32)>,
+    /// Lowest priority first — the order it drains in.
+    pub sources: Vec<RelaySource>,
     /// How many items the destination's push queue may hold before this relay
     /// stops forwarding. The bottleneck queue stays shallow, so priority at the
     /// entrance is priority in fact.
     pub window: u64,
     pub forwarded: AtomicU64,
+    /// Transactions this relay committed. Divided into `forwarded` it is the
+    /// average batch a relay transaction carried, which is the number that
+    /// explains an edge's throughput: the destination's push partition takes one
+    /// row lock per transaction whoever holds it, so items-per-transaction is the
+    /// multiplier on everything the runners do in parallel.
+    pub commits: AtomicU64,
     /// Items a relay could not route: a destination sharded by a dimension the
     /// item does not carry. Nacked with a reason rather than dropped.
     pub unroutable: AtomicU64,
@@ -120,9 +131,24 @@ pub struct RelayRuntime {
     pub cancel: queen_mq::Cancel,
 }
 
+/// One in-edge of a merge relay, and how wide it runs.
+pub struct RelaySource {
+    pub node: String,
+    pub priority: u32,
+    /// How many runners drain this leg: one per partition of the source's
+    /// admitted queue, per lane of it. This is the number the throughput of the
+    /// edge scales with, and it is derived — a caller raises it by declaring more
+    /// `admitted.partitions` on the source, never by asking for more runners on
+    /// the partitions it has.
+    pub runners: u32,
+}
+
 impl RelayRuntime {
     pub fn forwarded(&self) -> u64 {
         self.forwarded.load(Ordering::Relaxed)
+    }
+    pub fn commits(&self) -> u64 {
+        self.commits.load(Ordering::Relaxed)
     }
     pub fn unroutable(&self) -> u64 {
         self.unroutable.load(Ordering::Relaxed)

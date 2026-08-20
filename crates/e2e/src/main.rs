@@ -10,7 +10,17 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-const GATE: &str = "http://127.0.0.1:8788";
+/// Where the gate under test is listening.
+///
+/// From the environment, defaulting to the port a local `gate-server` takes, so a
+/// driver run can be pointed at a second instance without a rebuild — a laptop
+/// that already has one serving on 8788 is the ordinary case, not the exotic one.
+fn gate_url() -> &'static str {
+    static URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    URL.get_or_init(|| {
+        std::env::var("GATE_URL").unwrap_or_else(|_| "http://127.0.0.1:8788".to_string())
+    })
+}
 
 #[derive(Default)]
 struct Counters {
@@ -24,6 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let http = reqwest::Client::builder()
         .pool_max_idle_per_host(64)
         .build()?;
+    let gate = gate_url();
 
     let target = std::env::args().nth(1).unwrap_or_else(|| "load".into());
     // Which team's target this is. Applications never share a ceiling, so the
@@ -77,7 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "admitted": { "partitionBy": "connection", "partitions": 8 }
     });
     let res: Value = http
-        .put(format!("{GATE}/v1/apps/{application}/targets/{target}"))
+        .put(format!("{gate}/v1/apps/{application}/targets/{target}"))
         .json(&spec)
         .send()
         .await?
@@ -97,6 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (http, target, c, app_name) =
             (http.clone(), target.clone(), c.clone(), application.clone());
         producers.push(tokio::spawn(async move {
+            let gate = gate_url();
             let share = total / 8;
             for i in 0..share {
                 let lane = if (i + w) % 5 == 0 { "urgent" } else { "bulk" };
@@ -107,7 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
                 if http
                     .post(format!(
-                        "{GATE}/v1/apps/{app_name}/targets/{target}/lanes/{lane}/push"
+                        "{gate}/v1/apps/{app_name}/targets/{target}/lanes/{lane}/push"
                     ))
                     .json(&body)
                     .send()
@@ -145,10 +157,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 application.clone(),
             );
             consumers.push(tokio::spawn(async move {
+                let gate = gate_url();
                 while stop.load(Ordering::Relaxed) == 0 {
                     let r: Value = match http
                         .get(format!(
-                            "{GATE}/v1/apps/{application}/targets/{target}/lanes/{lane}/next?batch=100&wait_ms=1000"
+                            "{gate}/v1/apps/{application}/targets/{target}/lanes/{lane}/next?batch=100&wait_ms=1000"
                         ))
                         .send()
                         .await
@@ -178,7 +191,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "lane": lane,
                     });
                     if http
-                        .post(format!("{GATE}/v1/leases/ack"))
+                        .post(format!("{gate}/v1/leases/ack"))
                         .json(&ack)
                         .send()
                         .await
@@ -199,8 +212,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // driver managed to pull back out. When the second is lower, the harness is
     // the bottleneck and the first is the number that means anything.
     async fn admitted_now(http: &reqwest::Client, application: &str, target: &str) -> u64 {
+        let gate = gate_url();
         let v: Value = match http
-            .get(format!("{GATE}/api/apps/{application}/targets/{target}"))
+            .get(format!("{gate}/api/apps/{application}/targets/{target}"))
             .send()
             .await
         {

@@ -122,6 +122,42 @@ impl Depths {
         Some(out)
     }
 
+    /// The same read as [`Self::pending_of_group`], with the cache skipped and the
+    /// failure kept.
+    ///
+    /// The relay chooses which partitions to poll from this, and both properties
+    /// matter for that. Cached, a two-second-old answer would leave an item that
+    /// has just arrived unpolled for as long as the entry is warm — on a path whose
+    /// whole job is to move work along. And `None` has to be tellable from "nothing
+    /// waiting": a relay that read a broker's silence as an empty queue would stop
+    /// polling every partition it has, which is not a slower relay, it is a stopped
+    /// one.
+    pub async fn try_pending_of_group_now(
+        &self,
+        queen: &Queen,
+        queue: &str,
+        group: &str,
+    ) -> Option<HashMap<String, u64>> {
+        let key = format!("{queue}\u{1f}{group}");
+        match queen.admin().queue_depth(queue, Some(group)).await {
+            Ok(v) => {
+                let out = depth_route(&v);
+                self.cache.write().insert(key, (out.clone(), Instant::now()));
+                Some(out)
+            }
+            // No fallback to the queue-level number, and this one is measured. The
+            // queue-level pending is not this group's backlog on every broker: on
+            // 1.0.3 an admitted queue that a second consumer group had read to the
+            // end reported ZERO while the relay's own group still owed thirty items.
+            // A caller that BOUNDS work on this — the relay decides which partitions
+            // to poll — would have stopped polling a queue that was full, which is
+            // not a slower relay but a stopped graph. So an answer that is not this
+            // group's own is no answer: `None`, and the caller does what it did
+            // before it could ask.
+            Err(_) => None,
+        }
+    }
+
     /// The same read, scoped to ONE consumer group's own backlog.
     ///
     /// Queue-level pending answers "is anything waiting"; this answers "is

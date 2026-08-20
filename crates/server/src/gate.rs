@@ -79,8 +79,7 @@ pub async fn spawn(
     let cost_default = spec.cost.default;
 
     let admitted = spec.admitted_queue(&lane_name);
-    let partition_by = spec.admitted.partition_by;
-    let partitions = spec.admitted.partitions as u64;
+    let admitted_ring = spec.admitted.clone();
 
     let gate_spec = spec.clone();
     let gate_lane = lane.clone();
@@ -183,11 +182,11 @@ pub async fn spawn(
                 }
             }
         })
-        .to_partitioned(queen.queue(admitted), move |v| match partition_by {
-            gate_core::PartitionBy::None => "default".to_string(),
-            gate_core::PartitionBy::Entity => bucket(v.get("entity"), partitions),
-            gate_core::PartitionBy::Connection => bucket(v.get("connection"), partitions),
-        });
+        // The ring is `Admitted`'s own, so the name this writes and the name the
+        // relay's pinned pop reads come out of one function. Two copies of the
+        // rule would not fail loudly: the relay would poll partitions that never
+        // receive anything while the work piled up in ones nobody claimed.
+        .to_partitioned(queen.queue(admitted), move |v| admitted_ring.partition_of(v));
 
     // One query id per lane, shared by that lane's shards: the stream's state is
     // keyed `(query_id, partition_id)`, so pinned runners on different partitions
@@ -223,17 +222,6 @@ pub async fn spawn(
     handle_target.handles.write().push(handle);
     Ok(())
 }
-
-/// A fixed hash ring, so an unmeasured cardinality cannot become an unbounded
-/// partition count. Collisions serialise more than strictly necessary, never
-/// less, which is the only safe direction to be wrong in.
-fn bucket(v: Option<&serde_json::Value>, n: u64) -> String {
-    let s = v.and_then(|v| v.as_str()).unwrap_or("default");
-    // The same hash the push route shards on, from the same place, so a value
-    // cannot land in one bucket here and another there.
-    format!("p{}", gate_core::shard_index(s, n.min(u32::MAX as u64) as u32))
-}
-
 
 /// The consumer group this runner reads its push queue under.
 ///

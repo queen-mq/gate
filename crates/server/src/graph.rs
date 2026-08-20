@@ -547,10 +547,21 @@ pub async fn view(app: &Shared, g: &Arc<GraphRuntime>) -> Value {
         .map(|r| {
             json!({
                 "dest": r.dest,
-                "sources": r.sources.iter().map(|(n, p)| json!({ "node": n, "priority": p }))
-                    .collect::<Vec<_>>(),
+                "sources": r.sources.iter().map(|s| json!({
+                    "node": s.node, "priority": s.priority,
+                    // How many runners drain this leg: one per admitted partition
+                    // of the source, per lane. The number the edge's throughput
+                    // scales with, and the one a caller changes by declaring more
+                    // partitions on the source.
+                    "runners": s.runners,
+                })).collect::<Vec<_>>(),
                 "window": r.window,
                 "forwarded": r.forwarded(),
+                // Transactions committed. `forwarded / commits` is the average
+                // batch one relay transaction carried, and the destination's push
+                // partition serialises those transactions — so it is the number
+                // that explains this edge's throughput.
+                "commits": r.commits(),
                 "unroutable": r.unroutable(),
                 "duplicates": r.duplicates(),
 

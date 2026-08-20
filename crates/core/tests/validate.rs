@@ -465,3 +465,103 @@ fn a_kv_budget_must_lease_enough_for_one_item() {
     v["budgets"][0]["periodSeconds"] = json!(10);
     assert!(!validate(&parse(v)).iter().any(|p| p.rule == "kv-chunk"));
 }
+
+#[test]
+fn an_admitted_ring_is_a_resource_number_now_that_it_is_a_runner_count() {
+    // An admitted partition used to be a hash bucket and nothing else, so nobody
+    // bounded it. It is now also the unit of relay parallelism — a node with an
+    // out-edge gets one relay runner per admitted partition per lane — so the count
+    // buys claims on the broker exactly as `shards` buys gate runners, and it gets
+    // the same wall.
+    let mut v = base();
+    v["admitted"] = json!({ "partitionBy": "connection", "partitions": 4096 });
+    let problems = validate(&parse(v.clone()));
+    let p = problems
+        .iter()
+        .find(|p| p.rule == "admitted-partitions")
+        .unwrap_or_else(|| panic!("{problems:?}"));
+    assert!(p.detail.contains("relay runner"), "{}", p.detail);
+
+    // A ring of no buckets has nowhere to put an item, and was silently read as one.
+    v["admitted"] = json!({ "partitionBy": "connection", "partitions": 0 });
+    assert!(validate(&parse(v.clone()))
+        .iter()
+        .any(|p| p.rule == "admitted-partitions"));
+
+    // The wall itself is fine, and so is the default.
+    v["admitted"] = json!({ "partitionBy": "connection", "partitions": GATE_MAX_ADMITTED_PARTITIONS });
+    assert!(!validate(&parse(v.clone()))
+        .iter()
+        .any(|p| p.rule == "admitted-partitions"));
+
+    // `partitionBy: none` keeps ONE partition whatever the number says, so the
+    // number is not a resource claim and is not policed. What it is instead is a
+    // relay that cannot be parallelised, which the graph warns about.
+    v["admitted"] = json!({ "partitionBy": "none", "partitions": 4096 });
+    assert!(!validate(&parse(v.clone()))
+        .iter()
+        .any(|p| p.rule == "admitted-partitions"));
+    assert_eq!(parse(v).admitted.count(), 1);
+}
+
+#[test]
+fn the_ring_the_gate_writes_is_the_ring_the_relay_reads() {
+    // The gate's partitioner and the relay's pinned pops have to name partitions
+    // identically or the relay polls partitions that never receive anything while
+    // the work piles up in ones nobody claims. Both go through `Admitted`, and this
+    // is the property that makes the single definition worth having.
+    let mut v = base();
+    v["admitted"] = json!({ "partitionBy": "connection", "partitions": 8 });
+    let spec = parse(v);
+    let names = spec.admitted.partition_names();
+    assert_eq!(names.len(), 8);
+    for c in ["conn-7", "conn-8", "listing-42", "", "default"] {
+        let landed = spec.admitted.partition_of(&json!({ "connection": c }));
+        assert!(names.contains(&landed), "`{c}` landed in `{landed}`, which is not a partition");
+    }
+    // A payload with no `connection` at all still lands somewhere, deterministically.
+    assert_eq!(
+        spec.admitted.partition_of(&json!({ "entity": "x" })),
+        spec.admitted.partition_of(&json!({})),
+    );
+
+    // `partitionBy: none` is one partition, and it is the one the relay pins to.
+    let mut v = base();
+    v["admitted"] = json!({ "partitionBy": "none", "partitions": 64 });
+    let spec = parse(v);
+    assert_eq!(spec.admitted.partition_names(), vec!["default".to_string()]);
+    assert_eq!(spec.admitted.partition_of(&json!({ "connection": "c1" })), "default");
+}
+
+#[test]
+fn narrowing_the_admitted_ring_is_migration_class() {
+    // The ring used to be a hash bucket and nothing more, so its width was free to
+    // change: whoever drained the queue drained whatever partitions the broker
+    // offered. It is now the claim topology — a relay runs one runner per partition
+    // it can NAME — so a narrower ring leaves whatever is still in the partitions
+    // that no longer exist with nobody to claim it. Same failure `shards` has on the
+    // push queue, same answer: say the change was meant.
+    let mut old = base();
+    old["admitted"] = json!({ "partitionBy": "connection", "partitions": 64 });
+    let mut new = old.clone();
+    new["admitted"] = json!({ "partitionBy": "connection", "partitions": 16 });
+    assert!(needs_version_bump(&parse(old.clone()), &parse(new)));
+
+    // Widening is the same decision in the other direction: the old items are still
+    // in partitions the new ring names, but a key moves buckets, and everything that
+    // reads the ring has to agree on which.
+    let mut wider = old.clone();
+    wider["admitted"] = json!({ "partitionBy": "connection", "partitions": 128 });
+    assert!(needs_version_bump(&parse(old.clone()), &parse(wider)));
+
+    // A number that changes nothing about the ring changes nothing here: with
+    // `partitionBy: none` there is one partition whatever the field says.
+    let mut a = base();
+    a["admitted"] = json!({ "partitionBy": "none", "partitions": 8 });
+    let mut b = base();
+    b["admitted"] = json!({ "partitionBy": "none", "partitions": 64 });
+    assert!(!needs_version_bump(&parse(a), &parse(b)));
+
+    // And an untouched ring is untouched.
+    assert!(!needs_version_bump(&parse(old.clone()), &parse(old)));
+}

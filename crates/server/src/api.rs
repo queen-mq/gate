@@ -858,7 +858,10 @@ async fn next_from(app: &Shared, rt: &Arc<TargetRuntime>, lane: &str, q: NextQue
         // is `new` unless the deployment says otherwise.
         .subscription_mode(SubscriptionMode::All)
         .batch(q.batch.unwrap_or(l.concurrency as i32).max(1))
-        .partitions(rt.spec.admitted.partitions.max(1) as i32)
+        // The ring's real width, which `partitionBy: none` makes one whatever the
+        // document's number says. One place mints that answer, so a caller's claim
+        // and a relay's runners cannot disagree about how many partitions exist.
+        .partitions(rt.spec.admitted.count() as i32)
 
         .wait(true)
         .poll_timeout(std::time::Duration::from_millis(wait))
@@ -1613,8 +1616,12 @@ async fn declare_graph(st: &Shared, spec: GraphSpec) -> ApiResult {
             "edges": rt.spec.edges,
             "relays": rt.relays.iter().map(|r| json!({
                 "dest": r.dest,
-                "sources": r.sources.iter().map(|(n, p)| json!({ "node": n, "priority": p }))
-                    .collect::<Vec<_>>(),
+                "sources": r.sources.iter().map(|s| json!({
+                    "node": s.node, "priority": s.priority,
+                    // One relay runner per admitted partition of the source, per
+                    // lane: what a caller gets for the partitions it declared.
+                    "runners": s.runners,
+                })).collect::<Vec<_>>(),
                 // How deep the destination's push queue is allowed to get. Shallow
                 // is what makes priority at the entrance priority in fact.
                 "window": r.window,

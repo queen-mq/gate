@@ -565,3 +565,45 @@ fn the_cost_field_refusal_names_each_field_once() {
     assert!(field.detail.contains("`httpCost` in ip, messages"), "{}", field.detail);
     assert!(field.detail.contains("`weight` in mid"), "{}", field.detail);
 }
+
+#[test]
+fn a_source_with_one_admitted_partition_is_told_its_relay_is_one_runner() {
+    // A relay is sharded by its SOURCE's admitted partitions — one runner each,
+    // because a partition has one claimer and that is what keeps a connection's
+    // items in order. One partition is therefore one runner, and the edge cannot
+    // go faster than one loop. Legal (it is the only way to ask for a single
+    // global order), so it warns rather than refusing; what it must not be is a
+    // surprise.
+    let mut v = chain();
+    v["nodes"]["messages"]["admitted"] = json!({ "partitionBy": "none", "partitions": 64 });
+    let g = parse(v);
+    assert_eq!(validate_graph(&g), vec![], "one partition is legal");
+    let w = graph_warnings(&g);
+    let p = w
+        .iter()
+        .find(|p| p.rule == "relay-parallelism")
+        .unwrap_or_else(|| panic!("{w:?}"));
+    assert!(p.detail.contains("`messages`"), "{}", p.detail);
+    assert!(p.detail.contains("partitionBy: none"), "{}", p.detail);
+
+    // `partitions: 1` is the same fact said differently, and is reported as such.
+    let mut v = chain();
+    v["nodes"]["messages"]["admitted"] = json!({ "partitionBy": "connection", "partitions": 1 });
+    let w = graph_warnings(&parse(v));
+    assert!(
+        w.iter().any(|p| p.rule == "relay-parallelism" && p.detail.contains("partitions: 1")),
+        "{w:?}"
+    );
+
+    // The TERMINAL has no out-edge, so its admitted partitions feed consumers and
+    // not a relay: one of them is nobody's bottleneck and says nothing.
+    let mut v = chain();
+    v["nodes"]["ip"]["admitted"] = json!({ "partitionBy": "none", "partitions": 1 });
+    let w = graph_warnings(&parse(v));
+    assert!(!w.iter().any(|p| p.rule == "relay-parallelism"), "{w:?}");
+
+    // And the default ring warns about nothing.
+    assert!(!graph_warnings(&parse(chain()))
+        .iter()
+        .any(|p| p.rule == "relay-parallelism"));
+}

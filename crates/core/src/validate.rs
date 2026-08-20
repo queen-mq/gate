@@ -30,6 +30,17 @@ pub const GATE_MAX_KEYS: u64 = 5_000;
 /// figure; this is the wall.
 pub const GATE_MAX_SHARDS: u32 = 256;
 
+/// The same wall, for the other partitioned queue.
+///
+/// An admitted partition used to be nothing but a hash bucket that kept one
+/// connection's work in order, and its count cost nothing to raise. It is now
+/// also the unit of relay parallelism — a node with an out-edge gets one relay
+/// runner per admitted partition per lane, because the partition is what makes
+/// a runner the only claimer of what it forwards — so the number buys claims,
+/// pinned polls and tasks exactly as `shards` buys gate runners. Same argument,
+/// same wall.
+pub const GATE_MAX_ADMITTED_PARTITIONS: u32 = 256;
+
 /// What a caller is allowed to relax, and nothing more.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ValidateOpts {
@@ -356,6 +367,42 @@ pub fn validate_with(spec: &TargetSpec, opts: ValidateOpts) -> Vec<Problem> {
         out.push(p("pacing", "leaseSeconds is an integer of at least 1".into()));
     }
 
+    // ---- admitted partitions. A hash bucket, and now also a relay runner.
+    //
+    // Both ends are refused rather than clamped. A zero used to be read as a one
+    // everywhere it was used, which is a decision nobody made surviving as a
+    // `.max(1)` in five places; and the ceiling is the same resource argument
+    // `shard-count` makes — every partition of a node with an out-edge is a relay
+    // runner holding a claim on the broker, so a number chosen by pasting is a
+    // number the broker pays for.
+    if spec.admitted.partition_by != crate::spec::PartitionBy::None {
+        if spec.admitted.partitions < 1 {
+            out.push(p(
+                "admitted-partitions",
+                format!(
+                    "`partitionBy: {}` needs `partitions` of at least 1: a ring of no buckets has \
+                     nowhere to put an item",
+                    match spec.admitted.partition_by {
+                        crate::spec::PartitionBy::Entity => "entity",
+                        _ => "connection",
+                    }
+                ),
+            ));
+        }
+        if spec.admitted.partitions > GATE_MAX_ADMITTED_PARTITIONS {
+            out.push(p(
+                "admitted-partitions",
+                format!(
+                    "{} admitted partitions is above the {GATE_MAX_ADMITTED_PARTITIONS} this build \
+                     runs: a node with an out-edge gets one relay runner per admitted partition per \
+                     lane, each holding its own claim on the broker. Raise the batch or the lease \
+                     before raising this",
+                    spec.admitted.partitions
+                ),
+            ));
+        }
+    }
+
     // ---- sharding. A shard is a partition, and a partition is a counter.
     if let Some(dim) = spec.shard_by {
         let shards = spec.shards.unwrap_or(0);
@@ -406,7 +453,19 @@ pub fn validate_with(spec: &TargetSpec, opts: ValidateOpts) -> Vec<Problem> {
 /// a new `partition_id` is a counter that restarts at zero, and changing a
 /// period or an alignment changes what the accumulated state *means*.
 pub fn needs_version_bump(old: &TargetSpec, new: &TargetSpec) -> bool {
-    if old.admitted.partition_by != new.admitted.partition_by {
+    // The admitted ring: both how it is keyed and how wide it is.
+    //
+    // The width used to be free to change, because the ring was only a hash bucket
+    // and whoever drained the queue drained whatever partitions the broker offered.
+    // It is now the claim topology: a relay runs one runner per partition it can
+    // NAME, so narrowing the ring leaves whatever is still sitting in the partitions
+    // that no longer exist in the document with nobody to claim it — the same thing
+    // narrowing `shards` does to the push queue, and it gets the same answer. A bump
+    // does not move that work; it makes the caller say the change was meant, and the
+    // stranded items stay visible as lag on the edge until the ring is widened again.
+    if old.admitted.partition_by != new.admitted.partition_by
+        || old.admitted.count() != new.admitted.count()
+    {
         return true;
     }
     // Re-sharding moves keys between shards, and a shard is a counter: the same

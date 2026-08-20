@@ -266,6 +266,71 @@ pub enum PartitionBy {
     None,
 }
 
+impl PartitionBy {
+    /// The payload field the ring is keyed on, or `None` for a queue that keeps
+    /// one order for everybody.
+    pub fn field(&self) -> Option<&'static str> {
+        match self {
+            PartitionBy::Connection => Some("connection"),
+            PartitionBy::Entity => Some("entity"),
+            PartitionBy::None => None,
+        }
+    }
+}
+
+impl Admitted {
+    /// How many partitions this queue ACTUALLY has, which is not always what the
+    /// document says.
+    ///
+    /// `partitionBy: none` puts everything in one partition whatever `partitions`
+    /// is set to, and the difference is no longer cosmetic: a relay runs one
+    /// runner per partition of its source, so this is the number of runners that
+    /// edge gets. Read the ring width from here and never from the field, or a
+    /// node that declared sixty-four partitions and no dimension to spread them
+    /// on would get sixty-four runners contending for one.
+    pub fn count(&self) -> u32 {
+        match self.partition_by {
+            PartitionBy::None => 1,
+            _ => self.partitions.max(1),
+        }
+    }
+
+    /// The name of one partition, by index.
+    ///
+    /// The names are Gate's, not the broker's — the broker takes whatever string
+    /// it is given — so they are minted in exactly one place. The gate's
+    /// partitioner writes them and the relay's pinned pops read them, and a
+    /// near-miss between the two would not fail loudly: the relay would poll a
+    /// partition that never receives anything while the work piled up in one
+    /// nobody was claiming.
+    pub fn partition_name(&self, index: u32) -> String {
+        match self.partition_by {
+            PartitionBy::None => "default".to_string(),
+            _ => format!("p{}", index.min(self.count().saturating_sub(1))),
+        }
+    }
+
+    /// Every partition of this queue, in order — one relay runner each.
+    pub fn partition_names(&self) -> Vec<String> {
+        (0..self.count()).map(|i| self.partition_name(i)).collect()
+    }
+
+    /// Which partition an item lands in.
+    ///
+    /// A fixed hash ring, so an unmeasured cardinality cannot become an unbounded
+    /// partition count. Collisions serialise more than strictly necessary, never
+    /// less, which is the only safe direction to be wrong in.
+    pub fn partition_of(&self, payload: &serde_json::Value) -> String {
+        match self.partition_by.field() {
+            None => self.partition_name(0),
+            Some(field) => {
+                let value = payload.get(field).and_then(|v| v.as_str()).unwrap_or("default");
+                self.partition_name(shard_index(value, self.count()))
+            }
+        }
+    }
+}
+
 impl TargetSpec {
     pub fn lane(&self, name: &str) -> Option<&Lane> {
         self.lanes.iter().find(|l| l.name == name)
