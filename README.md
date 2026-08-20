@@ -615,3 +615,100 @@ CI runs exactly that against a real broker
 ([.github/workflows/test.yml](.github/workflows/test.yml)), with
 `GATE_TEST_REQUIRE_LIVE=1` so a missing broker fails the build instead of skipping the
 only tests that cover the relay, the reconcile and the retro path.
+
+---
+
+## What it costs
+
+`cargo test` says the limiter is correct. It does not say what it costs, and
+[crates/e2e](crates/e2e) does not either: that one floods a declared target and asserts
+the ceiling held, which a limiter that admits nothing also passes. `crates/bench`
+measures the other half — requests per second and latency, per use case.
+
+```bash
+cargo run --release -p gate-bench -- all
+cargo run --release -p gate-bench -- push,drain     # or one scenario at a time
+```
+
+It needs a running Gate and nothing else; every scenario declares its own targets under
+a run-stamped name and removes them afterwards. `GATE_URL`, `GATE_APP`, `BENCH_SECONDS`,
+`BENCH_WARMUP`, `BENCH_CONC`, `BENCH_BACKLOG` and `BENCH_THREADS` are the knobs.
+
+**Gate has two latencies and quoting one for the other makes both meaningless.**
+
+* **API latency** is `push`, `next` and `ack` on the wire. A push is one queen append; an
+  ack is one queen transaction. It is flat whether the target is empty or a hundred
+  thousand items deep, because a push does not consult the gate.
+* **Admission latency** is push to poppable. That is not performance, it is the declared
+  ceiling doing its job: an item that arrives 900 deep behind 50/s waits eighteen
+  seconds because it was told to.
+
+A rate limiter reported as slow is usually the second number wearing the first one's
+name.
+
+### What it measures
+
+| Scenario | The question |
+|---|---|
+| `health` | the floor: axum and the kernel, no broker. Every other row minus this one is queen |
+| `push` | ingest — the only call an application waits on |
+| `drain` | `next` + `ack`, swept over batch and over consumer count against the partition count |
+| `cycle` | push to pop with the ceiling out of the way: the machinery's own latency |
+| `throttled` | a real ceiling and a backlog: the API stays flat while the wait becomes arithmetic |
+| `pacing` | the same ceiling under three lease lengths, against the `lease-beats-window` rule |
+| `lanes` | isolation, and its price: a trickle in `urgent` under a flood in `bulk` |
+| `graph` | the same work over two hops, which is what the three-hop cap is pricing |
+
+### Two drivers, on purpose
+
+A **closed loop** holds *n* requests in flight and starts the next when the last
+returns. It finds the saturation point, and its latency is a lie: when the server slows
+the driver sends less, the queue never builds, and the percentiles stay flat. So the
+throughput rows are closed-loop and the latency rows are **open loop** — sent on a
+schedule fixed in advance, with each request measured from when it was *due* rather than
+from when the driver got to it. A run whose driver falls behind its own schedule says so
+in the row.
+
+### What one machine did
+
+An Apple M4, ten cores, with the driver, Gate and the broker all on it and a Postgres
+behind the broker. Everything below is a **floor**: the driver was competing with the
+server it was measuring, and a real deployment puts them on different hardware.
+
+| | throughput | p50 | p99 |
+|---|---|---|---|
+| `GET /health` — no broker | 41 500/s at c=1, 105 000/s at c=32 | 0.0 ms | 0.6 ms |
+| `POST …/push` — one append | 380/s at c=1, 1 534/s at c=8, **6 735/s at c=128** | 2.5–9.0 ms | 6.8 ms at c=1 |
+| `push` at a fixed 3 367/s | held | 7.4 ms | 34.0 ms |
+| `next`+`ack`, batch 1 | 189 items/s | 19.6 ms | 43.7 ms |
+| `next`+`ack`, batch 25 | **3 012 items/s** | 32.0 ms | 60.6 ms |
+| push → pop, one hop, no ceiling | 500/s offered | **43 ms** | 279 ms |
+| push → pop, two hops | 500/s offered | **79 ms** | 443 ms |
+
+Three things worth taking from it.
+
+**Push is cheap and the ceiling does not make it expensive.** Pushing 1 500 items into a
+target limited to 50/s cost p50 2.8 ms and p99 10 ms — the same as pushing into an empty
+one, because the push is an append and never consults the gate. What grows is the wait,
+and the wait is `depth / ceiling` by construction.
+
+**Batching is the whole consumer story.** One `next` and one `ack` cost two round trips
+whether they carry one item or twenty-five, so moving from `batch=1` to `batch=25` took
+the same consumers from 189 to 3 012 items a second. Adding consumers past the admitted
+queue's partition count does not: 1 → 8 consumers roughly tripled it, 8 → 16 added
+almost nothing and doubled the latency.
+
+**Lanes isolate, measurably.** Under a 3 000-item flood in `bulk`, a trickle in `urgent`
+went push-to-pop at p50 16 ms and a worst case of 27 ms, while `bulk`'s own items were
+waiting p90 12.6 s — the same target, the same ceiling.
+
+**A freshly declared target takes a few seconds before its gate admits anything** — five
+to ten in these runs, spent creating queues and a consumer group and taking a partition
+lease. It is reported separately rather than averaged into the rate, because a declare
+followed immediately by a burst will see it.
+
+`pacing` is the one to run before choosing a `leaseSeconds`. Against a ten-second window
+the same 50/s ceiling held 95% at a one-second lease, 88% at three and 69% at six, which
+is the `lease-beats-window` rule of thumb — a lease no longer than a fifth of the
+tightest window — arrived at from the outside. The declare-time warning is the cheap
+version of that whole scenario: it fires before anything is running.

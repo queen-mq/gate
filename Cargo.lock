@@ -422,6 +422,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "gate-bench"
+version = "0.1.3"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "gate-core"
 version = "0.1.3"
 dependencies = [
@@ -1143,9 +1153,9 @@ dependencies = [
 
 [[package]]
 name = "queen-mq"
-version = "1.0.3"
+version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a8143f154ec24e2cd5cd2193fa26ebdd873d9618c8611f0e9a190c04ca0db37"
+checksum = "f1857b3caf3b37f5c06c271577da73676b4023a26f3aee7031428f4b653d1ea3"
 dependencies = [
  "queen-protocol",
  "rand 0.8.7",
@@ -1159,9 +1169,9 @@ dependencies = [
 
 [[package]]
 name = "queen-protocol"
-version = "1.0.3"
+version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1b7e97342c5d23607ed3c539919ef7aab9002bc40ddc817fb92197a28622e0d"
+checksum = "26ffd12bf5249a1b37de6fa413abf7e3aab75385e230fe5879191332ce01de22"
 dependencies = [
  "serde",
  "serde_json",
