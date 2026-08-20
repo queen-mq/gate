@@ -360,7 +360,17 @@ const STALL_TOLERANCE: u32 = 8;
 /// So one cycle in this many ignores the answer and asks every partition. It costs a
 /// ring's worth of empty pops that often and nothing else, and it means no depth
 /// answer, however wrong, can blind this relay for longer than that.
-const FULL_SWEEP_EVERY: usize = 16;
+///
+/// Sixty-four, and it was sixteen. A sweep is a ring's worth of pops per leg — 192
+/// of them on the three-leg, 64-partition graph this was measured on — and at
+/// sixteen it was the whole of what an IDLE relay cost the database beyond the
+/// version before it: 850 `log_pop_specific_v1` calls per two idle minutes became
+/// 1,236, and 192 of that gap is one sweep. Stretching it is the cheap fix because
+/// this is a backstop and not a latency path: nothing waits on a sweep. What it
+/// bounds is how long a WRONG depth answer could hide work, and at the pace an idle
+/// relay settles to that is minutes either way — so the number is chosen against
+/// the cost, not against the wait.
+const FULL_SWEEP_EVERY: usize = 64;
 
 /// One runner: one leg, one lane of its source, one partition of that lane's
 /// admitted queue.
@@ -527,6 +537,12 @@ pub fn spawn(queen: Queen, depths: Arc<Depths>, plan: Plan) -> Arc<RelayRuntime>
         // can cost: the first item after a quiet spell waits at most one of these,
         // on a path whose latency floor is already a lease per hop. Same trade the
         // gate's own poll window makes, same reason.
+        //
+        // Five was tried and reverted. It does cut the idle depth reads by the
+        // ratio you would expect (243 calls per two idle minutes to 102), but that
+        // is 0.1% of a core on the graph it was measured on, and the price is three
+        // more seconds before a quiet graph notices work. The floor is not where
+        // the money is; see `FULL_SWEEP_EVERY`.
         let idle_cap = std::time::Duration::from_millis(2_000);
         let mut idle = pace;
         // Where in each leg's list this cycle starts, and how many cycles have run.
