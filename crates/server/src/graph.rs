@@ -51,6 +51,7 @@ pub async fn compile(app: &Shared, doc: &GraphDoc) -> (Plan, gate_core::External
     let opts = PlanOpts {
         batch: knobs().batch,
         concurrency: knobs().concurrency,
+        lane_capacity: knobs().lane_capacity,
         partitions,
         // §16.3 — the `assumed` discount is wired and NOT switched on. v1
         // defined it, unit-tested it, documented it in the README and never

@@ -832,21 +832,20 @@ pub fn warnings_with(doc: &GraphDoc, facts: &ExternalFacts) -> Vec<Problem> {
                 .or_else(|| plan.queue(q).and_then(|qs| qs.partitions))
                 .or_else(|| node.ingress.as_ref().and_then(|i| i.partitions()))
                 .unwrap_or(0);
-            let concurrency = plan
-                .stages
-                .iter()
-                .filter(|s| s.source == q)
-                .map(|s| s.concurrency)
-                .max()
-                .unwrap_or(1);
-            if partitions == 1 && concurrency > 1 {
+            // Keyed on the partition count ALONE. It used to also require a
+            // worker count above one, as a proxy for "you asked for parallelism
+            // you cannot have" — and a worker count is no longer a statement of
+            // intent: it is DERIVED from the budget, so a node whose ceiling is
+            // small gets one worker whatever its author meant. The question this
+            // warns about was never really about workers anyway.
+            if partitions == 1 {
                 out.push(p(
                     "single-partition",
                     format!(
-                        "`{q}` has one partition, so one worker claims it at a time and this stage \
-                         cannot go faster than one loop. One partition is one order for the whole \
-                         node, which is the only way to ask for strict global FIFO — it must not \
-                         be a surprise."
+                        "`{q}` has one partition, so one claim is in flight at a time and this \
+                         stage cannot go faster than one loop, whatever its budget allows. One \
+                         partition is one order for the whole node, which is the only way to ask \
+                         for strict global FIFO — it must not be a surprise."
                     ),
                 ));
             }

@@ -246,7 +246,10 @@ fn passthrough_budget(node: &str, out: &mut Vec<Problem>) -> Budget {
         ),
     ));
     Budget {
-        id: Some("passthrough".into()),
+        // The constant, not the spelling: `plan::fitting_workers` recognises
+        // this id to REFUSE to divide by it, and a drift between the two would
+        // silently hand a class node a lane per partition.
+        id: Some(crate::plan::PASSTHROUGH_BUDGET_ID.into()),
         count: 1_000_000,
         time_ms: 1000,
         sub_windows: Some(1),
@@ -386,11 +389,13 @@ pub fn from_v1_target(spec: &v1::TargetSpec) -> Result<Migrated, Refused> {
             &lane0,
         ))),
         batch: Some(spec.pacing.batch.clamp(1, 1000)),
-        concurrency: lanes.iter().map(|l| l.concurrency).max().filter(|n| *n > 0),
+        // NOT mapped — see `lane_concurrency_warning`.
+        concurrency: None,
     };
     if node.budgets.iter().all(|b| b.scope_by.is_some()) {
         node.budgets.push(passthrough_budget(&node_name, &mut out));
     }
+    lane_concurrency_warning(&lanes, &node_name, &mut out);
     pacing_warnings(spec.pacing.lease_seconds, &node_name, &mut out);
     admitted_warnings(&spec.admitted, &node_name, &mut out);
     shard_warnings(spec.shard_by.is_some(), &node_name, &mut out);
@@ -472,7 +477,8 @@ pub fn from_v1_graph(spec: &v1::GraphSpec) -> Result<Migrated, Refused> {
                 })
             }),
             batch: Some(n.pacing.batch.clamp(1, 1000)),
-            concurrency: lanes.iter().map(|l| l.concurrency).max().filter(|c| *c > 0),
+            // NOT mapped — see `lane_concurrency_warning`.
+            concurrency: None,
         };
         if node.budgets.iter().all(|b| b.scope_by.is_some()) {
             node.budgets.push(passthrough_budget(name, &mut out));
@@ -487,6 +493,7 @@ pub fn from_v1_graph(spec: &v1::GraphSpec) -> Result<Migrated, Refused> {
                 ),
             ));
         }
+        lane_concurrency_warning(&lanes, name, &mut out);
         pacing_warnings(n.pacing.lease_seconds, name, &mut out);
         admitted_warnings(&n.admitted, name, &mut out);
         shard_warnings(n.shard_by.is_some(), name, &mut out);
@@ -682,6 +689,38 @@ fn lane_paths(
             }
         })
         .collect()
+}
+
+/// v1's `lanes[].concurrency` is dropped rather than carried over, and the
+/// caller is told.
+///
+/// It looks like the same number and it is not. v1's was how many GATE RUNNERS
+/// a lane got — a throughput knob for a runtime that pinned a runner per shard
+/// per lane, and whose default was eight because eight was a reasonable number
+/// of goroutines. v2 derives the worker count from the BUDGET, because a rate
+/// limiter's drain never needs to exceed its own cap.
+///
+/// Carrying it would defeat the change on exactly the documents that motivated
+/// it: every migrated node would pin eight workers regardless of its ceiling,
+/// which for the three graphs we run is 128 parked consumers for caps between
+/// 1.7 and 400 items a second. A caller who genuinely wants a fixed count says
+/// so in the v2 field, `nodes[].concurrency`, which still wins.
+fn lane_concurrency_warning(lanes: &[v1::Lane], node: &str, out: &mut Vec<Problem>) {
+    let declared = lanes.iter().map(|l| l.concurrency).max().unwrap_or(0);
+    if declared == 0 {
+        return;
+    }
+    out.push(w(
+        "lane-concurrency",
+        format!(
+            "node `{node}`: `lanes[].concurrency: {declared}` is not carried over. It counted \
+             GATE RUNNERS per lane, and there are none — the worker count is DERIVED from this \
+             node's own ceiling now (one lane per {} items/s of it, capped by the partition \
+             count), because a limiter never needs to drain faster than it admits. Declare \
+             `nodes[].concurrency` if you want a fixed number anyway.",
+            crate::plan::LANE_CAPACITY
+        ),
+    ));
 }
 
 fn pacing_warnings(lease_seconds: i64, node: &str, out: &mut Vec<Problem>) {

@@ -1592,6 +1592,37 @@ Declare the `airbnb` graph (§3.7). Push nothing. Wait five minutes.
 * Measured with `pg_stat_statements` around the window, and by `gate-bench idle`, which reports
   the delta and fails above the threshold.
 
+**Not met as an absolute, and the number is now a hundred and forty times better rather than
+twenty.** A parked poll that times out re-issues its pop, so the floor is not zero — it is
+
+```
+stages × derived_workers × replicas ÷ poll_timeout     pops per second
+```
+
+What changed is `derived_workers`. It was `max(4, partitions of the source)`, which is a
+THROUGHPUT rule: size the consumer to the width of the queue, because the queue is what bounds
+you. In a rate limiter it does not — the budget does, by construction — so lanes beyond what
+the cap can feed are parked polls that can never have work. Stage measured ~200 gate consumers
+for a system whose largest declared budget is 400 items a second.
+
+`plan::fitting_workers` derives it instead:
+
+```
+workers = clamp(ceil(cap_rate_per_sec / GATE_LANE_CAPACITY), 1, partitions)
+```
+
+from the stage's tightest unscoped budget with its `share` applied. For the three graphs we
+run — sixteen stages, caps between 1.7 and 400 items a second — that is **one worker per
+stage**: sixteen parked polls per replica, about 1,900 pops an hour, against v1's ~275,000.
+`airbnb` is six of those sixteen, `vrbo` six and `google` four — a stage being one node on one
+path, so the four `airbnb` nodes become six stages across its three paths.
+`the_three_real_graphs_derive_one_worker_per_stage` pins the tally.
+
+Partitions do not shrink with it. They are the ordering identity, one wildcard consumer drains
+all of them, and fewer lanes than partitions costs latency at saturation and nothing else.
+The burst worth checking is a full window released at once: one lane at 1000 items/s drains a
+2000-token window in about two seconds, and at batch 200 that is ten claims.
+
 ### B. Throughput — the reason it is worth doing
 
 One stage, one node, one budget large enough not to bind, one source queue with 16 partitions,

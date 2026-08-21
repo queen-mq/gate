@@ -45,46 +45,163 @@ fn a_stage_group_is_named_for_the_path_and_the_node() {
     );
 }
 
-/// The per-stage worker count defaults from the SOURCE's partition width, which
-/// is a fact Gate reads from the broker rather than one it chooses. More workers
-/// than partitions is harmless — the extras find nothing and park; fewer is a
-/// throughput ceiling.
+/// The per-stage worker count comes from the BUDGET, not from the partitions.
+///
+/// A rate limiter's drain never needs to exceed its own cap: the cap bounds the
+/// admissible work by construction, so lanes beyond what it can feed are parked
+/// polls that can never have work to do. The old rule — `max(4, partitions)` —
+/// is a THROUGHPUT rule, which assumes the queue is what bounds you. Stage,
+/// measured: about 200 gate consumers parked for a system whose largest declared
+/// budget is 200 items a second.
+///
+///     workers = clamp(ceil(cap_rate_per_sec / LANE_CAPACITY), 1, partitions)
 #[test]
-fn concurrency_defaults_from_the_sources_partition_width() {
-    let d = doc(json!({
+fn the_worker_count_comes_from_the_budget_and_not_from_the_partitions() {
+    let node = |count: i64, time_ms: i64| {
+        doc(json!({
+          "application": "a", "graph": "g", "version": 1,
+          "nodes": { "n": { "ingress": { "queue": "theirs.in" },
+                            "budgets": [{ "id": "b", "count": count, "timeMs": time_ms }],
+                            "egress": "theirs.out" } },
+          "paths": [{ "name": "main", "nodes": ["n"] }]
+        }))
+    };
+    let with_partitions = |d: &gate_core::GraphDoc, n: u32| {
+        let mut partitions = std::collections::BTreeMap::new();
+        partitions.insert("theirs.in".to_string(), n);
+        gate_core::compile_with(
+            d,
+            &PlanOpts {
+                partitions,
+                ..Default::default()
+            },
+        )
+        .stages[0]
+            .concurrency
+    };
+
+    // 200 per second against a lane that drains a thousand: ONE, and the
+    // sixteen partitions it is spread over do not change that. This is the
+    // shape of every real graph we run.
+    assert_eq!(with_partitions(&node(200, 1000), 16), 1);
+    // The same ceiling expressed over a longer window is the same rate.
+    assert_eq!(with_partitions(&node(12_000, 60_000), 16), 1);
+
+    // 20k per second needs twenty lanes and is given what the ordering has:
+    // sixteen partitions, sixteen lanes.
+    assert_eq!(with_partitions(&node(20_000, 1000), 16), 16);
+    // ...and four, on four. A lane with no partition to claim finds nothing,
+    // for ever.
+    assert_eq!(with_partitions(&node(20_000, 1000), 4), 4);
+    // Exactly at the lane capacity is one lane; a single item more is two.
+    assert_eq!(with_partitions(&node(1000, 1000), 16), 1);
+    assert_eq!(with_partitions(&node(1001, 1000), 16), 2);
+
+    // A node with no budget at all has no rate to divide. (`node-budget`
+    // refuses the document; the compiler still may not divide by nothing.)
+    let bare = doc(json!({
       "application": "a", "graph": "g", "version": 1,
-      "nodes": { "n": { "ingress": { "queue": "theirs.in" },
-                        "budgets": [{ "id": "b", "count": 100, "timeMs": 1000 }],
-                        "egress": "theirs.out" } },
+      "nodes": { "n": { "ingress": { "queue": "theirs.in" }, "egress": "theirs.out" } },
       "paths": [{ "name": "main", "nodes": ["n"] }]
     }));
+    assert_eq!(with_partitions(&bare, 16), 1, "no budget, one worker");
+    // A budget of ZERO is a rate of zero, and the floor holds: a stage with no
+    // workers is a queue nobody drains, and the thing that admits nothing here
+    // is the budget, which needs a lane to say so.
+    assert_eq!(with_partitions(&node(0, 1000), 16), 1, "zero, one worker");
 
-    // Nothing observed: the declared default.
-    let bare = gate_core::compile(&d);
-    assert_eq!(bare.stages[0].concurrency, plan::DEFAULT_INGRESS_PARTITIONS);
-
-    // Observed at the broker: that, floored at four.
-    let mut partitions = std::collections::BTreeMap::new();
-    partitions.insert("theirs.in".to_string(), 2u32);
-    let narrow = gate_core::compile_with(
-        &d,
-        &PlanOpts {
-            partitions,
-            ..Default::default()
-        },
+    // The migration's pass-through is a SENTINEL, not a measurement. A million a
+    // second means "this node limits nothing", and dividing it by a lane would
+    // ask for a thousand lanes on behalf of a class node that paces no traffic
+    // of its own.
+    let class_node = doc(json!({
+      "application": "a", "graph": "g", "version": 1,
+      "nodes": { "n": { "ingress": { "queue": "theirs.in" }, "egress": "theirs.out",
+                        "budgets": [{ "id": plan::PASSTHROUGH_BUDGET_ID,
+                                      "count": 1_000_000, "timeMs": 1000, "subWindows": 1 }] } },
+      "paths": [{ "name": "main", "nodes": ["n"] }]
+    }));
+    assert_eq!(
+        with_partitions(&class_node, 16),
+        1,
+        "a pass-through is not a rate"
     );
-    assert_eq!(narrow.stages[0].concurrency, 4, "floored, never zero");
 
-    let mut partitions = std::collections::BTreeMap::new();
-    partitions.insert("theirs.in".to_string(), 32u32);
-    let wide = gate_core::compile_with(
-        &d,
-        &PlanOpts {
-            partitions,
-            ..Default::default()
-        },
+    // A per-key budget is not a rate the node has — 100 photo deletions per
+    // listing per week says nothing about how fast the node drains — so the
+    // node's own budget is what decides, exactly as it does for the batch.
+    let scoped = doc(json!({
+      "application": "a", "graph": "g", "version": 1,
+      "nodes": { "n": { "ingress": { "queue": "theirs.in" }, "egress": "theirs.out",
+                        "budgets": [
+                          { "id": "node", "count": 20000, "timeMs": 1000 },
+                          { "id": "per-listing", "count": 100, "timeMs": 604800000,
+                            "subWindows": 1, "scopeBy": "payload.listingId" }
+                        ] } },
+      "paths": [{ "name": "main", "nodes": ["n"] }]
+    }));
+    assert_eq!(
+        with_partitions(&scoped, 16),
+        16,
+        "the per-key budget is not a rate"
     );
-    assert_eq!(wide.stages[0].concurrency, 32);
+}
+
+/// A path's SHARE is part of its ceiling, so it is part of its worker count: a
+/// path that may spend a quarter of the counter needs a quarter of the lanes.
+#[test]
+fn a_paths_share_is_part_of_the_rate_its_workers_are_derived_from() {
+    let d = doc(json!({
+      "application": "a", "graph": "g", "version": 1,
+      "nodes": {
+        "e1": { "ingress": true, "budgets": [{ "id": "x", "count": 100, "timeMs": 1000 }] },
+        "e2": { "ingress": true, "budgets": [{ "id": "y", "count": 100, "timeMs": 1000 }] },
+        "n":  { "budgets": [{ "id": "b", "count": 8000, "timeMs": 1000 }], "egress": "out" }
+      },
+      "paths": [
+        { "name": "top", "priority": 0, "share": 1.0,  "nodes": ["e1", "n"] },
+        { "name": "low", "priority": 1, "share": 0.25, "nodes": ["e2", "n"] }
+      ]
+    }));
+    let p = gate_core::compile(&d);
+    let at = |path: &str| p.stage(path, "n").expect("stage").concurrency;
+    assert_eq!(at("top"), 8, "8000/s over lanes of 1000");
+    assert_eq!(
+        at("low"),
+        2,
+        "a quarter of the counter is a quarter of the lanes"
+    );
+}
+
+/// The lane capacity is a knob, because "what one lane drains" is a property of
+/// the deployment and not of the declaration.
+#[test]
+fn the_lane_capacity_is_what_divides_the_ceiling() {
+    let d = doc(json!({
+      "application": "a", "graph": "g", "version": 1,
+      "nodes": { "n": { "ingress": true,
+                        "budgets": [{ "id": "b", "count": 4000, "timeMs": 1000 }],
+                        "egress": "out" } },
+      "paths": [{ "name": "main", "nodes": ["n"] }]
+    }));
+    let workers = |capacity: u32| {
+        gate_core::compile_with(
+            &d,
+            &PlanOpts {
+                lane_capacity: capacity,
+                ..Default::default()
+            },
+        )
+        .stages[0]
+            .concurrency
+    };
+    assert_eq!(workers(plan::LANE_CAPACITY), 4);
+    assert_eq!(
+        workers(500),
+        8,
+        "a more pessimistic lane wants more of them"
+    );
+    assert_eq!(workers(4000), 1);
 }
 
 /// A node may declare its own batch and its own worker count, and they win over
