@@ -30,6 +30,12 @@ pub const MAX_BATCH: u32 = 1000;
 /// `breach-attempts` policed the same number for the same reason.
 pub const MAX_ATTEMPTS_CEILING: u32 = 20;
 
+/// Above this, a scoped budget's sub-window is long enough that one full key
+/// holding the head of a partition is an operational surprise rather than a
+/// pacing decision. An hour: the same order as the broker's own default dedup
+/// window, and far above any window an operator watches in real time.
+pub const HEAD_OF_LINE_WARN_SECONDS: i64 = 3600;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Problem {
     pub rule: &'static str,
@@ -780,6 +786,38 @@ pub fn warnings_with(doc: &GraphDoc, facts: &ExternalFacts) -> Vec<Problem> {
                 }
             }
         }
+        // A per-key counter with a very long window is a head-of-line block on
+        // every OTHER key behind it, for as long as the window lasts.
+        //
+        // The block itself is not a defect: what gets settled is a true PREFIX
+        // of a claim, because the cursor commits positionally and a subset would
+        // commit past the gap and DROP what it skipped. So a message that cannot
+        // be admitted holds its partition, by design, and order inside a
+        // partition is the guarantee the whole passthrough design rests on.
+        //
+        // What IS a defect is nobody being told. `cost-fits` already refuses the
+        // one case where a message can never be admitted at all; this is the
+        // case where it can, eventually, and "eventually" is days. The lever is
+        // `subWindows`, which turns one week-long block into `N` shorter ones.
+        for b in np.budgets.iter().filter(|b| b.is_scoped()) {
+            if b.window_sub_seconds > HEAD_OF_LINE_WARN_SECONDS {
+                out.push(p(
+                    "window-head-of-line",
+                    format!(
+                        "budget `{}` of node `{name}` counts per `{}` over a window of {} seconds. \
+                         A key that fills it blocks the head of its partition until the window \
+                         rotates — messages for OTHER keys queued behind it wait too, because a \
+                         claim is settled as a prefix and skipping one would commit past it and \
+                         drop it. Raise `subWindows` to divide the block, or give this node its \
+                         own ingress partitioning so one key cannot sit in front of another.",
+                        b.id,
+                        b.scope_by.as_deref().unwrap_or("?"),
+                        b.window_sub_seconds
+                    ),
+                ));
+            }
+        }
+
         if let Some(q) = np.ingress_queue.as_deref() {
             // The broker's answer first, then the RESOLVED plan — not the raw
             // document. A queue Gate owns has a width whether or not the

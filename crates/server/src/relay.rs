@@ -478,7 +478,14 @@ async fn park_or_release(
         // same row on the same millisecond. It is the difference between 33k
         // incr/s and a lock convoy.
         let jitter = jitter_ms(wait_ms);
-        let sleep = Duration::from_millis((wait_ms + jitter) as u64);
+        // Floored, because a MISSING deadline reads as "retry now" and "now"
+        // plus a 20ms jitter span is roughly three thousand full kv batches over
+        // the thirty-second parking budget. A key reaped between the incr and
+        // the read is the ordinary way to get there, and a Gate clock running
+        // ahead of the broker's deflates every wait towards the same spin.
+        // Fifty milliseconds turns thousands of retries into tens and costs
+        // nothing a park can notice.
+        let sleep = Duration::from_millis((wait_ms + jitter).max(50) as u64);
         *parked += sleep;
         tokio::select! {
             _ = tokio::time::sleep(sleep) => Wait::Retry,

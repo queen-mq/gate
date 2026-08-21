@@ -757,7 +757,15 @@ async fn a_batch_poisoned_by_a_duplicate_still_settles_every_item() {
 
     // Plant the duplicate BEFORE the graph exists, so the relay's first push of
     // that id is the one that collides.
+    //
+    // A terminal push DERIVES its id (§7), so what has to be planted is the id
+    // the relay will compute for the item pushed as `planted`, not `planted`
+    // itself — plant the raw one and the relay's push simply does not collide.
     let planted = format!("planted-{}", h.application);
+    let collides = gate_core::derive(
+        &planted,
+        &gate_core::plan::egress_label(&h.application, "g", "main", "n"),
+    );
     h.queen.queue(&out).create().await.ok();
     h.queen
         .queue(&out)
@@ -766,7 +774,7 @@ async fn a_batch_poisoned_by_a_duplicate_still_settles_every_item() {
             queue: out.clone(),
             partition: Some("p0".into()),
             payload: json!({ "n": -1 }),
-            transaction_id: Some(planted.clone()),
+            transaction_id: Some(collides.clone()),
         }])
         .await
         .expect("plant");
@@ -1373,15 +1381,24 @@ async fn a_fanout_delivers_to_both_branches_with_distinct_deterministic_ids() {
 
     // Deterministic: the same parent and the same label give the same id, every
     // release and from a shell.
+    // Two derivations, because there are two hops: the fan-out branch, then the
+    // terminal push into the branch's own egress queue. Both are the API.
+    let through = |branch: &str| {
+        let hop = gate_core::derive(
+            &parent,
+            &gate_core::plan::label(&h.application, "g", "main", branch),
+        );
+        gate_core::derive(
+            &hop,
+            &gate_core::plan::egress_label(&h.application, "g", "main", branch),
+        )
+    };
     assert_eq!(
         l[0].transaction_id,
-        gate_core::derive(&parent, "main/left"),
+        through("left"),
         "the derivation is the API"
     );
-    assert_eq!(
-        r[0].transaction_id,
-        gate_core::derive(&parent, "main/right")
-    );
+    assert_eq!(r[0].transaction_id, through("right"));
 
     h.cleanup("g").await;
 }

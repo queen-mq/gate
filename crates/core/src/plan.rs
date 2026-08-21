@@ -185,11 +185,29 @@ pub struct Destination {
     /// upstream's own.
     ///
     /// True at a fan-out (two branches must not carry one id, or a later
-    /// convergence dedups one of them away) and true where several stages push
-    /// into one queue (two messages that entered by different paths carrying the
-    /// same upstream id — which is exactly what pub-sub over a shared ingress
-    /// produces — would otherwise collapse on arrival). Both are decided here,
-    /// at declare time, so the hot path reads a bool instead of walking a graph.
+    /// convergence dedups one of them away); true where several stages of this
+    /// plan push into one queue (two messages that entered by different paths
+    /// carrying the same upstream id — which is exactly what pub-sub over a
+    /// shared ingress produces — would otherwise collapse on arrival); and
+    /// **always at a terminal push**.
+    ///
+    /// The last one is the case a count cannot see. `converging` is counted over
+    /// the stages of ONE plan, so two separate graphs that both name
+    /// `channel.airbnb.out` as an egress each counted one and each reused the
+    /// upstream id verbatim. Partition passthrough puts both copies on the
+    /// same-named partition, and the broker's dedup probes by hash per partition
+    /// (`003_log_push.sql`) over the transaction id's bytes alone — so if one
+    /// producer event id enters both graphs, the second push is a dedup hit and
+    /// that message is SILENTLY LOST. §11's `egress-owner` is only a warning, so
+    /// nothing prevents the topology.
+    ///
+    /// Deriving there costs nothing and keeps every property the reuse was for:
+    /// the id is still deterministic in the message's own, so a redelivered
+    /// relay still computes the same one and dedup still refuses the second
+    /// push, and a producer's own coalescing id still collapses two pushes into
+    /// one. What changes is the value an application's consumer reads off the
+    /// egress queue, which is why this is recorded in §7 rather than done
+    /// quietly.
     pub derive_id: bool,
     pub terminal: bool,
 }
@@ -298,6 +316,28 @@ pub fn shared_budget_key(app: &str, shared: &str) -> String {
 
 pub fn breaker_key(app: &str, graph: &str, node: &str) -> String {
     format!("brk:{app}:{graph}:{node}")
+}
+
+/// The label a derived transaction id hashes: `{app}/{graph}/{path}/{node}`.
+///
+/// The application and the graph are in it because `converging` can only count
+/// the stages of ONE plan. Two graphs that both name `channel.airbnb.out` as an
+/// egress each counted one, so each thought it had nothing to distinguish itself
+/// from — and a label of `{path}/{node}` can coincide across graphs anyway. With
+/// both in the name, ids minted by different graphs cannot collide by
+/// construction rather than by a count.
+pub fn label(app: &str, graph: &str, path: &str, node: &str) -> String {
+    format!("{app}/{graph}/{path}/{node}")
+}
+
+/// The label a TERMINAL push hashes: [`label`] with `/out` on the end.
+///
+/// A terminal push's destination node is the stage's own node, so it would
+/// otherwise carry the identical label to the hop that fed it — which is
+/// harmless, because the parent ids differ, and confusing to anyone
+/// reproducing a value by hand.
+pub fn egress_label(app: &str, graph: &str, path: &str, node: &str) -> String {
+    format!("{}/out", label(app, graph, path, node))
 }
 
 // ------------------------------------------------------------------- windows
@@ -463,8 +503,9 @@ pub fn compile_with(doc: &GraphDoc, opts: &PlanOpts) -> Plan {
                         Some(q) => vec![Destination {
                             node: node_name.to_string(),
                             queue: q.clone(),
-                            label: format!("{}/{}", p.name, node_name),
-                            derive_id: false,
+                            label: egress_label(app, graph, &p.name, node_name),
+                            // ALWAYS at a terminal. See the note on `derive_id`.
+                            derive_id: true,
                             terminal: true,
                         }],
                         None => Vec::new(),
@@ -477,7 +518,7 @@ pub fn compile_with(doc: &GraphDoc, opts: &PlanOpts) -> Plan {
                             nodes.get(*d).map(|dn| Destination {
                                 node: (*d).to_string(),
                                 queue: dn.interior_queue.clone(),
-                                label: format!("{}/{}", p.name, d),
+                                label: label(app, graph, &p.name, d),
                                 derive_id: false,
                                 terminal: false,
                             })
@@ -548,7 +589,8 @@ pub fn compile_with(doc: &GraphDoc, opts: &PlanOpts) -> Plan {
         s.owns_unstamped = claimed.insert(s.source.clone());
         let fanout = s.destinations.len() > 1;
         for d in &mut s.destinations {
-            d.derive_id = fanout || converging.get(&d.queue).copied().unwrap_or(1) > 1;
+            d.derive_id =
+                d.terminal || fanout || converging.get(&d.queue).copied().unwrap_or(1) > 1;
         }
     }
 

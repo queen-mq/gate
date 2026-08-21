@@ -46,13 +46,27 @@ fn the_airbnb_fixture_validates_clean() {
     assert!(problems.is_empty(), "{problems:#?}");
 }
 
-/// ...and warns about exactly one thing: that a fan-out multiplies what the
-/// vendor sees. A fixture with a fan-out that warned about nothing would mean
-/// the rule was not wired.
+/// ...and warns about exactly two things, both of which are the flagship's own
+/// shape being reported back rather than a rule misfiring.
+///
+/// `fanout-multiplies` is §11's mandated notice that a fan-out doubles what the
+/// vendor sees. `window-head-of-line` is the `per-listing` budget: 100 photo
+/// deletions per listing per WEEK, so one listing that fills its counter holds
+/// the head of its partition — and every other listing's messages behind it —
+/// until that window rotates. A claim is settled as a prefix and skipping one
+/// message would commit past it and drop it, so the block is the design working;
+/// what the rule buys is that an operator hears about it at PUT time rather than
+/// six days into one.
+///
+/// A fixture that warned about neither would mean the rules were not wired.
 #[test]
-fn the_airbnb_fixture_warns_only_that_a_fanout_multiplies() {
+fn the_airbnb_fixture_warns_about_its_fanout_and_its_week_long_per_key_window() {
     let w = warnings(&airbnb());
-    assert_eq!(rules(&w), vec!["fanout-multiplies"], "{w:#?}");
+    assert_eq!(
+        rules(&w),
+        vec!["fanout-multiplies", "window-head-of-line"],
+        "{w:#?}"
+    );
 }
 
 #[test]

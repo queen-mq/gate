@@ -172,7 +172,12 @@ fn a_fanout_derives_a_distinct_id_per_branch() {
     assert_eq!(s.destinations.len(), 2);
     assert!(s.destinations.iter().all(|d| d.derive_id));
     let labels: Vec<&str> = s.destinations.iter().map(|d| d.label.as_str()).collect();
-    assert_eq!(labels, vec!["photos/ip", "photos/audit"]);
+    assert_eq!(
+        labels,
+        vec!["channel/airbnb/photos/ip", "channel/airbnb/photos/audit"],
+        "the application and the graph are in the label because `converging` can only count ONE \
+         plan's stages: without them two graphs can mint the same id for two different messages"
+    );
 
     let a = gate_core::derive("parent", labels[0]);
     let b = gate_core::derive("parent", labels[1]);
@@ -193,12 +198,42 @@ fn a_convergence_derives_even_without_a_fanout() {
         "three stages push into ip.in, so the id must be derived"
     );
 
-    // And where exactly one stage pushes into a queue, the upstream id is
-    // carried through — that is the exactly-once mechanism under redelivery.
+    // And an INTERIOR queue exactly one stage pushes into carries the upstream
+    // id through — that is the exactly-once mechanism under redelivery, and it
+    // is what settled point 4 asks for.
+    let two_hop = p.stage("prices", "ip").unwrap();
+    assert!(
+        two_hop.destinations.iter().all(|d| d.terminal),
+        "the `ip` stage is terminal in this fixture"
+    );
+    let chain: gate_core::GraphDoc = serde_json::from_str(
+        r#"{"application":"a","graph":"g","version":1,
+            "nodes":{"one":{"ingress":true,"budgets":[{"id":"b","count":100,"timeMs":1000}]},
+                     "two":{"budgets":[{"id":"b","count":100,"timeMs":1000}],"egress":"a.g.out"}},
+            "paths":[{"name":"main","nodes":["one","two"]}]}"#,
+    )
+    .unwrap();
+    let chain = compile(&chain);
+    let hop = &chain.stage("main", "one").unwrap().destinations[0];
+    assert!(!hop.terminal);
+    assert!(
+        !hop.derive_id,
+        "one writer, one reader, no fan-out: the upstream id is carried through"
+    );
+
+    // A TERMINAL push always derives, whatever the count says. `converging` sees
+    // one plan, so two graphs that both name one egress queue each counted one
+    // and each reused the upstream id — and one producer event id entering both
+    // graphs then dedup-collapses on arrival and is silently lost.
     let single = compile(&rrl());
     let only = &single.stages[0];
     assert_eq!(only.destinations.len(), 1);
-    assert!(!only.destinations[0].derive_id);
+    assert!(only.destinations[0].terminal);
+    assert!(
+        only.destinations[0].derive_id,
+        "a terminal push derives, so two graphs sharing an egress queue cannot collapse each \
+         other's messages"
+    );
 }
 
 // ---------------------------------------------------------------- ceilings

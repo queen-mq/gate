@@ -816,10 +816,12 @@ available for free, and the compiler applies it:
 ```
 converging(queue) = the number of (path, hop) stages in this plan that push into `queue`
 
-label(stage, dest) = "{path}/{dest_node}"
+label(stage, dest)  = "{application}/{graph}/{path}/{dest_node}"
+label(terminal)     = "{application}/{graph}/{path}/{node}/out"
 
 txn_id_for(stage, dest, msg) =
-    if dest is one of several fan-out branches   -> derive(msg.transaction_id, label)
+    if dest is a TERMINAL push                   -> derive(msg.transaction_id, label)
+    else if dest is one of several fan-out branches -> derive(msg.transaction_id, label)
     else if converging(dest.queue) > 1           -> derive(msg.transaction_id, label)
     else                                          -> msg.transaction_id          // reuse
 ```
@@ -832,8 +834,30 @@ would dedup-collapse on arrival. Deriving per `{path}/{node}` makes them distinc
 keeping each one idempotent under its own redelivery. `converging` is computed at declare
 time and recorded in the plan, so the hot path does a field read, not a graph walk.
 
-See §16.2: this is a **refinement** of settled point 4, not a departure, and the author should
-say so explicitly before it ships.
+**The first arm is a change to settled point 4 and is recorded as one.** It was added on
+2026-08-21 because the middle arm alone is unsound, and the failure is silent message LOSS
+rather than a duplicate. `converging` counts the stages of ONE plan: two separate graphs that
+both name `channel.airbnb.out` as an egress each count one, so each reuses the upstream id
+verbatim. Partition passthrough puts both copies on the same-named partition, and the broker
+probes dedup by hash per partition (`003_log_push.sql:130-170`, `xxh3_128` of the transaction
+id's bytes alone, `dedup_window_seconds` 3600 by default) — so one producer event id entering
+both graphs means the second push is a dedup hit and that message is gone, with no error
+anywhere. §11's `egress-owner` is only a WARNING, so nothing prevents the topology; and the
+compiler cannot see the other graph, because reading it from the store would make the plan
+depend on what a replica happened to load and two replicas would then mint different ids for
+one message.
+
+Deriving at a terminal costs nothing and keeps every property the reuse was for: the id is
+still deterministic in the message's own, so a redelivered relay computes the same one and
+dedup still refuses the second push, and a producer's own coalescing id still collapses two
+pushes into one at the door. What changes is the id value an application reads off its egress
+queue — it is now a v5 uuid derived from the one it pushed, not that one.
+
+The `{application}/{graph}` prefix on every label is part of the same fix: without it two
+graphs can mint the same id for two different messages by having the same path and node names.
+
+See §16.2 for the middle arm, which is a **refinement** of settled point 4 rather than a
+departure. Both want the author's explicit word.
 
 ---
 
@@ -1614,11 +1638,14 @@ Each of these is one `#[ignore]`d live test against a real broker:
   without a recorded reason is a regression nobody will be able to reconstruct, and this
   repository's whole test culture — *every test names the failure it is buying* — is the thing
   the rewrite is most at risk of losing.
-* The `airbnb` fixture validates clean, and warns about exactly one thing: `fanout-multiplies`,
-  which is §11's own mandated notice that a fan-out doubles what the vendor sees. A fixture with
-  a fan-out that warned about nothing would mean the rule was not wired, so the test asserts the
-  exact warning set rather than an empty one. The warns-about-nothing case is the smaller §3.8
-  `rrl` fixture, which has no fan-out. If either cannot, the schema is wrong, not the fixture.
+* The `airbnb` fixture validates clean, and warns about exactly two things, both of them the
+  flagship's own shape reported back: `fanout-multiplies` (§11's mandated notice that a fan-out
+  doubles what the vendor sees) and `window-head-of-line` (its `per-listing` budget is 100 per
+  listing per WEEK, so one full listing holds the head of its partition — and the messages for
+  every other listing behind it — until that window rotates). A fixture that warned about
+  neither would mean the rules were not wired, so the test asserts the exact warning set rather
+  than an empty one. The warns-about-nothing case is the smaller §3.8 `rrl` fixture. If either
+  cannot, the schema is wrong, not the fixture.
 
 ### F. Migration
 
