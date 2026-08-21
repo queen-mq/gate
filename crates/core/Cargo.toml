@@ -1,6 +1,6 @@
 [package]
 name = "gate-core"
-description = "The admission engine: nested windows, weighted cost, lane caps. No I/O."
+description = "The declaration, its validation, and the plan it compiles to. No I/O."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,3 +9,8 @@ license.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+# The one new dependency, and it does no I/O either. RFC 4122 §4.3 (UUIDv5) is
+# written out in `ids.rs` over this, for the same reason v1 wrote FNV-1a out by
+# hand: the number must be stable across releases and reproducible by an
+# operator with a shell.
+sha1 = "0.10"

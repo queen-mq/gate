@@ -1,567 +1,490 @@
-use gate_core::*;
-use serde_json::json;
+//! Every rule, and the failure it buys.
+//!
+//! Fixture-mutation style, ported from v1: take a document that validates clean,
+//! break exactly one thing, and assert the rule name. The rule names are what
+//! the caller sees, so they are API and they are asserted on here.
+//!
+//! Rules deleted with v1 and the reason each one went — every one policed an
+//! invariant that is now structural, or a resource v2 does not allocate:
+//!
+//! * `default-lane`, `lane-unique`, `lane-concurrency`, `lane-floor` x2,
+//!   `lane-shares` x4 — lanes DIVIDED a ceiling because each was its own
+//!   partition with its own counters. There is one counter now, so N ceilings
+//!   cannot oversubscribe it; the 93/s-against-50 and 7131-against-5000 defects
+//!   are not expressible.
+//! * `max-keys`, `store-fits`, `kv-scope`, `kv-match`, `kv-chunk` x2,
+//!   `shard-count` x3, `shard-scope`, `shard-entry` — cardinality is Postgres
+//!   rows with a TTL, not entries in a document Gate re-reads whole every cycle,
+//!   and there is no capacity lease in front of a shared budget any more.
+//! * `batch-fits`, `pacing`, `lease-beats-window` — the lease is a work lease
+//!   and pacing is the budget window; there is no pacing quantum to beat.
+//! * `admitted-partitions` x2, `edge-fanout`, `relay-lane`, `edge-unique`,
+//!   `edge-self`, `cost-monotonic`, `budget-once`, `consume-terminal`,
+//!   `path-length` (the 3-hop wall), `relay-parallelism` — the admitted ring,
+//!   the merge relay and the smear that made a long path a vague one are all
+//!   gone with the counter-funnel.
+//! * `retry-cost`, `retry-entry`, `breach-when`, `breach-attempts` — see
+//!   `migrate`: a v1 document carrying `breach[]` is REFUSED with a pointer, not
+//!   quietly accepted with the policy dropped.
+//! * `kv-rolling` — kv was always a fixed window; that is now the only window
+//!   there is, and it is documented rather than warned about per budget.
 
-fn parse(v: serde_json::Value) -> TargetSpec {
-    serde_json::from_value(v).expect("parse")
+mod common;
+
+use common::{airbnb, rules};
+use gate_core::doc::{Egress, Ingress, PathElem};
+use gate_core::{validate, warnings, GraphDoc};
+
+/// The single most valuable test in the file: the flagship fixture must validate
+/// clean, in the new vocabulary. If it cannot, the schema is wrong.
+#[test]
+fn the_airbnb_fixture_validates_clean() {
+    let problems = validate(&airbnb());
+    assert!(problems.is_empty(), "{problems:#?}");
 }
 
-fn base() -> serde_json::Value {
-    json!({
-        "name": "t", "version": 1,
-        "budgets": [{ "id": "b", "cap": 100, "periodSeconds": 60,
-                      "alignment": "calendar", "confidence": "inferred" }],
-        "lanes": [{ "name": "bulk", "cap": "ceiling", "concurrency": 4, "default": true }],
-        "cost": { "field": "c", "default": 1, "max": 1 },
-        "pacing": { "leaseSeconds": 1, "batch": 200 }
-    })
+/// ...and warns about exactly one thing: that a fan-out multiplies what the
+/// vendor sees. A fixture with a fan-out that warned about nothing would mean
+/// the rule was not wired.
+#[test]
+fn the_airbnb_fixture_warns_only_that_a_fanout_multiplies() {
+    let w = warnings(&airbnb());
+    assert_eq!(rules(&w), vec!["fanout-multiplies"], "{w:#?}");
 }
 
 #[test]
-fn a_sound_spec_has_no_problems() {
-    assert_eq!(validate(&parse(base())), vec![]);
+fn the_rrl_fixture_validates_clean_and_warns_about_nothing() {
+    let doc = common::rrl();
+    assert!(validate(&doc).is_empty());
+    assert!(warnings(&doc).is_empty());
+}
+
+fn broken(f: impl FnOnce(&mut GraphDoc)) -> Vec<&'static str> {
+    let mut doc = airbnb();
+    f(&mut doc);
+    rules(&validate(&doc))
+}
+
+// -------------------------------------------------------------------- naming
+
+#[test]
+fn application_is_one_lowercase_segment() {
+    assert!(broken(|d| d.application = "Channel Manager".into()).contains(&"application"));
 }
 
 #[test]
-fn an_item_that_cannot_fit_any_cap_is_rejected_at_declare_time() {
-    let mut v = base();
-    v["cost"]["max"] = json!(500);
-    let problems = validate(&parse(v));
-    assert!(problems.iter().any(|p| p.rule == "cost-fits"), "{problems:?}");
+fn a_graph_name_carries_no_dot() {
+    assert!(broken(|d| d.graph = "airbnb.eu".into()).contains(&"graph-name"));
 }
 
 #[test]
-fn exactly_one_lane_must_be_default() {
-    let mut v = base();
-    v["lanes"] = json!([
-        { "name": "urgent", "cap": "ceiling", "concurrency": 4 },
-        { "name": "bulk", "cap": "ceiling", "concurrency": 4 }
-    ]);
-    assert!(validate(&parse(v)).iter().any(|p| p.rule == "default-lane"));
-}
-
-#[test]
-fn a_scoped_budget_must_declare_its_cardinality() {
-    let mut v = base();
-    v["budgets"][0]["scope"] = json!(["entity"]);
-    assert!(validate(&parse(v)).iter().any(|p| p.rule == "max-keys"));
-}
-
-#[test]
-fn high_cardinality_does_not_belong_in_the_gate_state() {
-    let mut v = base();
-    v["budgets"][0]["scope"] = json!(["entity"]);
-    v["budgets"][0]["maxKeys"] = json!(200_000);
-    assert!(validate(&parse(v.clone())).iter().any(|p| p.rule == "store-fits"));
-
-    // This test used to end by moving the budget to kv and asserting the spec
-    // then passed — which is how the defect got a test of its own. The kv pool
-    // keys on `(application, id)` and DROPS the scope, so the per-key limit
-    // silently became one shared counter. The escape hatch for cardinality is
-    // sharding, not kv.
-    let mut on_kv = v.clone();
-    on_kv["budgets"][0]["store"] = json!("kv");
-    let problems = validate(&parse(on_kv));
-    assert!(
-        problems.iter().any(|p| p.rule == "kv-scope"),
-        "a scoped budget on kv must be refused, not recommended: {problems:?}"
-    );
-
-    // Sharded, the same 200,000 keys fit: 64 documents of 3,125.
-    let mut sharded = v.clone();
-    sharded["shardBy"] = json!("entity");
-    sharded["shards"] = json!(64);
-    assert_eq!(validate(&parse(sharded)), vec![]);
-}
-
-#[test]
-fn a_kv_budget_may_not_carry_a_match_either() {
-    // The pool is spent from a local lease before any op is looked at, so a
-    // selector on it charges every op and reads as though it selected.
-    let mut v = base();
-    v["budgets"][0]["store"] = json!("kv");
-    v["budgets"][0]["match"] = json!({ "op": ["message.post"] });
-    assert!(validate(&parse(v)).iter().any(|p| p.rule == "kv-match"));
-}
-
-#[test]
-fn a_kv_budget_too_small_to_chunk_would_deadlock_at_zero() {
-    // chunk = cap / periodSeconds, topped up below chunk/2. At cap < 2 x period
-    // the chunk is one, half of it is zero, and the top-up never fires.
-    let mut v = base();
-    v["budgets"][0] = json!({ "id": "shared", "cap": 100, "periodSeconds": 60,
-                              "alignment": "calendar", "store": "kv",
-                              "confidence": "inferred" });
-    assert!(validate(&parse(v.clone())).iter().any(|p| p.rule == "kv-chunk"));
-
-    v["budgets"][0]["cap"] = json!(120);
-    assert!(!validate(&parse(v)).iter().any(|p| p.rule == "kv-chunk"));
-}
-
-#[test]
-fn a_ceiling_nobody_claims_is_a_ceiling_enforced_twice() {
-    // T6: with no lane on `ceiling`, `ceiling-minus-measured` reads the residual
-    // as its own — so two derived lanes each claim everything the other did not
-    // reserve. This validated clean until the rule existed.
-    let mut v = base();
-    v["lanes"] = json!([
-        { "name": "urgent", "cap": "ceiling-minus-measured", "concurrency": 4, "floor": 0.1,
-          "default": true },
-        { "name": "bulk", "cap": "ceiling-minus-measured", "concurrency": 4, "floor": 0.1 }
-    ]);
-    let s = parse(v);
-    let problems = validate(&s);
-    assert!(problems.iter().any(|p| p.rule == "lane-shares"), "{problems:?}");
-    // And the reason, measured: the shares add up to nearly two ceilings.
-    let total: f64 = s.lanes.iter().map(|l| s.lane_share(&l.name, None)).sum();
-    assert!(total > 1.0 + 1e-9, "the defect this refuses should be visible: {total}");
-}
-
-#[test]
-fn reservations_that_sum_to_one_need_no_taker() {
-    // The fix the refusal recommends: either a lane claims the ceiling, or the
-    // reservations close it themselves.
-    let mut v = base();
-    v["lanes"] = json!([
-        { "name": "urgent", "cap": "share:0.4", "concurrency": 4, "default": true },
-        { "name": "bulk", "cap": "share:0.6", "concurrency": 4 }
-    ]);
-    assert_eq!(validate(&parse(v)), vec![]);
-}
-
-/// The property the code's comments claimed and nothing held: whatever a spec
-/// declares, if it validates clean its lanes divide ONE ceiling.
-#[test]
-fn every_spec_that_validates_clean_divides_exactly_one_ceiling() {
-    let policies = ["ceiling", "ceiling-minus-measured", "share:0.25", "share:0.5",
-                    "share:0.75", "absolute:10"];
-    let floors = [0.0, 0.1, 0.25, 0.5, 1.0];
-    let mut clean = 0usize;
-    for a in policies {
-        for b in policies {
-            for fa in floors {
-                for fb in floors {
-                    let mut v = base();
-                    v["lanes"] = json!([
-                        { "name": "urgent", "cap": a, "concurrency": 4, "floor": fa,
-                          "default": true },
-                        { "name": "bulk", "cap": b, "concurrency": 4, "floor": fb }
-                    ]);
-                    let s = parse(v);
-                    if !validate(&s).is_empty() {
-                        continue;
-                    }
-                    clean += 1;
-                    // Every measurement, including none: the meter may only
-                    // shrink a derived lane, so `None` is the worst case.
-                    for m in 0..=20 {
-                        let measured = Some(m as f64 / 20.0);
-                        for measured in [None, measured] {
-                            let total: f64 = s
-                                .lanes
-                                .iter()
-                                .map(|l| s.lane_share(&l.name, measured))
-                                .sum();
-                            assert!(
-                                total <= 1.0 + 1e-9,
-                                "`{a}`(floor {fa}) + `{b}`(floor {fb}) at measured {measured:?} \
-                                 divide {total} ceilings"
-                            );
-                        }
-                    }
-                }
-            }
+fn a_node_name_that_overflows_a_queue_name_is_refused() {
+    let long = "n".repeat(60);
+    let got = broken(|d| {
+        let n = d.nodes.remove("audit").unwrap();
+        d.nodes.insert(long.clone(), n);
+        if let Some(p) = d.paths.iter_mut().find(|p| p.name == "photos") {
+            p.nodes[1] = PathElem::FanOut(vec!["ip".into(), long.clone()]);
         }
-    }
-    assert!(clean > 5, "the property is vacuous if almost nothing validates: {clean}");
+    });
+    assert!(got.contains(&"node-name"), "{got:?}");
 }
 
 #[test]
-fn a_sharded_target_may_not_hold_an_unscoped_budget() {
-    // G7: one counter per shard is the cap enforced `shards` times.
-    let mut v = base();
-    v["shardBy"] = json!("entity");
-    v["shards"] = json!(8);
-    let problems = validate(&parse(v.clone()));
-    assert!(problems.iter().any(|p| p.rule == "shard-scope"), "{problems:?}");
-
-    v["budgets"][0]["scope"] = json!(["entity"]);
-    v["budgets"][0]["maxKeys"] = json!(1000);
-    assert_eq!(validate(&parse(v)), vec![]);
+fn two_paths_of_one_name_would_share_a_cursor() {
+    let got = broken(|d| d.paths[1].name = "prices".into());
+    assert!(got.contains(&"path-name"), "{got:?}");
 }
 
-#[test]
-fn shards_are_partitions_so_the_count_is_bounded_and_named() {
-    let mut v = base();
-    v["shards"] = json!(8);
-    assert!(validate(&parse(v)).iter().any(|p| p.rule == "shard-count"));
-
-    let mut v = base();
-    v["shardBy"] = json!("entity");
-    v["shards"] = json!(100_000);
-    v["budgets"][0]["scope"] = json!(["entity"]);
-    v["budgets"][0]["maxKeys"] = json!(1000);
-    assert!(validate(&parse(v)).iter().any(|p| p.rule == "shard-count"));
-}
+// --------------------------------------------------------------- graph shape
 
 #[test]
-fn re_sharding_re_founds_the_counters_and_needs_a_version() {
-    let mut a = base();
-    a["shardBy"] = json!("entity");
-    a["shards"] = json!(8);
-    a["budgets"][0]["scope"] = json!(["entity"]);
-    a["budgets"][0]["maxKeys"] = json!(1000);
-    let mut b = a.clone();
-    b["shards"] = json!(16);
-    assert!(needs_version_bump(&parse(a.clone()), &parse(b)));
-    // The same shape is not a migration.
-    assert!(!needs_version_bump(&parse(a.clone()), &parse(a)));
-}
-
-#[test]
-fn a_shard_is_a_partition_and_a_key_lands_in_exactly_one() {
-    let mut v = base();
-    v["shardBy"] = json!("entity");
-    v["shards"] = json!(64);
-    v["budgets"][0]["scope"] = json!(["entity"]);
-    v["budgets"][0]["maxKeys"] = json!(200_000);
-    let s = parse(v);
-    assert_eq!(s.shard_count(), 64);
-    // Stable, and the same number the gate's own partitioner computes.
-    let a = s.shard_of("listing-1");
-    assert_eq!(a, s.shard_of("listing-1"));
-    assert_eq!(s.push_partition("bulk", a), format!("bulk:{a}"));
-    assert!((0..64).all(|i| s.lane_partitions("bulk").contains(&format!("bulk:{i}"))));
-    // Spread, not a single bucket: a hash that piles up serialises everything.
-    let buckets: std::collections::HashSet<u32> =
-        (0..500).map(|i| s.shard_of(&format!("listing-{i}"))).collect();
-    assert!(buckets.len() > 40, "500 keys landed in only {} of 64 shards", buckets.len());
-
-    // Unsharded, the partition IS the lane — which is why nothing about an
-    // existing target changes.
-    let plain = parse(base());
-    assert_eq!(plain.shard_count(), 1);
-    assert_eq!(plain.push_partition("bulk", 0), "bulk");
-}
-
-#[test]
-fn a_graph_node_is_a_target_whose_name_carries_a_dot() {
-    let mut v = base();
-    v["name"] = json!("airbnb.messages");
-    assert_eq!(validate(&parse(v)), vec![]);
-
-    let mut bad = base();
-    bad["name"] = json!("airbnb..messages");
-    assert!(validate(&parse(bad)).iter().any(|p| p.rule == "name"));
-
-    let mut bad = base();
-    bad["name"] = json!("Airbnb.Messages");
-    assert!(validate(&parse(bad)).iter().any(|p| p.rule == "name"));
-}
-
-
-#[test]
-fn documented_without_a_source_is_not_documented() {
-    let mut v = base();
-    v["budgets"][0]["confidence"] = json!("documented");
-    assert!(validate(&parse(v)).iter().any(|p| p.rule == "provenance"));
-}
-
-#[test]
-fn a_batch_smaller_than_the_budget_would_be_the_real_limiter() {
-    let mut v = base();
-    v["budgets"][0] = json!({ "id": "fast", "cap": 400, "periodSeconds": 1,
-                              "alignment": "rolling", "confidence": "inferred" });
-    v["pacing"] = json!({ "leaseSeconds": 1, "batch": 50 });
-    assert!(validate(&parse(v)).iter().any(|p| p.rule == "batch-fits"));
-}
-
-#[test]
-fn changing_a_period_re_founds_the_state_and_needs_a_version() {
-    let old = parse(base());
-    let mut v = base();
-    v["budgets"][0]["periodSeconds"] = json!(120);
-    assert!(needs_version_bump(&old, &parse(v)));
-}
-
-#[test]
-fn changing_only_a_cap_is_a_hot_change() {
-    let old = parse(base());
-    let mut v = base();
-    v["budgets"][0]["cap"] = json!(50);
-    assert!(!needs_version_bump(&old, &parse(v)));
-}
-
-#[test]
-fn an_assumed_cap_is_enforced_below_what_it_claims() {
-    assert_eq!(effective_cap(100.0, Confidence::Documented), 100.0);
-    assert_eq!(effective_cap(100.0, Confidence::Assumed), 70.0);
-}
-
-#[test]
-fn rolling_on_kv_warns_because_kv_is_a_fixed_window() {
-    let mut v = base();
-    v["budgets"][0]["store"] = json!("kv");
-    v["budgets"][0]["alignment"] = json!("rolling");
-    assert!(warnings(&parse(v)).iter().any(|p| p.rule == "kv-rolling"));
-}
-
-#[test]
-fn two_lanes_cannot_both_claim_the_whole_ceiling() {
-    // The rule that came out of a load run: each lane is its own partition with
-    // its own counters, so two ceilings enforce the ceiling twice.
-    let mut v = base();
-    v["lanes"] = json!([
-        { "name": "urgent", "cap": "ceiling", "concurrency": 4, "default": true },
-        { "name": "bulk", "cap": "ceiling", "concurrency": 4 }
-    ]);
-    assert!(validate(&parse(v)).iter().any(|p| p.rule == "lane-shares"));
-}
-
-#[test]
-fn reservations_may_not_oversubscribe_the_ceiling() {
-    let mut v = base();
-    v["lanes"] = json!([
-        { "name": "a", "cap": "share:0.7", "concurrency": 4, "default": true },
-        { "name": "b", "cap": "share:0.6", "concurrency": 4 }
-    ]);
-    assert!(validate(&parse(v)).iter().any(|p| p.rule == "lane-shares"));
-}
-
-#[test]
-fn a_derived_lane_needs_a_floor_or_it_admits_nothing() {
-    let mut v = base();
-    v["lanes"] = json!([
-        { "name": "urgent", "cap": "ceiling", "concurrency": 4, "default": true },
-        { "name": "bulk", "cap": "ceiling-minus-measured", "concurrency": 4 }
-    ]);
-    assert!(validate(&parse(v)).iter().any(|p| p.rule == "lane-floor"));
-}
-
-#[test]
-fn shares_divide_the_ceiling_rather_than_replicating_it() {
-    let mut v = base();
-    v["lanes"] = json!([
-        { "name": "urgent", "cap": "ceiling", "concurrency": 4, "default": true },
-        { "name": "bulk", "cap": "ceiling-minus-measured", "concurrency": 4, "floor": 0.25 }
-    ]);
-    let s = parse(v);
-    assert_eq!(validate(&s), vec![]);
-    let urgent = s.lane_share("urgent", None);
-    let bulk = s.lane_share("bulk", None);
-    assert!((urgent - 0.75).abs() < 1e-9, "urgent got {urgent}");
-    assert!((bulk - 0.25).abs() < 1e-9, "bulk got {bulk}");
-    assert!((urgent + bulk - 1.0).abs() < 1e-9, "shares must sum to the ceiling");
-}
-
-#[test]
-fn a_lease_as_long_as_the_window_warns_because_it_beats_against_it() {
-    // Measured: 200/s over a 1s window with a 1s lease held 152/s; the same
-    // ceiling over a 10s window held 205/s.
-    let v = base(); // 60s window, 1s lease — five times over, so quiet
-    assert!(!warnings(&parse(v)).iter().any(|p| p.rule == "lease-beats-window"));
-
-    let mut v = base();
-    v["budgets"][0]["periodSeconds"] = json!(1);
-    v["pacing"] = json!({ "leaseSeconds": 1, "batch": 200 });
-    let w = warnings(&parse(v));
-    assert!(w.iter().any(|p| p.rule == "lease-beats-window"), "{w:?}");
+fn a_path_that_visits_an_undeclared_node_is_refused() {
     assert!(
-        w.iter().any(|p| p.detail.contains("lease floor is one second")),
-        "a one-second window should say it cannot do better"
+        broken(|d| d.paths[0].nodes[1] = PathElem::One("nowhere".into())).contains(&"path-node")
     );
 }
 
 #[test]
-fn shares_never_oversubscribe_whatever_the_meter_says() {
-    // The property a load run broke: with the meter live, `ceiling` subtracted
-    // static reservations while `ceiling-minus-measured` subtracted measured
-    // spend, and neither knew what the other had taken. 5000 per ten seconds
-    // carried 7131.
-    let mut v = base();
-    v["lanes"] = json!([
-        { "name": "urgent", "cap": "ceiling", "concurrency": 4, "default": true },
-        { "name": "bulk", "cap": "ceiling-minus-measured", "concurrency": 8, "floor": 0.5 }
-    ]);
-    let s = parse(v);
-    for i in 0..=20 {
-        let m = i as f64 / 20.0;
-        let urgent = s.lane_share("urgent", None);
-        let bulk = s.lane_share("bulk", Some(m));
-        assert!(
-            urgent + bulk <= 1.0 + 1e-9,
-            "measured {m}: urgent {urgent} + bulk {bulk} = {} over the ceiling",
-            urgent + bulk
-        );
-        assert!(bulk >= 0.5 - 1e-9, "measured {m}: bulk fell below its floor at {bulk}");
-    }
+fn a_cycle_would_re_pay_every_budget_on_the_way_round() {
+    let got = broken(|d| {
+        d.paths[0].nodes = vec![
+            PathElem::One("prices".into()),
+            PathElem::One("ip".into()),
+            PathElem::One("prices".into()),
+        ]
+    });
+    assert!(got.contains(&"acyclic"), "{got:?}");
 }
 
 #[test]
-fn a_derived_lane_gets_the_residual_and_the_meter_can_only_shrink_it() {
-    // What the name promises — take back an idle neighbour's capacity — is not
-    // implementable here: each lane is its own partition, there is no channel
-    // to tell a borrower to give capacity back, and an idle neighbour is still
-    // entitled to its allocation the moment it wakes. So the measurement may
-    // shrink this lane and never grow it past its residual.
-    let mut v = base();
-    v["lanes"] = json!([
-        { "name": "urgent", "cap": "ceiling", "concurrency": 4, "default": true },
-        { "name": "bulk", "cap": "ceiling-minus-measured", "concurrency": 8, "floor": 0.2 }
-    ]);
-    let s = parse(v);
-    let urgent = s.lane_share("urgent", None);
-    assert!((urgent - 0.8).abs() < 1e-9, "urgent should hold its allocation, got {urgent}");
-    // An idle neighbour does NOT hand its share over.
-    assert!((s.lane_share("bulk", Some(0.0)) - 0.2).abs() < 1e-9);
-    // And a busy one cannot push this lane below its floor.
-    assert!((s.lane_share("bulk", Some(1.0)) - 0.2).abs() < 1e-9);
-}
-
-/// The application is in the queue name AND in queen's own namespace field.
-/// The name is a convention this codebase invented; the namespace is a thing
-/// the broker keeps, and only the second one shows up in queen's console.
-#[test]
-fn namespace_is_per_application() {
-    let mut v = base();
-    v["application"] = json!("finance");
-    v["name"] = json!("stripe");
-    let spec = parse(v);
-    assert_eq!(spec.namespace(), "gate.finance");
-    assert_eq!(spec.push_queue(), "gate.finance.stripe.push");
-    assert_eq!(spec.calls_queue(), "gate.finance.stripe.calls");
-    assert_eq!(
-        spec.admitted_queue("urgent"),
-        "gate.finance.stripe.admitted.urgent"
-    );
-    // Two applications, same target name: different namespaces, and nothing
-    // they own can collide.
-    let mut w = base();
-    w["application"] = json!("channel-manager");
-    w["name"] = json!("stripe");
-    let other = parse(w);
-    assert_ne!(spec.namespace(), other.namespace());
-    assert_ne!(spec.push_queue(), other.push_queue());
+fn a_path_must_start_at_a_node_work_can_enter_by() {
+    assert!(broken(|d| d.nodes.get_mut("prices").unwrap().ingress = None).contains(&"path-entry"));
 }
 
 #[test]
-fn a_kv_budget_must_lease_enough_for_one_item() {
-    // `cost-fits` compares an item against the whole cap, which is right for a budget
-    // the gate holds in memory. A kv budget is spent from a LEASE of one second's
-    // rate, so an item costing more than that lease can never be admitted and blocks
-    // the head of its lane for ever — the very failure cost-fits exists to prevent.
-    let mut v = base();
-    v["budgets"][0] = json!({ "id": "shared", "cap": 1000, "periodSeconds": 60,
-                              "alignment": "calendar", "store": "kv",
-                              "confidence": "inferred" });
-    v["cost"] = json!({ "field": "c", "default": 1, "max": 100 });
-    let problems = validate(&parse(v.clone()));
-    assert!(problems.iter().any(|p| p.rule == "kv-chunk"), "{problems:?}");
+fn a_path_must_end_where_work_can_leave() {
+    assert!(broken(|d| d.nodes.get_mut("ip").unwrap().egress = None).contains(&"path-terminal"));
+}
+
+#[test]
+fn a_node_no_path_visits_can_never_hold_work() {
+    let got = broken(|d| {
+        d.nodes.insert("stray".into(), d.nodes["audit"].clone());
+    });
+    assert!(got.contains(&"node-orphan"), "{got:?}");
+}
+
+#[test]
+fn a_fanout_of_one_is_not_a_fanout() {
     assert!(
-        !problems.iter().any(|p| p.rule == "cost-fits"),
-        "cost-fits sees a cap of 1000 and is happy; the lease is the real limit: {problems:?}"
+        broken(|d| d.paths[2].nodes[1] = PathElem::FanOut(vec!["ip".into()]))
+            .contains(&"fanout-branch")
     );
-
-    // A rate of 100 per second leases 100 per top-up, which fits the item.
-    v["budgets"][0]["periodSeconds"] = json!(10);
-    assert!(!validate(&parse(v)).iter().any(|p| p.rule == "kv-chunk"));
 }
 
 #[test]
-fn an_admitted_ring_is_a_resource_number_now_that_it_is_a_runner_count() {
-    // An admitted partition used to be a hash bucket and nothing else, so nobody
-    // bounded it. It is now also the unit of relay parallelism — a node with an
-    // out-edge gets one relay runner per admitted partition per lane — so the count
-    // buys claims on the broker exactly as `shards` buys gate runners, and it gets
-    // the same wall.
-    let mut v = base();
-    v["admitted"] = json!({ "partitionBy": "connection", "partitions": 4096 });
-    let problems = validate(&parse(v.clone()));
-    let p = problems
-        .iter()
-        .find(|p| p.rule == "admitted-partitions")
-        .unwrap_or_else(|| panic!("{problems:?}"));
-    assert!(p.detail.contains("relay runner"), "{}", p.detail);
+fn a_fanout_must_be_the_last_hop() {
+    let got = broken(|d| {
+        d.paths[2].nodes = vec![
+            PathElem::FanOut(vec!["prices".into(), "photos".into()]),
+            PathElem::One("ip".into()),
+        ]
+    });
+    assert!(got.contains(&"fanout-terminal"), "{got:?}");
+}
 
-    // A ring of no buckets has nowhere to put an item, and was silently read as one.
-    v["admitted"] = json!({ "partitionBy": "connection", "partitions": 0 });
-    assert!(validate(&parse(v.clone()))
-        .iter()
-        .any(|p| p.rule == "admitted-partitions"));
+// ------------------------------------------------------------------- budgets
 
-    // The wall itself is fine, and so is the default.
-    v["admitted"] = json!({ "partitionBy": "connection", "partitions": GATE_MAX_ADMITTED_PARTITIONS });
-    assert!(!validate(&parse(v.clone()))
-        .iter()
-        .any(|p| p.rule == "admitted-partitions"));
+#[test]
+fn a_node_with_no_budget_is_a_queue_with_extra_steps() {
+    assert!(broken(|d| d.nodes.get_mut("audit").unwrap().budgets.clear()).contains(&"node-budget"));
+}
 
-    // `partitionBy: none` keeps ONE partition whatever the number says, so the
-    // number is not a resource claim and is not policed. What it is instead is a
-    // relay that cannot be parallelised, which the graph warns about.
-    v["admitted"] = json!({ "partitionBy": "none", "partitions": 4096 });
-    assert!(!validate(&parse(v.clone()))
-        .iter()
-        .any(|p| p.rule == "admitted-partitions"));
-    assert_eq!(parse(v).admitted.count(), 1);
+/// A node with only per-key budgets has no denominator for the ETA and no lever
+/// for the breaker.
+#[test]
+fn a_node_needs_at_least_one_unscoped_budget() {
+    let got = broken(|d| {
+        let n = d.nodes.get_mut("photos").unwrap();
+        n.budgets.retain(|b| b.scope_by.is_some());
+    });
+    assert!(got.contains(&"node-unscoped-budget"), "{got:?}");
 }
 
 #[test]
-fn the_ring_the_gate_writes_is_the_ring_the_relay_reads() {
-    // The gate's partitioner and the relay's pinned pops have to name partitions
-    // identically or the relay polls partitions that never receive anything while
-    // the work piles up in ones nobody claims. Both go through `Admitted`, and this
-    // is the property that makes the single definition worth having.
-    let mut v = base();
-    v["admitted"] = json!({ "partitionBy": "connection", "partitions": 8 });
-    let spec = parse(v);
-    let names = spec.admitted.partition_names();
-    assert_eq!(names.len(), 8);
-    for c in ["conn-7", "conn-8", "listing-42", "", "default"] {
-        let landed = spec.admitted.partition_of(&json!({ "connection": c }));
-        assert!(names.contains(&landed), "`{c}` landed in `{landed}`, which is not a partition");
-    }
-    // A payload with no `connection` at all still lands somewhere, deterministically.
+fn a_budget_that_cannot_admit_anything_never_will() {
+    assert!(
+        broken(|d| d.nodes.get_mut("audit").unwrap().budgets[0].count = 0)
+            .contains(&"budget-count")
+    );
+}
+
+#[test]
+fn the_window_floor_is_a_hundred_milliseconds() {
+    assert!(
+        broken(|d| d.nodes.get_mut("audit").unwrap().budgets[0].time_ms = 50)
+            .contains(&"budget-window")
+    );
+}
+
+#[test]
+fn one_id_declared_twice_would_spend_one_counter() {
+    let got = broken(|d| {
+        let n = d.nodes.get_mut("photos").unwrap();
+        let dup = n.budgets[0].clone();
+        n.budgets.push(dup);
+    });
+    assert!(got.contains(&"budget-unique"), "{got:?}");
+}
+
+#[test]
+fn more_sub_windows_than_count_enforces_the_sub_window_count() {
+    let got = broken(|d| {
+        let b = &mut d.nodes.get_mut("audit").unwrap().budgets[0];
+        b.count = 10;
+        b.sub_windows = Some(50);
+    });
+    assert!(got.contains(&"subwindow-fits"), "{got:?}");
+}
+
+#[test]
+fn sub_windows_has_a_range() {
+    assert!(
+        broken(|d| d.nodes.get_mut("audit").unwrap().budgets[0].sub_windows = Some(0))
+            .contains(&"subwindow-range")
+    );
+}
+
+/// The one that matters most. An item costing more than a sub-window can never
+/// be admitted, blocks the head of its partition for ever, and never reaches a
+/// DLQ because lease expiry charges no retry.
+#[test]
+fn an_item_that_cannot_fit_a_window_is_refused_at_declare_time() {
+    let got = broken(|d| {
+        d.nodes.get_mut("audit").unwrap().cost = gate_core::Cost::Fixed(5000);
+    });
+    assert!(got.contains(&"cost-fits"), "{got:?}");
+}
+
+#[test]
+fn a_max_below_the_default_makes_the_default_inadmissible() {
+    let got = broken(|d| {
+        d.nodes.get_mut("prices").unwrap().cost = gate_core::Cost::Path(gate_core::CostPath {
+            path: "payload.rooms".into(),
+            default: 9,
+            max: Some(4),
+        })
+    });
+    assert!(got.contains(&"cost-max"), "{got:?}");
+}
+
+/// The counter is an integer on this wire, which v1's `f64` cost was not.
+#[test]
+fn a_cost_below_one_is_not_expressible() {
+    assert!(
+        broken(|d| d.nodes.get_mut("audit").unwrap().cost = gate_core::Cost::Fixed(0))
+            .contains(&"cost-integer")
+    );
+}
+
+#[test]
+fn a_cost_path_is_a_payload_path() {
+    let got = broken(|d| {
+        d.nodes.get_mut("audit").unwrap().cost = gate_core::Cost::Path(gate_core::CostPath {
+            path: "rooms".into(),
+            default: 1,
+            max: Some(1),
+        })
+    });
+    assert!(got.contains(&"cost-path"), "{got:?}");
+}
+
+#[test]
+fn a_scope_path_is_a_payload_path() {
+    let got = broken(|d| {
+        d.nodes.get_mut("photos").unwrap().budgets[1].scope_by = Some("listingId".into())
+    });
+    assert!(got.contains(&"scope-path"), "{got:?}");
+}
+
+/// One counter, two declarations that disagree: one of them is a lie about what
+/// it enforces.
+#[test]
+fn a_shared_key_declared_twice_must_agree() {
+    let got = broken(|d| {
+        let b = d.nodes.get_mut("audit").unwrap().budgets[0].clone();
+        let mut b = b;
+        b.id = Some("audit-shared".into());
+        b.shared_key = Some("egress-ip".into());
+        b.count = 7;
+        b.time_ms = 10_000;
+        d.nodes.get_mut("audit").unwrap().budgets.push(b);
+    });
+    assert!(got.contains(&"shared-conflict"), "{got:?}");
+}
+
+#[test]
+fn an_empty_when_op_charges_nothing() {
+    assert!(
+        broken(|d| d.nodes.get_mut("photos").unwrap().budgets[1].when_op = Some(vec![]))
+            .contains(&"whenop-empty")
+    );
+}
+
+/// A guess must never look like a measurement.
+#[test]
+fn documented_means_source_and_as_of() {
+    assert!(
+        broken(|d| d.nodes.get_mut("prices").unwrap().budgets[0].source = None)
+            .contains(&"provenance")
+    );
+}
+
+// -------------------------------------------------------------------- shares
+
+#[test]
+fn a_share_is_a_fraction_not_a_rate() {
+    assert!(broken(|d| d.paths[1].share = Some(1.5)).contains(&"share-range"));
+}
+
+/// The top priority must be able to reach the whole ceiling, or the headroom
+/// above every other path's share belongs to nobody.
+#[test]
+fn the_top_priority_must_reach_the_ceiling() {
+    assert!(broken(|d| d.paths[0].share = Some(0.9)).contains(&"share-top"));
+}
+
+/// Priority is expressed as the ceiling, so a lower priority with a larger
+/// share is the opposite of what was asked for.
+#[test]
+fn a_lower_priority_may_not_have_a_larger_share() {
+    let got = broken(|d| {
+        d.paths[1].share = Some(0.5);
+        d.paths[2].share = Some(0.9);
+    });
+    assert!(got.contains(&"share-order"), "{got:?}");
+}
+
+#[test]
+fn a_share_that_rounds_below_the_item_cost_could_never_admit() {
+    let got = broken(|d| d.paths[2].share = Some(0.01));
+    assert!(got.contains(&"share-rounds-out"), "{got:?}");
+}
+
+// ----------------------------------------------------------------- ownership
+
+/// Two consumers of one queue in different groups each get every message, which
+/// doubles what leaves.
+#[test]
+fn two_nodes_may_not_name_one_ingress_queue() {
+    let got = broken(|d| {
+        d.nodes.get_mut("prices").unwrap().ingress = Some(Ingress::Named(gate_core::IngressSpec {
+            queue: Some("channel.airbnb.messages.in".into()),
+            partitions: None,
+            http: None,
+        }))
+    });
+    assert!(got.contains(&"ingress-owner"), "{got:?}");
+}
+
+#[test]
+fn an_ingress_queue_claimed_elsewhere_in_the_fleet_is_refused() {
+    let facts = gate_core::ExternalFacts {
+        ingress_owners: vec![(
+            "channel.airbnb.messages.in".into(),
+            "channel/other".into(),
+            "in".into(),
+        )],
+        ..Default::default()
+    };
+    let got = rules(&gate_core::validate_with(&airbnb(), &facts));
+    assert!(got.contains(&"ingress-owner"), "{got:?}");
+}
+
+// ------------------------------------------------------------------ warnings
+
+/// A kv TTL is whole seconds, so a window declared under one is enforced at one
+/// — tighter than declared, never looser, but slower. It is a trade and not a
+/// mistake, so it is a warning that names both numbers.
+#[test]
+fn a_sub_second_window_warns_rather_than_refusing() {
+    let mut doc = airbnb();
+    doc.nodes.get_mut("audit").unwrap().budgets[0].time_ms = 200;
+    assert!(validate(&doc).is_empty(), "{:#?}", validate(&doc));
+    let w = warnings(&doc);
+    assert!(rules(&w).contains(&"window-sub-second"), "{w:#?}");
+    assert!(
+        w.iter()
+            .any(|p| p.detail.contains("200ms") && p.detail.contains("2000 per 1s")),
+        "the warning must name both numbers: {w:#?}"
+    );
+}
+
+#[test]
+fn rounding_down_more_than_two_percent_is_said_out_loud() {
+    let mut doc = airbnb();
+    let b = &mut doc.nodes.get_mut("audit").unwrap().budgets[0];
+    b.count = 95;
+    b.time_ms = 10_000;
+    b.sub_windows = Some(10);
+    let w = warnings(&doc);
+    assert!(rules(&w).contains(&"subwindow-rounding"), "{w:#?}");
+}
+
+/// A boundary warning is about a subdivision chosen FOR the caller. A budget
+/// that declares its own `subWindows` has made the trade knowingly — a weekly
+/// per-listing quota has a week-long window and no amount of subdividing changes
+/// that.
+#[test]
+fn the_boundary_warning_is_only_for_a_defaulted_subdivision() {
+    let mut doc = airbnb();
+    let b = &mut doc.nodes.get_mut("audit").unwrap().budgets[0];
+    b.count = 2000;
+    b.time_ms = 30_000;
+    b.sub_windows = None;
+    // 30s / 30 sub-windows is a one-second sub-window: nothing to say.
+    assert!(!rules(&warnings(&doc)).contains(&"window-boundary"));
+
+    let b = &mut doc.nodes.get_mut("audit").unwrap().budgets[0];
+    b.count = 3;
+    b.time_ms = 30_000;
+    assert!(rules(&warnings(&doc)).contains(&"window-boundary"));
+}
+
+#[test]
+fn a_user_owned_ingress_queue_with_a_retention_is_named() {
+    let mut queues = std::collections::BTreeMap::new();
+    queues.insert(
+        "channel.airbnb.messages.in".to_string(),
+        gate_core::QueueFacts {
+            exists: true,
+            partitions: 8,
+            retention: Some("2 hours".into()),
+        },
+    );
+    let facts = gate_core::ExternalFacts {
+        queues,
+        ..Default::default()
+    };
+    let w = gate_core::warnings_with(&airbnb(), &facts);
+    assert!(rules(&w).contains(&"ingress-retention"), "{w:#?}");
+}
+
+#[test]
+fn one_partition_is_one_order_and_must_not_be_a_surprise() {
+    let mut queues = std::collections::BTreeMap::new();
+    queues.insert(
+        "channel.airbnb.messages.in".to_string(),
+        gate_core::QueueFacts {
+            exists: true,
+            partitions: 1,
+            retention: None,
+        },
+    );
+    let facts = gate_core::ExternalFacts {
+        queues,
+        ..Default::default()
+    };
+    let w = gate_core::warnings_with(&airbnb(), &facts);
+    assert!(rules(&w).contains(&"single-partition"), "{w:#?}");
+}
+
+#[test]
+fn a_shared_egress_queue_is_legal_and_named() {
+    let facts = gate_core::ExternalFacts {
+        egress_owners: vec![("channel.airbnb.out".into(), "channel/legacy".into())],
+        ..Default::default()
+    };
+    let w = gate_core::warnings_with(&airbnb(), &facts);
+    assert!(rules(&w).contains(&"egress-owner"), "{w:#?}");
+}
+
+// ------------------------------------------------------------------ shorthand
+
+#[test]
+fn egress_accepts_a_bare_queue_name_or_a_group() {
+    let doc = airbnb();
     assert_eq!(
-        spec.admitted.partition_of(&json!({ "entity": "x" })),
-        spec.admitted.partition_of(&json!({})),
+        doc.nodes["audit"].egress.as_ref().unwrap().queue(),
+        "channel.airbnb.audit"
     );
-
-    // `partitionBy: none` is one partition, and it is the one the relay pins to.
-    let mut v = base();
-    v["admitted"] = json!({ "partitionBy": "none", "partitions": 64 });
-    let spec = parse(v);
-    assert_eq!(spec.admitted.partition_names(), vec!["default".to_string()]);
-    assert_eq!(spec.admitted.partition_of(&json!({ "connection": "c1" })), "default");
+    assert_eq!(doc.nodes["audit"].egress.as_ref().unwrap().group(), None);
+    assert_eq!(
+        doc.nodes["ip"].egress.as_ref().unwrap().group(),
+        Some("channel-workers")
+    );
+    let e: Egress = serde_json::from_str(r#""q.out""#).unwrap();
+    assert_eq!(e.queue(), "q.out");
 }
 
 #[test]
-fn narrowing_the_admitted_ring_is_migration_class() {
-    // The ring used to be a hash bucket and nothing more, so its width was free to
-    // change: whoever drained the queue drained whatever partitions the broker
-    // offered. It is now the claim topology — a relay runs one runner per partition
-    // it can NAME — so a narrower ring leaves whatever is still in the partitions
-    // that no longer exist with nobody to claim it. Same failure `shards` has on the
-    // push queue, same answer: say the change was meant.
-    let mut old = base();
-    old["admitted"] = json!({ "partitionBy": "connection", "partitions": 64 });
-    let mut new = old.clone();
-    new["admitted"] = json!({ "partitionBy": "connection", "partitions": 16 });
-    assert!(needs_version_bump(&parse(old.clone()), &parse(new)));
-
-    // Widening is the same decision in the other direction: the old items are still
-    // in partitions the new ring names, but a key moves buckets, and everything that
-    // reads the ring has to agree on which.
-    let mut wider = old.clone();
-    wider["admitted"] = json!({ "partitionBy": "connection", "partitions": 128 });
-    assert!(needs_version_bump(&parse(old.clone()), &parse(wider)));
-
-    // A number that changes nothing about the ring changes nothing here: with
-    // `partitionBy: none` there is one partition whatever the field says.
-    let mut a = base();
-    a["admitted"] = json!({ "partitionBy": "none", "partitions": 8 });
-    let mut b = base();
-    b["admitted"] = json!({ "partitionBy": "none", "partitions": 64 });
-    assert!(!needs_version_bump(&parse(a), &parse(b)));
-
-    // And an untouched ring is untouched.
-    assert!(!needs_version_bump(&parse(old.clone()), &parse(old)));
+fn ingress_true_is_a_queue_gate_owns() {
+    let doc = airbnb();
+    assert!(doc.nodes["prices"].ingress.as_ref().unwrap().is_owned());
+    assert!(!doc.nodes["messages"].ingress.as_ref().unwrap().is_owned());
+    // The front door defaults on for a queue Gate made and off for one the
+    // application already pushes to with its own SDK.
+    assert!(doc.nodes["prices"].ingress.as_ref().unwrap().http());
+    assert!(!doc.nodes["messages"].ingress.as_ref().unwrap().http());
 }
