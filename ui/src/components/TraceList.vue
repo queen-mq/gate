@@ -1,15 +1,15 @@
 <script setup>
 /*
-  One decision per row. The roll-ups say how much; this says which — the op,
-  the lane, and the budget that held it — which is the only thing that settles
-  an argument with a caller who swears their request was refused.
+  One refusal per row: the node, the path, and the budget that held it — which is
+  the only thing that settles an argument with a caller who swears their request
+  was refused.
 
-  The colour rule here is the whole product in one line: a denial is rendered
-  in the same quiet grey as a completed call. It is the limiter working. Only a
-  throttle — the vendor refusing work after we admitted it — is painted bad,
-  because only a throttle means the number we enforce is wrong.
+  The colour rule here is the whole product in one line: a denial is rendered in
+  quiet grey. **It is the limiter working.** Only a throttle — the vendor
+  refusing work we had admitted — is painted bad, because only a throttle means
+  the number we enforce is wrong.
 */
-import { ago, clock, num, pct, traceRef, traceRefPath } from '../lib/api.js'
+import { ago, clock, pct, traceRef, traceRefPath } from '../lib/api.js'
 
 defineProps({
   traces: { type: Array, default: () => [] },
@@ -48,7 +48,7 @@ function tone(t) {
           {{ traceRef(t).application }}
         </span>
       </RouterLink>
-      <span class="font-mono text-[11.5px] text-fg-3 shrink-0 w-[70px] truncate">{{ t.lane }}</span>
+      <span class="font-mono text-[11.5px] text-fg-3 shrink-0 w-[70px] truncate">{{ t.path ?? t.lane }}</span>
       <span class="font-mono text-[12px] text-fg-2 shrink-0 max-w-[160px] truncate">{{ t.op }}</span>
 
       <span class="truncate flex-1" :class="tone(t)">
@@ -65,8 +65,9 @@ function tone(t) {
             :class="t.utilisation > 1 ? 'text-bad' : t.utilisation >= 0.85 ? 'text-warn' : 'text-fg-3'">
         {{ pct(t.utilisation) }}
       </span>
-      <span v-else class="font-mono text-[11.5px] text-fg-3 tabular-nums w-[64px] text-right shrink-0">
-        {{ num(t.calls) }} calls
+      <span v-else-if="t.node"
+            class="font-mono text-[11.5px] text-fg-3 truncate w-[64px] text-right shrink-0">
+        {{ t.node }}
       </span>
     </li>
   </ul>

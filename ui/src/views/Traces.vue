@@ -1,13 +1,14 @@
 <script setup>
 /*
-  The roll-ups say how much; this says which. When a caller swears a request
-  was refused and the counters agree that thousands were, the only thing that
-  settles it is the decision itself — which lane, which op, and which budget
-  held it.
+  The roll-ups say how much; this says which. When a caller swears a request was
+  refused and the counters agree that thousands were, the only thing that settles
+  it is the decision itself — which path, and which budget held it.
 
-  The default filter is denials, and not for tidiness: every denial and every
-  breach is kept whole while the rest is sampled, so denials are the only view
-  of this log that is complete. Each filter says which of the two it is.
+  **Denials, and only denials.** v1 wrote one row per decision through a calls
+  queue, in the same transaction as the ack; there is no ack any more, so there
+  is nothing to ride along with and nothing that could compare an estimated cost
+  with an actual one. What is kept is the interesting event: the refusal.
+  Admissions are counted and never traced.
 */
 import { ref, computed, watch } from 'vue'
 import PageHeader from '../components/PageHeader.vue'
@@ -16,10 +17,8 @@ import { api, splitTargetKey, traceRef, DEFAULT_APP } from '../lib/api.js'
 import { usePoll } from '../lib/poll.js'
 
 const OUTCOMES = [
-  { key: 'denied', label: 'Denied', note: 'the gate refused the call — every one is kept' },
-  { key: 'throttled', label: 'Breached', note: 'the vendor refused it after we admitted it — every one is kept' },
-  { key: 'ok', label: 'Completed', note: 'work the caller acked as done — sampled, never complete' },
-  { key: 'all', label: 'All', note: 'denials and breaches whole, the rest sampled' },
+  { key: 'denied', label: 'Denied', note: 'the gate refused the batch — the last 500, and whatever has been flushed' },
+  { key: 'all', label: 'All', note: 'the same list: an admission is counted, never traced' },
 ]
 
 const outcome = ref('denied')
@@ -72,7 +71,7 @@ const note = computed(() => OUTCOMES.find((o) => o.key === outcome.value)?.note 
   <div>
     <PageHeader
       title="Traces"
-      sub="Individual decisions, as they were taken. Denials and breaches are kept in full; the rest is sampled, because admissions are 99% of the volume and almost none of the interest."
+      sub="Refusals, as they were taken. Admissions are counted and never traced — they are 99% of the volume and almost none of the interest, and the hot path writes one KV batch and one transaction and nothing else."
     >
       <template #actions>
         <select v-model="target" class="input w-[180px]">
@@ -106,8 +105,9 @@ const note = computed(() => OUTCOMES.find((o) => o.key === outcome.value)?.note 
     <div v-else-if="traces === null" class="card px-6 py-14 text-center">
       <p class="text-[15px] font-medium">Decision traces are not being served</p>
       <p class="hint mt-2 max-w-md mx-auto">
-        Traces are written away from the admission path, never in line with it, so the gate can be
-        perfectly healthy while this page has nothing to read.
+        Refusals are kept in a bounded ring in each replica and flushed to Postgres when one is
+        configured, never written in line with a decision — so the gate can be perfectly healthy
+        while this page has nothing to read.
       </p>
     </div>
 
@@ -118,13 +118,9 @@ const note = computed(() => OUTCOMES.find((o) => o.key === outcome.value)?.note 
           No refusal has been recorded{{ target ? ` on ${target}` : '' }}. Denials are the one outcome
           kept in full rather than sampled, so an empty page here is a quiet limiter and not a gap.
         </template>
-        <template v-else-if="outcome === 'throttled'">
-          No vendor has refused work we admitted{{ target ? ` on ${target}` : '' }} — the caps being
-          enforced have held.
-        </template>
         <template v-else>
-          Completed calls are sampled, so an empty page here means the sample missed rather than that
-          nothing ran.
+          Nothing has been refused{{ target ? ` on ${target}` : '' }}. A vendor throttle is not here
+          either — it is reported to the backoff endpoint and appears on the overview.
         </template>
       </p>
     </div>

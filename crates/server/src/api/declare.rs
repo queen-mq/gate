@@ -278,6 +278,15 @@ async fn do_sync(st: &Shared, application: &str, bodies: Vec<Value>) -> ApiResul
         if declared.contains(&rt.doc.graph) {
             continue;
         }
+        // A sync reaps what it could have DECLARED, and nothing else. v1
+        // exempted graph nodes from a target sync because a target list does not
+        // name them and reaping one would tear down half a topology; there are
+        // no node-targets any more, so the same rule is spelt as "a sync of
+        // targets does not delete a graph". A one-node graph IS a target and is
+        // fair game.
+        if rt.plan.nodes.len() > 1 {
+            continue;
+        }
         let name = rt.doc.graph.clone();
         if let Err(e) = crate::store::forget(&st.queen, application, &name).await {
             tracing::warn!(graph = %name, error = %e, "sync: not reaped, the stored document could not be removed");
