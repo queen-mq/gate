@@ -1314,6 +1314,97 @@ async fn the_product_metrics_endpoint_keeps_the_shape_a_consumer_decodes() {
     h.cleanup("g").await;
 }
 
+/// An item that can never be admitted is dead-lettered, and does not take its
+/// partition with it.
+///
+/// §13.3's most consequential behaviour change: v1 set `retry_limit` to zero
+/// because it PACED by nacking and could not tell waiting from failing, so it
+/// had no working DLQ at all. v2 paces by RELEASING — and queen charges no retry
+/// budget on lease expiry — so a nack means what it says again and this path is
+/// reachable. It replaces the declare-time `cost-monotonic` rule, and it shipped
+/// without a test of its own: the only assertion on the counter was another test
+/// checking it stays zero.
+///
+/// Reachable only through a USER-OWNED ingress queue, which is the point. The
+/// HTTP door refuses a cost above `cost.max` with a 422; a producer pushing with
+/// its own SDK has no door to refuse it, and the item then arrives declaring a
+/// cost the node can never afford. Left in place it parks the head of its
+/// partition FOR EVER, never reaching a DLQ, because a lease that expires
+/// charges no retry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn an_item_that_can_never_be_admitted_is_dead_lettered() {
+    let Some(h) = harness("poison").await else {
+        return;
+    };
+    let out = egress_of("poison", &h.application);
+    let ingress = format!("app.poison.{}.in", h.application);
+    h.queen.queue(&ingress).create().await.ok();
+
+    let doc = json!({
+      "version": 1,
+      "nodes": {
+        "n": {
+          "ingress": { "queue": ingress, "http": false },
+          "egress": out,
+          "cost": { "path": "payload.w", "default": 1, "max": 5 },
+          "budgets": [{ "id": "b", "count": 1000, "timeMs": 1000, "subWindows": 1 }]
+        }
+      },
+      "paths": [{ "name": "main", "nodes": ["n"] }]
+    });
+    let (status, body) = h.put_graph("g", doc).await;
+    assert_eq!(status, 200, "declare: {body}");
+
+    // The poison at the HEAD of its partition, with ordinary work behind it. The
+    // work is what proves the point: it must arrive.
+    let mut items = vec![queen_mq::PushItem {
+        queue: ingress.clone(),
+        partition: Some("p0".into()),
+        payload: json!({ "w": 500, "n": -1 }),
+        transaction_id: None,
+    }];
+    for i in 0..4 {
+        items.push(queen_mq::PushItem {
+            queue: ingress.clone(),
+            partition: Some("p0".into()),
+            payload: json!({ "w": 1, "n": i }),
+            transaction_id: None,
+        });
+    }
+    h.queen
+        .queue(&ingress)
+        .push_items(items)
+        .await
+        .expect("push");
+
+    let got = h.drain(&out, 4, Duration::from_secs(40)).await;
+    let ns: Vec<i64> = got
+        .iter()
+        .filter_map(|m| m.data.get("n").and_then(|v| v.as_i64()))
+        .collect();
+    assert_eq!(
+        ns,
+        vec![0, 1, 2, 3],
+        "the work behind the poison must arrive, in order: an item that can never be admitted          must not park its partition for ever"
+    );
+    assert!(
+        !ns.contains(&-1),
+        "the poison itself must never be forwarded: {ns:?}"
+    );
+
+    let (_, view) = h.get_graph("g").await;
+    let dead = view["stages"][0]["counters"]["deadlettered"]
+        .as_u64()
+        .unwrap_or(0);
+    assert!(
+        dead >= 1,
+        "the dead-letter path must be visible: a recovery nobody can see is one nobody knows          ran. {view}"
+    );
+
+    h.cleanup("g").await;
+}
+
 /// A KV route that refuses is NOT a refusal.
 ///
 /// Reading a failed charge as a refusal would park the graph; reading it as an
@@ -2021,10 +2112,61 @@ async fn the_console_can_draw_what_is_running() {
         "without the counters stream this must be null, not a lifetime average: {overview}"
     );
 
+    // `/api/targets` is a list a console DRAWS, so what is in it is the
+    // assertion: a bare 200 would pass against an empty array.
     let (status, targets) = h.send(reqwest::Method::GET, "/api/targets", None).await;
     assert_eq!(status, 200, "{targets}");
+    let mine = targets
+        .as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .find(|t| t["application"] == json!(h.application) && t["name"] == json!("g"))
+        .cloned()
+        .unwrap_or_else(|| panic!("this graph is not in /api/targets: {targets}"));
+    assert_eq!(mine["running"], json!(true), "{mine}");
+    assert!(mine["worst_budget_id"].is_string(), "{mine}");
+    assert!(
+        mine["worst_period_seconds"].as_i64().unwrap_or(0) > 0,
+        "the period beside the ceiling is the sub-window, and a hardcoded zero is what this          endpoint was called out for: {mine}"
+    );
 
+    // And the per-node flags the topology view draws are what the test is NAMED
+    // for: which node work enters by, and which one it leaves by. v1 called
+    // them `entry` and `consume` and put a `running` on every node; v2 draws
+    // `ingress` and `egress`, and `running` is a property of the GRAPH — its
+    // stages are started and stopped together — so it is asserted on the graph
+    // view above rather than repeated per node.
+    let nodes = topo["nodes"].as_array().cloned().unwrap_or_default();
+    assert!(!nodes.is_empty(), "{topo}");
+    assert!(
+        nodes.iter().any(|n| n["ingress"] == json!(true)),
+        "no node draws as an entry: {topo}"
+    );
+    assert!(
+        nodes.iter().any(|n| n["egress"] == json!(true)),
+        "no node draws as a terminal: {topo}"
+    );
+    assert!(
+        nodes
+            .iter()
+            .all(|n| n["paths"].as_array().is_some_and(|p| !p.is_empty())),
+        "a node no path visits cannot be drawn on a path: {topo}"
+    );
+
+    // A deleted graph is gone from the console too, which nothing observed
+    // because `cleanup` discards its answer.
     h.cleanup("g").await;
+    let (status, gone) = h
+        .send(
+            reqwest::Method::GET,
+            &format!("/api/apps/{}/graphs/g", h.application),
+            None,
+        )
+        .await;
+    assert_eq!(
+        status, 404,
+        "a deleted graph is gone from the console too: {gone}"
+    );
 }
 
 // ============================================================== lifecycle
