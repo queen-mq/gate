@@ -1197,6 +1197,123 @@ async fn a_v1_push_body_still_says_what_an_item_costs() {
     h.cleanup("g").await;
 }
 
+/// The product metrics endpoint answers the shape a v1 consumer decodes.
+///
+/// `GET /v1/apps/{app}/metrics` is what channel-go's `gateEgress` page scrapes
+/// (one `Metrics` struct per poll), and a scraper that decodes into a struct
+/// gets a silent ZERO for any field that was renamed — a dashboard then draws a
+/// budget with a cap of nothing rather than failing. So the fields are asserted
+/// by name here: the two backlogs kept apart, the ETA null rather than zero when
+/// nothing is draining, and v1's `cap`/`period_seconds` beside v2's
+/// `count`/`time_ms`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn the_product_metrics_endpoint_keeps_the_shape_a_consumer_decodes() {
+    let Some(h) = harness("metrics").await else {
+        return;
+    };
+    let out = egress_of("metrics", &h.application);
+    let (status, body) = h
+        .put_graph(
+            "g",
+            one_node(
+                &out,
+                json!({ "id": "b", "count": 5, "timeMs": 60000, "subWindows": 1 }),
+            ),
+        )
+        .await;
+    assert_eq!(status, 200, "declare: {body}");
+
+    let (status, m) = h
+        .send(
+            reqwest::Method::GET,
+            &format!("/v1/apps/{}/metrics", h.application),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{m}");
+    assert_eq!(m["application"], json!(h.application));
+    assert!(m["at"].as_i64().unwrap_or(0) > 0, "Gate's own clock: {m}");
+
+    let t = &m["targets"][0];
+    assert_eq!(
+        t["name"],
+        json!("g.n"),
+        "a node is `{{graph}}.{{node}}`: {m}"
+    );
+    assert_eq!(t["state"], json!("flowing"));
+    assert_eq!(t["waiting_for_budget"], json!(0));
+    assert_eq!(t["waiting_for_workers"], json!(0));
+    let b = &t["binding_budget"];
+    assert_eq!(b["id"], json!("b"));
+    assert_eq!(b["count"], json!(5), "v2's word");
+    assert_eq!(b["cap"], json!(5), "v1's word for the same number");
+    assert_eq!(b["time_ms"], json!(60000));
+    assert_eq!(b["period_seconds"], json!(60));
+    assert!(b["utilisation"].is_number(), "{b}");
+    assert!(b["confidence"].is_string(), "{b}");
+    // The counters stream is off for this graph, so nothing has measured a rate:
+    // null, never a lifetime average, and the ETA has to say so too.
+    assert!(t["admitted_per_sec"].is_null(), "{t}");
+    assert_eq!(
+        t["drain_eta_seconds"],
+        json!(0),
+        "nothing waiting is an eta of zero, which is not the same as `cannot say`"
+    );
+    assert!(t["last_breach_at"].is_null());
+
+    // Fill the window and the state has to move, with the backlog on the budget
+    // side rather than the worker side.
+    for i in 0..12 {
+        let (status, _) = h
+            .push(
+                "g",
+                "n",
+                json!({ "op": "test", "partition": "p0", "payload": { "n": i } }),
+            )
+            .await;
+        assert_eq!(status, 200);
+    }
+    assert_eq!(h.drain(&out, 5, Duration::from_secs(25)).await.len(), 5);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let (_, m) = h
+        .send(
+            reqwest::Method::GET,
+            &format!("/v1/apps/{}/metrics", h.application),
+            None,
+        )
+        .await;
+    let t = &m["targets"][0];
+    assert_eq!(t["state"], json!("pacing"), "{m}");
+    assert!(
+        t["waiting_for_budget"].as_u64().unwrap_or(0) > 0,
+        "the limiter is holding these on purpose: {m}"
+    );
+    assert!(
+        t["drain_eta_seconds"].is_null(),
+        "no measured rate means `cannot say`, which is not zero: {m}"
+    );
+
+    // A breaker is the third state, and the timestamp is what a page renders.
+    let (status, res) = h
+        .backoff("g", "n", json!({ "retryAfterSeconds": 30, "by": "test" }))
+        .await;
+    assert_eq!(status, 200, "{res}");
+    let (_, m) = h
+        .send(
+            reqwest::Method::GET,
+            &format!("/v1/apps/{}/metrics", h.application),
+            None,
+        )
+        .await;
+    let t = &m["targets"][0];
+    assert_eq!(t["state"], json!("breached"), "{m}");
+    assert!(t["last_breach_at"].as_i64().unwrap_or(0) > 0, "{m}");
+
+    h.cleanup("g").await;
+}
+
 /// A KV route that refuses is NOT a refusal.
 ///
 /// Reading a failed charge as a refusal would park the graph; reading it as an

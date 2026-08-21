@@ -654,6 +654,13 @@ pub async fn app_metrics(
                     "count_sub": b.count_sub, "window_sub_seconds": b.window_sub_seconds,
                     "value": v, "ceiling": ceiling,
                     "utilisation": u, "confidence": b.confidence,
+                    // v1's words for the two above, kept because this is the
+                    // PRODUCT metrics endpoint and §12.1 does not move the
+                    // shapes a live consumer already reads. A scraper that
+                    // decodes into a struct silently gets 0 for a field that was
+                    // renamed, and a dashboard then draws a budget with a cap of
+                    // zero rather than failing.
+                    "cap": b.count, "period_seconds": b.time_ms / 1000,
                 })),
                 "admitted_per_sec": rate,
                 "waiting_for_budget": waiting_budget,
