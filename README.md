@@ -276,7 +276,7 @@ your producer  ──►  ingress queue        (your SDK, or Gate's HTTP front d
                     kv.incr(budget key, batch cost, {max: your share, ttl: sub-window})
                         │
              applied ───┴─── refused ──► admit the PREFIX that fits, or
-                │                        park (short wait) / release (long wait)
+                │                        park in-handler, or release the claim
                 ▼
         ONE transaction: ack(the batch) + push(next hop, same partition)
                         │
@@ -289,10 +289,16 @@ refuses, what applied is refunded and the prefix that fits is charged instead.
 Prefix, not subset: order inside a partition is the guarantee the whole design rests
 on.
 
-**Waiting is not failing.** When nothing fits, a short wait parks in-handler holding
-the lease and a long one returns without acking — and queen charges **no retry budget
-on lease expiry**, so paced work is never dead-lettered for waiting. An explicit
-failed ack is reserved for real poison, which is why Gate has a working DLQ again.
+**Waiting is not failing.** When nothing fits, the handler parks in-handler holding
+its claim for as long as it can afford to (`GATE_MAX_PARK_MS`), and returns without
+acking when it cannot — and queen charges **no retry budget on lease expiry**, so paced
+work is never dead-lettered for waiting. An explicit failed ack is reserved for real
+poison, which is why Gate has a working DLQ again.
+
+Parking is preferred to releasing for a measured reason: a claim settled IN FULL
+re-arms its partition in about 7ms, but one that is released is not offered again for
+about a minute — so the only time it is worth releasing is when the wait is longer
+than the claim can be held.
 
 ---
 
