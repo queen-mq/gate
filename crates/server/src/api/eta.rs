@@ -49,6 +49,14 @@ async fn answer(
     node: &str,
     q: PathQuery,
 ) -> ApiResult {
+    // A stopped runtime is REFUSED rather than answered. An ETA is the one read
+    // that would turn "registered but stopped" into a confident number: a graph
+    // whose swap failed and whose old plan could not be restarted would answer
+    // `state: "waiting-budget"`, an `etaSeconds` and a `boundBy`, none of which
+    // anything is going to act on, because no stage is running to act. The 503
+    // is recoverable — the reconcile loop repairs it on its next pass — and it
+    // is the same guard `push` makes.
+    crate::api::refuse_if_stopped(rt)?;
     if rt.plan.node(node).is_none() {
         return Err(Fail(
             StatusCode::NOT_FOUND,

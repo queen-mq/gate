@@ -20,9 +20,11 @@
 //! vendor's own `Retry-After` deadline, and `relay::park_or_release` computes it
 //! without being told.
 //!
-//! What is not here: per-item bounded retry. That is design §16.6 and it is an
-//! open question, not a silent deletion — the migration refuses a v1 document
-//! carrying `breach[]` and says so.
+//! This is the AGGREGATE half of what v1's breach rules did. The per-item half
+//! — put this one item back at the door it came in at and make it re-pay every
+//! budget on its path — is [`crate::api::reenter`], design §16.6 option (2).
+//! Together they cover what `plan_retro` covered, with the trigger moved: v1
+//! watched the ack, and v2 is told.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};

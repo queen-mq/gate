@@ -38,12 +38,15 @@
 //!   per-item half is an open question (design §16.6) and is NOT in this build.
 //! * `priority_and_the_window_survive_the_relay_being_many_runners`,
 //!   `a_leg_that_is_not_dry_holds_its_window_but_not_for_ever`,
-//!   `a_wide_window_does_not_leak_priority_to_the_next_leg` — all three assert
-//!   STRICT priority at a merge: drain the top leg to exhaustion before looking
-//!   at the next one. v2 has no merge and no window; priority is a ceiling on
-//!   one shared counter, so the property that is bought is the atomic reserve,
-//!   and `the_high_share_path_keeps_admitting_while_the_low_one_refuses` asserts
-//!   that instead. Priority is capacity now, not queue position.
+//!   `a_wide_window_does_not_leak_priority_to_the_next_leg`,
+//!   `priority_at_the_entrance_is_priority_in_fact` — all FOUR assert STRICT
+//!   priority at a merge: drain the top leg to exhaustion before looking at the
+//!   next one. v2 has no merge and no window; priority is a ceiling on one
+//!   shared counter, so the property that is bought is the atomic reserve, and
+//!   `the_high_share_path_keeps_admitting_while_the_low_one_refuses` asserts
+//!   that instead. Priority is capacity now, not queue position. (The fourth was
+//!   deleted unnamed in the rewrite and is recorded here because §16.7 asks the
+//!   author to sign off on this trade, and a miscount understates it.)
 //! * `a_shard_serialises_one_key_and_lets_another_through` — there are no
 //!   shards. The per-key limit it tested is now one Postgres row per key, and
 //!   `a_scoped_budget_limits_one_key_and_lets_another_through` is the same
@@ -54,6 +57,15 @@
 //!   sugar resolves to it. The rule that survived is that an INTERIOR node
 //!   cannot be pushed into, which is
 //!   `an_interior_queue_belongs_to_the_graph_and_not_to_a_caller`.
+//! * `an_interior_leg_is_measured_against_the_relay_that_drains_it` — deleted
+//!   unnamed in the rewrite, and it should not have been: the distinction it
+//!   asserted still exists, split across the two branches of `eta::view`
+//!   (`waiting_for_budget` reads the stage's own group on its source, which for
+//!   an interior node is the interior queue; `waiting_for_workers` is populated
+//!   only where there is an egress queue, so an interior node reports zero).
+//!   `an_eta_tells_a_budget_backlog_from_a_worker_one` uses a ONE-node graph and
+//!   therefore reaches only the terminal branch. Recorded as a known gap rather
+//!   than as a justified deletion.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -1900,18 +1912,203 @@ async fn a_declare_that_cannot_be_stored_is_not_acknowledged() {
         "the caller must be told to retry: {res}"
     );
 
+    // And the 502 is checked against the thing it PROMISES, not only against its
+    // own wording. The runtime deliberately keeps serving the un-stored document
+    // — tearing it down would add an outage to a failed write — so what makes
+    // the message true is the reconcile pass putting the stored one back. Drop
+    // this assertion and the test stays green while the sentence becomes a lie.
+    //
+    // Here the store holds nothing for `g` at all, because the FIRST declare is
+    // what failed to persist. There is no stored document to revert to, so the
+    // reconcile pass takes the other branch by design — "declared here, never
+    // persisted" — and makes the running document durable rather than tearing it
+    // down. Nothing is lost either way, which is the point.
+    gate_server::reconcile(&h.app).await;
+    let rt = h
+        .app
+        .registry
+        .get(&h.application, "g")
+        .expect("a declare that ran and could not be stored is not torn down");
+    assert!(rt.is_running());
+
+    // The half the 502 actually promises needs something to revert TO. Declare
+    // cleanly, fail the store on a SECOND declare, and the reconcile must put
+    // version 1 back.
+
+    let mut v2 = one_node(&out, wide("b"));
+    v2["version"] = json!(2);
+    v2["nodes"]["n"]["budgets"][0]["count"] = json!(7);
+    faulty.refuse("graph%3A");
+    let (status, res) = h.put_graph("g", v2).await;
+    faulty.allow();
+    assert_eq!(status, 502, "{res}");
+
+    let rt = h.app.registry.get(&h.application, "g").expect("serving");
+    assert_eq!(
+        rt.doc.version, 2,
+        "the runtime keeps serving the new document until the reconcile swaps it back"
+    );
+    gate_server::reconcile(&h.app).await;
+    let rt = h.app.registry.get(&h.application, "g").expect("serving");
+    assert_eq!(
+        rt.doc.version, 1,
+        "the un-stored declare must have been reverted to the stored document, which is exactly \
+         what the 502 told the caller would happen"
+    );
+
+    h.cleanup("g").await;
+}
+
+/// A declare that cannot be RESTORED leaves nothing registered.
+///
+/// The other half of the provisioning contract, and the failure the whole
+/// unregister branch exists for: when the new plan cannot start and the old one
+/// cannot be restarted either, nothing is serving the graph. A graph left
+/// registered there would accept pushes and admit nothing, for ever, which is
+/// the one state an operator cannot get out of without reading this code. So it
+/// is unregistered — a push is then REFUSED, which is recoverable — and the
+/// reconcile pass brings it back from the store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn a_declare_that_cannot_be_restored_leaves_nothing_registered() {
+    let Some((h, faulty)) = faulty_harness("unregister").await else {
+        assert!(std::env::var("GATE_TEST_REQUIRE_LIVE").is_err());
+        return;
+    };
+    let out = egress_of("unregister", &h.application);
+
+    let (status, body) = h.put_graph("g", one_node(&out, wide("b"))).await;
+    assert_eq!(status, 200, "declare: {body}");
+    assert!(h.app.registry.get(&h.application, "g").is_some());
+
+    // Nothing gets through now, so neither the new plan nor the old one can be
+    // provisioned.
+    faulty.refuse("");
+    let mut v2 = one_node(&out, wide("b"));
+    v2["version"] = json!(2);
+    v2["nodes"]["n"]["budgets"][0]["count"] = json!(7);
+    let (status, res) = h.put_graph("g", v2).await;
+    assert_eq!(status, 502, "{res}");
+    assert!(
+        res["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unregistered"),
+        "the handler has to say what state it left behind: {res}"
+    );
+    assert!(
+        h.app.registry.get(&h.application, "g").is_none(),
+        "a stopped runtime must not be left registered: it would accept pushes into a queue \
+         nothing drains"
+    );
+
+    // A push is refused rather than accepted into a queue nothing drains.
+    faulty.allow();
+    let (status, _) = h
+        .push(
+            "g",
+            "n",
+            json!({ "op": "test", "partition": "p0", "payload": { "n": 1 } }),
+        )
+        .await;
+    assert_eq!(
+        status, 404,
+        "a push was accepted with nothing serving the graph"
+    );
+
+    // And the reconcile loop repairs it from the store, which still holds v1.
+    gate_server::reconcile(&h.app).await;
+    let rt = h
+        .app
+        .registry
+        .get(&h.application, "g")
+        .expect("the reconcile pass did not bring the graph back");
+    assert_eq!(rt.doc.version, 1);
+    assert!(rt.is_running());
+
+    let (status, _) = h
+        .push(
+            "g",
+            "n",
+            json!({ "op": "test", "partition": "p0", "payload": { "n": 2 } }),
+        )
+        .await;
+    assert_eq!(status, 200, "and it is admitting again");
+
     h.cleanup("g").await;
 }
 
 /// A graph that cannot be provisioned can still be deleted.
 ///
 /// The stored declaration goes first, so a document whose provisioning keeps
-/// failing is still removable — and a delete that cannot reach the store is
-/// refused rather than half-applied.
+/// failing is still removable — and a delete that answers 200 without reaching
+/// the store is worse than a refusal, because the next reconcile pass brings the
+/// graph back.
+///
+/// The stuck state is BUILT rather than assumed: declared cleanly so the store
+/// holds it, then a second replica that cannot provision it, so nothing is
+/// registered there and the delete has only the store to work on. Deleting a
+/// graph that was never declared exercises none of that.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn a_graph_that_cannot_be_provisioned_can_still_be_deleted() {
-    let Some(h) = harness("delete").await else {
+    let Some((h, faulty)) = faulty_harness("delete").await else {
+        assert!(std::env::var("GATE_TEST_REQUIRE_LIVE").is_err());
+        return;
+    };
+    let out = egress_of("delete", &h.application);
+    let key = format!("{}/g", h.application);
+
+    // Declared cleanly, so the store holds it.
+    let (status, body) = h.put_graph("g", one_node(&out, wide("b"))).await;
+    assert_eq!(status, 200, "declare: {body}");
+
+    // A fresh replica that CANNOT provision it: the document is in the store and
+    // nothing is running, which is the state an operator has to be able to get
+    // out of.
+    let stuck = serve(&faulty.url).await;
+    let stuck_base = spawn_server(stuck.clone()).await;
+    faulty.refuse("configure");
+    gate_server::restore(&stuck).await;
+    assert!(
+        stuck.registry.by_key(&key).is_none(),
+        "provisioning was supposed to fail on this replica"
+    );
+
+    // Delete it THERE. Nothing is registered locally, and that is not a reason
+    // to refuse: the stored declaration is what a delete is about.
+    faulty.allow();
+    let res = reqwest::Client::new()
+        .delete(format!("{stuck_base}/v1/apps/{}/graphs/g", h.application))
+        .send()
+        .await
+        .expect("delete");
+    let status = res.status().as_u16();
+    let body: Value = res.json().await.unwrap_or(Value::Null);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["registered"],
+        json!(false),
+        "not running here is a success: the document is gone, which is what was asked for"
+    );
+
+    // And it stops coming back: the reconcile has nothing left to retry, on
+    // EITHER replica. The second assertion is the one that catches a delete that
+    // answered 200 and never landed.
+    gate_server::reconcile(&stuck).await;
+    assert!(stuck.registry.by_key(&key).is_none());
+    gate_server::reconcile(&h.app).await;
+    assert!(
+        h.app.registry.by_key(&key).is_none(),
+        "the delete did not reach the store"
+    );
+}
+
+/// Deleting a graph nobody declared is a success, not a 404.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn deleting_a_graph_that_was_never_declared_is_a_success() {
+    let Some(h) = harness("delete404").await else {
         return;
     };
     let (status, res) = h
@@ -1922,11 +2119,7 @@ async fn a_graph_that_cannot_be_provisioned_can_still_be_deleted() {
         )
         .await;
     assert_eq!(status, 200, "{res}");
-    assert_eq!(
-        res["registered"],
-        json!(false),
-        "not running here is a success: the document is gone, which is what was asked for"
-    );
+    assert_eq!(res["registered"], json!(false), "{res}");
 }
 
 /// A second replica converges on the stored document.
@@ -2235,6 +2428,206 @@ async fn an_eta_tells_a_budget_backlog_from_a_worker_one() {
 //
 // Facts the whole admission algorithm rests on. They are the BROKER's, not
 // Gate's, so they are asserted against it rather than inferred from a reading of
+/// A stopped graph does not answer an ETA.
+///
+/// v1 refused `push`, `next` and `eta` alike for a registered-but-stopped
+/// runtime, and the ETA is the one that matters most: it is the read that would
+/// turn "registered but stopped" into a confident number. A graph whose swap
+/// failed and whose old plan could not be restarted would report
+/// `waiting-budget`, an `etaSeconds` and a `boundBy` — none of which anything is
+/// going to act on, because no stage is running to act.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn a_stopped_graph_refuses_an_eta_instead_of_answering_one() {
+    let Some(h) = harness("etastop").await else {
+        return;
+    };
+    let out = egress_of("etastop", &h.application);
+    let (status, body) = h.put_graph("g", one_node(&out, wide("b"))).await;
+    assert_eq!(status, 200, "declare: {body}");
+
+    let (status, eta) = h.node_eta("g", "n").await;
+    assert_eq!(status, 200, "a running graph answers: {eta}");
+
+    // Stop the stages without unregistering, which is exactly the state a failed
+    // swap leaves behind.
+    let rt = h.app.registry.get(&h.application, "g").expect("registered");
+    gate_server::supervisor::cancel(&rt);
+    assert!(!rt.is_running());
+
+    let (status, res) = h.node_eta("g", "n").await;
+    assert_eq!(
+        status, 503,
+        "a stopped graph must be refused, not answered with a number: {res}"
+    );
+    assert!(
+        res["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not running"),
+        "{res}"
+    );
+
+    h.cleanup("g").await;
+}
+
+/// Re-entry puts an item back at the door it came in at, bounded, and idempotent
+/// in its transaction id. Design §16.6, option (2).
+///
+/// The three properties v1's `plan_retro` had, asserted one by one: it lands on
+/// the ORIGIN ingress queue (so it re-pays every budget on its path rather than
+/// skipping the ones upstream of where it failed), the attempt rides in the id
+/// (so a caller reporting one item twice collapses on the broker's dedup), and
+/// it stops at `maxAttempts`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn a_throttled_item_re_enters_at_its_origin_until_its_attempts_run_out() {
+    let Some(h) = harness("reenter").await else {
+        return;
+    };
+    let out = egress_of("reenter", &h.application);
+    let mut doc = chain_doc();
+    doc["nodes"]["ip"]["egress"] = json!(out);
+    doc["maxAttempts"] = json!(2);
+    let (status, body) = h.put_graph("g", doc).await;
+    assert_eq!(status, 200, "declare: {body}");
+
+    // One item across the two-node graph, popped off the egress queue exactly as
+    // the application would.
+    let (status, _) = h
+        .push(
+            "g",
+            "messages",
+            json!({ "op": "test", "partition": "p0", "txn": "origin-1",
+                    "payload": { "n": 1 } }),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let got = h.drain(&out, 1, Duration::from_secs(25)).await;
+    assert_eq!(got.len(), 1);
+    let arrived = got[0].data.clone();
+    assert_eq!(arrived["_gate"]["path"], json!("main"));
+
+    async fn reenter(h: &Harness, payload: &Value, txn: &str) -> (u16, Value) {
+        h.send(
+            reqwest::Method::POST,
+            &format!("/v1/apps/{}/graphs/g/reenter", h.application),
+            Some(json!({ "payload": payload, "txn": txn, "partition": "p0" })),
+        )
+        .await
+    }
+
+    // ---- attempt 1: back at the door, and it comes out the other end again.
+    let (status, res) = reenter(&h, &arrived, &got[0].transaction_id).await;
+    assert_eq!(status, 200, "{res}");
+    assert_eq!(res["attempt"], json!(1));
+    assert_eq!(
+        res["node"],
+        json!("messages"),
+        "the ORIGIN entry, not the node that was throttled: {res}"
+    );
+    assert_eq!(
+        res["queue"],
+        json!(gate_core::plan::owned_ingress_queue(
+            &h.application,
+            "g",
+            "messages"
+        )),
+        "{res}"
+    );
+
+    // Reporting the SAME item again is the same id, so the broker's dedup
+    // collapses it and nothing re-enters twice. Nothing here keeps a table.
+    let (status, again) = reenter(&h, &arrived, &got[0].transaction_id).await;
+    assert_eq!(status, 200, "{again}");
+    assert_eq!(again["transactionId"], res["transactionId"]);
+
+    let round2 = h.drain(&out, 1, Duration::from_secs(25)).await;
+    assert_eq!(round2.len(), 1, "exactly one item came back round");
+    assert_eq!(
+        round2[0].data["_gate"]["attempt"],
+        json!(1),
+        "the attempt has to survive every hop, or the next report starts again at one: {}",
+        round2[0].data
+    );
+
+    // ---- attempt 2 is the last one the declaration allows.
+    let (status, res) = reenter(&h, &round2[0].data, &round2[0].transaction_id).await;
+    assert_eq!(status, 200, "{res}");
+    assert_eq!(res["attempt"], json!(2));
+    let round3 = h.drain(&out, 1, Duration::from_secs(25)).await;
+    assert_eq!(round3.len(), 1);
+    assert_eq!(round3[0].data["_gate"]["attempt"], json!(2));
+
+    // ---- attempt 3 is refused: an unbounded re-entry is a livelock the
+    // limiter would be paying for.
+    let (status, res) = reenter(&h, &round3[0].data, &round3[0].transaction_id).await;
+    assert_eq!(status, 422, "{res}");
+    assert!(
+        res["error"].as_str().unwrap_or_default().contains("2"),
+        "the bound has to be named: {res}"
+    );
+    assert_eq!(
+        h.drain_for(&out, Duration::from_secs(4)).await.len(),
+        0,
+        "nothing re-entered past the bound"
+    );
+
+    h.cleanup("g").await;
+}
+
+/// A claim wider than the broker's op ceiling is chunked, not refused.
+///
+/// One `kv` call carries at most 256 ops (`024_kv.sql`, `C_MAX_OPS_HTTP`), and a
+/// `scopeBy` budget mints one counter per distinct value in the claim — so a
+/// node with a scoped budget and a large batch built a call the broker rejected
+/// outright with `kv_too_many_ops`. `charge` returned `Err`, the relay read that
+/// as "try again later", and the identical claim came back for ever: a
+/// livelocked partition with no dead letter and one repeating WARN.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn a_charge_wider_than_one_kv_call_is_chunked() {
+    use gate_server::budget::Charge;
+    let Some(h) = harness("manykeys").await else {
+        return;
+    };
+    // 400 distinct counters in one charge: over the 256-op ceiling by enough
+    // that a single call cannot be what happens.
+    let charges: Vec<Charge> = (0..400)
+        .map(|i| Charge {
+            key: format!("b:{}:manykeys:n:per:{i}", h.application),
+            max: 10,
+            ttl: 60,
+            delta: 1,
+            budget_id: "per".into(),
+        })
+        .collect();
+
+    let a = h.app.budgets.charge(&charges).await.expect(
+        "a claim wider than one kv call must be chunked, not sent as one call the broker refuses",
+    );
+    assert_eq!(a.applied.len(), 400, "index-aligned to the charges");
+    assert!(a.applied.iter().all(|ok| *ok), "all under their ceiling");
+    assert_eq!(a.post.len(), 400);
+    assert!(a.post.iter().all(|p| *p == Some(1)));
+    assert_eq!(
+        a.states.len(),
+        400,
+        "and the read rides along in every chunk, or the park deadline is lost for most keys"
+    );
+
+    // The refund of a chunked charge gives every counter back, exactly.
+    h.app.budgets.refund(&a.refunds(&charges)).await;
+    assert_eq!(h.counter(&charges[0].key).await, 0);
+    assert_eq!(h.counter(&charges[399].key).await, 0);
+
+    let _ = h
+        .app
+        .budgets
+        .clear(&charges.iter().map(|c| c.key.clone()).collect::<Vec<_>>())
+        .await;
+}
+
 // its SQL — and if a minor version ever changes one of them, this is the test
 // that says so instead of a throughput graph six months later.
 

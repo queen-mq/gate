@@ -23,9 +23,12 @@
 //!   `path-length` (the 3-hop wall), `relay-parallelism` — the admitted ring,
 //!   the merge relay and the smear that made a long path a vague one are all
 //!   gone with the counter-funnel.
-//! * `retry-cost`, `retry-entry`, `breach-when`, `breach-attempts` — see
-//!   `migrate`: a v1 document carrying `breach[]` is REFUSED with a pointer, not
-//!   quietly accepted with the policy dropped.
+//! * `retry-cost`, `retry-entry`, `breach-when` — the TRIGGER is gone with
+//!   `POST /v1/leases/ack`: re-entry is asked for now (`POST .../reenter`,
+//!   design §16.6), so there is no `when` to validate and no per-rule cost to
+//!   check. `breach-attempts` survives as `max-attempts-range`, because the
+//!   BOUND survived: `migrate` maps `breach[].maxAttempts` to the document's
+//!   `maxAttempts` rather than dropping the policy.
 //! * `kv-rolling` — kv was always a fixed window; that is now the only window
 //!   there is, and it is documented rather than warned about per budget.
 
@@ -449,6 +452,62 @@ fn one_partition_is_one_order_and_must_not_be_a_surprise() {
     };
     let w = gate_core::warnings_with(&airbnb(), &facts);
     assert!(rules(&w).contains(&"single-partition"), "{w:#?}");
+}
+
+/// And it fires for a queue GATE owns, which is the case it could not reach.
+///
+/// The rule used to read the raw document, where `ingress: true` carries no
+/// number: it measured zero partitions and said nothing — for the one kind of
+/// queue whose width Gate itself decides. It reads the compiled plan now, so a
+/// caller who asks for one partition and four workers is told what that means.
+#[test]
+fn one_partition_is_a_surprise_on_a_queue_gate_owns_too() {
+    let doc: GraphDoc = serde_json::from_str(
+        r#"{"application":"a","graph":"g","version":1,
+            "nodes":{"n":{"ingress":{"partitions":1},"concurrency":4,
+                          "budgets":[{"id":"b","count":100,"timeMs":1000}],
+                          "egress":"a.g.n.out"}},
+            "paths":[{"name":"main","nodes":["n"]}]}"#,
+    )
+    .unwrap();
+    let w = warnings(&doc);
+    assert!(rules(&w).contains(&"single-partition"), "{w:#?}");
+
+    // And the default width does NOT warn: sixteen partitions is what the
+    // compiler gives an owned queue, and the front door now spreads across them.
+    let wide: GraphDoc = serde_json::from_str(
+        r#"{"application":"a","graph":"g","version":1,
+            "nodes":{"n":{"ingress":true,"concurrency":4,
+                          "budgets":[{"id":"b","count":100,"timeMs":1000}],
+                          "egress":"a.g.n.out"}},
+            "paths":[{"name":"main","nodes":["n"]}]}"#,
+    )
+    .unwrap();
+    assert!(!rules(&warnings(&wide)).contains(&"single-partition"));
+}
+
+/// §12.2 clamps v1's `pacing.batch` to [1, 1000]; a declaration is REFUSED
+/// rather than clamped, because a caller who asks for 5000 and is silently given
+/// 1000 has no way to find out.
+///
+/// The ceiling exists because the claim is what sizes the kv call: a scoped
+/// budget mints one counter per distinct value in the batch, and `charge` chunks
+/// so the broker's 256-op limit cannot be exceeded — but an unbounded batch is
+/// an unbounded number of round trips holding one lease.
+#[test]
+fn a_batch_has_a_range_and_a_scoped_budget_is_why() {
+    let mut doc = airbnb();
+    doc.nodes.get_mut("photos").expect("photos").batch = Some(5000);
+    assert!(rules(&validate(&doc)).contains(&"batch-range"), "{doc:#?}");
+
+    doc.nodes.get_mut("photos").expect("photos").batch = Some(0);
+    assert!(rules(&validate(&doc)).contains(&"batch-range"));
+
+    doc.nodes.get_mut("photos").expect("photos").batch = Some(1000);
+    assert!(
+        !rules(&validate(&doc)).contains(&"batch-range"),
+        "the ceiling itself is legal"
+    );
 }
 
 #[test]

@@ -103,6 +103,81 @@ fn a_node_may_size_its_own_stage() {
     assert_eq!(p.stages[0].concurrency, 3);
 }
 
+/// A claim is sized to what one sub-window admits, and a PER-KEY budget has no
+/// say in it.
+///
+/// This is v1's `the_relay_window_is_the_nodes_own_rate_and_never_a_per_key_one`
+/// asked of the mechanism that replaced it. Both halves matter and both are
+/// measured defects:
+///
+/// * the CLAMP — settling a claim in full re-arms its partition in about seven
+///   milliseconds and settling a prefix of one costs the whole lease, so a claim
+///   that routinely exceeds what the window admits would pace itself by the
+///   lease, which is the thing this design set out to remove;
+/// * the SCOPED EXCLUSION — a node limited only per key has no rate of its own.
+///   *100 photo deletions per listing per week is not one item per six thousand
+///   seconds of node throughput.* Sizing on it collapsed the claim to a single
+///   item, and because the depth it was compared against was the whole node's,
+///   one item waiting anywhere stopped everything.
+#[test]
+fn a_claim_is_sized_by_the_nodes_own_rate_and_never_by_a_per_key_one() {
+    // Clamped: 40 per sub-window at cost 1 is 40, under the declared 200.
+    let tight = doc(json!({
+      "application": "a", "graph": "g", "version": 1,
+      "nodes": { "n": { "ingress": true,
+                        "budgets": [{ "id": "b", "count": 40, "timeMs": 1000 }],
+                        "egress": "out" } },
+      "paths": [{ "name": "main", "nodes": ["n"] }]
+    }));
+    assert_eq!(gate_core::compile(&tight).stages[0].batch, 40);
+
+    // At cost 4 an item, the same window admits ten of them.
+    let costly = doc(json!({
+      "application": "a", "graph": "g", "version": 1,
+      "nodes": { "n": { "ingress": true, "cost": { "path": "payload.w", "default": 4, "max": 40 },
+                        "budgets": [{ "id": "b", "count": 40, "timeMs": 1000 }],
+                        "egress": "out" } },
+      "paths": [{ "name": "main", "nodes": ["n"] }]
+    }));
+    assert_eq!(gate_core::compile(&costly).stages[0].batch, 10);
+
+    // The share is part of the ceiling, so it is part of the claim: half of a
+    // 40-per-second counter is twenty.
+    let shared = doc(json!({
+      "application": "a", "graph": "g", "version": 1,
+      "nodes": { "e1": { "ingress": true, "budgets": [{ "id": "x", "count": 1000, "timeMs": 1000 }] },
+                 "e2": { "ingress": true, "budgets": [{ "id": "y", "count": 1000, "timeMs": 1000 }] },
+                 "n":  { "budgets": [{ "id": "b", "count": 40, "timeMs": 1000 }], "egress": "out" } },
+      "paths": [{ "name": "top", "priority": 0, "share": 1.0,  "nodes": ["e1", "n"] },
+                { "name": "low", "priority": 1, "share": 0.5, "nodes": ["e2", "n"] }]
+    }));
+    let p = gate_core::compile(&shared);
+    let at = |path: &str| p.stage(path, "n").expect("stage").batch;
+    assert_eq!(at("top"), 40);
+    assert_eq!(at("low"), 20, "half the ceiling is half the claim");
+
+    // And a per-key budget is excluded: 100 per WEEK per listing must not shrink
+    // the claim to one item. The node's own 500-per-second budget is what sizes
+    // it, and 500 is above the declared 200, so the declaration stands.
+    let per_key = doc(json!({
+      "application": "a", "graph": "g", "version": 1,
+      "nodes": { "n": { "ingress": true,
+                        "budgets": [
+                          { "id": "node", "count": 500, "timeMs": 1000 },
+                          { "id": "per-listing", "count": 100, "timeMs": 604800000,
+                            "subWindows": 1, "scopeBy": "payload.listingId" }
+                        ],
+                        "egress": "out" } },
+      "paths": [{ "name": "main", "nodes": ["n"] }]
+    }));
+    assert_eq!(
+        gate_core::compile(&per_key).stages[0].batch,
+        gate_core::DEFAULT_BATCH,
+        "a batch of two hundred messages across two hundred different keys spends one unit of \
+         each: sizing on a per-key allowance is how a node stops draining"
+    );
+}
+
 /// `null` rather than infinity when nothing is moving: "we cannot say" is an
 /// honest answer and a product can render it, where a number that means for ever
 /// would be rendered as a number.

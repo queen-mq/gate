@@ -238,7 +238,10 @@ async fn push_into(
         ));
     }
 
-    let partition = body.partition.or(body.key);
+    let partition = body
+        .partition
+        .or(body.key)
+        .or_else(|| spread(rt.plan.queue(&queue).and_then(|q| q.partitions)));
     let res = st
         .queen
         .queue(&queue)
@@ -258,6 +261,34 @@ async fn push_into(
         "partition": partition,
         "cost": cost,
     }))
+}
+
+/// A partition for a push that named none, so a queue Gate owns is as wide as
+/// it was declared to be.
+///
+/// **This is what makes `ingress.partitions` real.** Partitions in queen are
+/// created by producers naming them — there is no partition field on
+/// `QueueOptions` and nothing to provision — so a Gate-owned ingress queue
+/// driven through this door with no `partition`/`key` had exactly ONE partition,
+/// the literal `Default`, while its stage ran `max(4, 16)` workers claiming one
+/// at a time. The declare response said sixteen, §15 B's throughput arithmetic
+/// assumed sixteen, and the `single-partition` guard-rail could not fire for the
+/// queues Gate owns.
+///
+/// Round-robin and not a hash: a push that names nothing has no ordering to
+/// preserve, and hashing something arbitrary would invent one. A push that DOES
+/// name a partition or a key still passes it through untouched, which is the
+/// property the whole passthrough design rests on — a producer's choice, never
+/// a hash Gate owns.
+///
+/// `None` for a user-owned queue: its width belongs to the application, and the
+/// producer that pushes to it is the application anyway.
+fn spread(partitions: Option<u32>) -> Option<String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = partitions.filter(|n| *n > 1)?;
+    let i = NEXT.fetch_add(1, Ordering::Relaxed) % n as u64;
+    Some(format!("p{i}"))
 }
 
 /// `Some(seconds)` when every unscoped counter of this node is already full.

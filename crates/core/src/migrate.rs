@@ -5,12 +5,12 @@
 //! was mapped or ignored** — never a silent success, and never a 422 for having
 //! been written last year.
 //!
-//! One document is refused rather than mapped: one carrying `breach[]`. The
-//! whole breach machinery hangs off `POST /v1/leases/ack`, which the settled
-//! architecture removes — the application consumes the egress queue with its own
-//! SDK and Gate never sees the outcome. Silently dropping a bounded-retry policy
-//! is the one migration failure that would be discovered by a livelock, so it is
-//! a refusal with a pointer instead.
+//! Nothing is refused. The one field that came close is `breach[]`, whose whole
+//! machinery hung off `POST /v1/leases/ack` — the application consumes the
+//! egress queue with its own SDK now and Gate never sees the outcome — and it
+//! was a refusal until re-entry shipped (design §16.6). It maps to
+//! `maxAttempts`, with a warning that says the bound survived and the TRIGGER
+//! did not: re-entry is something the caller asks for now.
 
 #![allow(deprecated)]
 
@@ -233,7 +233,13 @@ fn cost(c: &v1::Cost, node: &str, out: &mut Vec<Problem>) -> Cost {
     })
 }
 
-fn share_of(cap: &v1::CapPolicy, tightest_rate: f64, out: &mut Vec<Problem>, lane: &str) -> f64 {
+fn share_of(
+    cap: &v1::CapPolicy,
+    floor: f64,
+    tightest_rate: f64,
+    out: &mut Vec<Problem>,
+    lane: &str,
+) -> f64 {
     match cap {
         v1::CapPolicy::Ceiling => 1.0,
         v1::CapPolicy::Share(f) => f.clamp(0.01, 1.0),
@@ -253,20 +259,31 @@ fn share_of(cap: &v1::CapPolicy, tightest_rate: f64, out: &mut Vec<Problem>, lan
             s
         }
         v1::CapPolicy::CeilingMinusMeasured => {
-            let s = ((1.0 - 0.0f64.max(0.0)).min(1.0) - 0.0).max(0.05);
-            // A static share, rounded to the nearest 0.05. There is no meter to
-            // derive it from any more, and there does not need to be: one
-            // counter with N ceilings cannot oversubscribe, which is what the
-            // derived cap existed to prevent (measured: 7131 against a declared
-            // 5000 per ten seconds).
+            // §12.2: `share: 1 - floor`, rounded to the nearest 0.05.
+            //
+            // The lane's `floor` is the whole point of the mapping and it must
+            // be READ. `ceiling-minus-measured` meant "take what the higher
+            // lanes are not using, but never less than `floor` of the ceiling",
+            // so what it reserved for those higher lanes is `1 - floor`. Losing
+            // the floor made every derived lane a share of 1.00 — not
+            // oversubscription, since there is one counter, but the exact
+            // opposite of §3.6's promise: the top path's headroom stops being a
+            // reserve the moment the low path can spend the counter to the
+            // ceiling too.
+            //
+            // A static share, because there is no meter to derive it from any
+            // more, and there does not need to be: one counter with N ceilings
+            // cannot oversubscribe, which is what the derived cap existed to
+            // prevent (measured: 7131 against a declared 5000 per ten seconds).
+            let s = (1.0 - floor.clamp(0.0, 1.0)).clamp(0.05, 1.0);
             let rounded = ((s * 20.0).round() / 20.0).clamp(0.05, 1.0);
             out.push(w(
                 "lane-cap",
                 format!(
-                    "lane `{lane}`: `ceiling-minus-measured` mapped to a static share of \
-                     {rounded:.2}. There is no meter to derive it from any more, and there does \
-                     not need to be: one counter with N ceilings cannot oversubscribe, which is \
-                     what the derived cap existed to prevent."
+                    "lane `{lane}`: `ceiling-minus-measured` with floor {floor:.2} mapped to a \
+                     static share of {rounded:.2}. There is no meter to derive it from any more, \
+                     and there does not need to be: one counter with N ceilings cannot \
+                     oversubscribe, which is what the derived cap existed to prevent."
                 ),
             ));
             rounded
@@ -354,6 +371,7 @@ pub fn from_v1_target(spec: &v1::TargetSpec) -> Result<Migrated, Refused> {
             version: spec.version,
             nodes,
             paths,
+            max_attempts: None,
             counters: None,
         },
         warnings: out,
@@ -362,23 +380,8 @@ pub fn from_v1_target(spec: &v1::TargetSpec) -> Result<Migrated, Refused> {
 
 /// A v1 graph, mapped chain by chain.
 pub fn from_v1_graph(spec: &v1::GraphSpec) -> Result<Migrated, Refused> {
-    if !spec.breach.is_empty() {
-        return Err(Refused(format!(
-            "this graph declares {} breach rule(s), and v2 has nowhere to put them. The whole \
-             breach machinery hangs off `POST /v1/leases/ack`, which is gone: the application \
-             consumes the egress queue with its own SDK and Gate never sees the outcome. What \
-             replaces it is `POST /v1/apps/{}/graphs/{}/nodes/{{node}}/backoff`, which spends the \
-             node's window for `retryAfterSeconds` so EVERY path stops — a node-wide backoff \
-             rather than a per-item re-entry. Per-item bounded retry is an open question (design \
-             §16.6) and is not in this build: to migrate now, remove `breach` and re-push a \
-             throttled item to the ingress queue with your own idempotency key.",
-            spec.breach.len(),
-            spec.application,
-            spec.name
-        )));
-    }
-
     let mut out = Vec::new();
+    let max_attempts = breach_attempts(spec, &mut out);
     let mut nodes: BTreeMap<String, Node> = BTreeMap::new();
 
     for (name, n) in &spec.nodes {
@@ -512,10 +515,68 @@ pub fn from_v1_graph(spec: &v1::GraphSpec) -> Result<Migrated, Refused> {
             version: spec.version,
             nodes,
             paths,
+            max_attempts,
             counters: None,
         },
         warnings: out,
     })
+}
+
+/// v1's `breach[]`, mapped to `maxAttempts` and a warning that says what moved.
+///
+/// It used to be a REFUSAL, because the machinery hung off `POST /v1/leases/ack`
+/// and there was nowhere to put it. There is now (design §16.6, option 2), and
+/// §12.1 is explicit that a v1 document is *"accepted, mapped, and answered 200
+/// with warnings naming every field that was mapped or ignored — never a silent
+/// success and never a 422 for having been written last year"*.
+///
+/// What does NOT survive is the trigger. v1 watched the ack and re-entered by
+/// itself; v2 never sees an outcome, so `when` has no reader and the application
+/// has to ask. The warning has to say so plainly, because a caller who reads
+/// "mapped" as "still automatic" gets a graph that silently stops retrying.
+fn breach_attempts(spec: &v1::GraphSpec, out: &mut Vec<Problem>) -> Option<u32> {
+    if spec.breach.is_empty() {
+        return None;
+    }
+    let max = spec
+        .breach
+        .iter()
+        .map(|b| b.max_attempts)
+        .max()
+        .unwrap_or(0);
+    let foreign: Vec<&str> = spec
+        .breach
+        .iter()
+        .map(|b| b.retry_to.as_str())
+        .filter(|t| *t != "origin-entry")
+        .collect();
+    out.push(w(
+        "breach",
+        format!(
+            "{} breach rule(s) mapped to `maxAttempts: {max}`, and the TRIGGER did not come with \
+             them. v1 watched `POST /v1/leases/ack` and re-entered a throttled item by itself; \
+             that ack is gone — your consumers pop the egress queue with their own SDK and Gate \
+             never sees the outcome — so re-entry is something you ASK for now: \
+             `POST /v1/apps/{}/graphs/{}/reenter {{\"payload\": ..., \"txn\": ...}}`. It still \
+             goes back to the door the item came in at, still re-pays every budget on its path, \
+             still carries the attempt in its transaction id so a double report collapses on \
+             dedup, and is still bounded by `maxAttempts`. The aggregate half is \
+             `POST .../nodes/{{node}}/backoff`, which spends the node's window so every path \
+             stops at once.{}",
+            spec.breach.len(),
+            spec.application,
+            spec.name,
+            if foreign.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " `retryTo` is ignored: re-entry is always at the origin entry, never at `{}`.",
+                    foreign.join("`, `")
+                )
+            }
+        ),
+    ));
+    Some(max.max(1))
 }
 
 fn lane_paths(
@@ -560,7 +621,7 @@ fn lane_paths(
                 // to nobody.
                 1.0
             } else {
-                share_of(&l.cap, tightest_rate, out, &l.name)
+                share_of(&l.cap, l.floor, tightest_rate, out, &l.name)
             };
             Path {
                 name: l.name.clone(),
@@ -573,12 +634,13 @@ fn lane_paths(
 }
 
 fn pacing_warnings(lease_seconds: i64, node: &str, out: &mut Vec<Problem>) {
-    let _ = lease_seconds;
     out.push(w(
         "pacing",
         format!(
-            "node `{node}`: `pacing.leaseSeconds` is a no-op — the lease is a WORK lease now (30s, \
-             renewed), and pacing is the budget window. `pacing.batch` became the stage's batch."
+            "node `{node}`: `pacing.leaseSeconds: {lease_seconds}` is a no-op — the lease is a \
+             WORK lease now (GATE_LEASE_SECONDS, {} by default, renewed while a handler runs), \
+             and pacing is the budget window. `pacing.batch` became the stage's batch.",
+            crate::plan::DEFAULT_LEASE_SECONDS
         ),
     ));
 }

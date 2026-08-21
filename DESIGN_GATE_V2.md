@@ -1098,7 +1098,8 @@ silent success and never a 422 for having been written last year.
 | `edges[]` | → `paths` (each maximal chain is a path) | `` {k} edges mapped to {m} paths. `` |
 | `edges[].priority` | → the path's `priority` | none |
 | `consume[]` | → `egress` on the named nodes, queue defaulting to `{app}.{graph}.{node}.out` | `` node `{n}` is now a terminal with egress `{q}` — your consumers pop that queue directly with the SDK instead of `GET .../next`. `` |
-| `breach[]` | **not mapped** | see §16.6 — refused with a pointer, not ignored |
+| `breach[].maxAttempts` | → the document's `maxAttempts` | `` {k} breach rule(s) mapped to `maxAttempts: {n}`, and the TRIGGER did not come with them: v1 watched the ack, and re-entry is something you ask for now — `POST /v1/apps/{app}/graphs/{g}/reenter`. See §16.6. `` |
+| `breach[].when` / `retryTo` | ignored | named in the same warning: there is no ack to watch, and re-entry is always at the origin entry |
 | `egress` (the v1 free-text field) | kept as metadata | none |
 
 ### 12.3 What still needs a version bump
@@ -1192,7 +1193,7 @@ move.
 | `FULL_SWEEP_EVERY` | O | A backstop against a wrong depth answer; there is no depth answer. |
 | `MAX_IN_FLIGHT` | R, as `concurrency` | A per-stage worker count, defaulted from the source's partition count and declarable. The measured reason it was capped at 16 (128 pinned pops per cycle overran the broker's pop admission) does not apply to parked long-polls, but the default is still bounded. |
 | Rotation | O | Wildcard pop. |
-| Strict priority across legs, parallelism inside one | ? → O | §3.6. **Strict** priority is deliberately traded for an atomic reserve. Recorded here, not discovered later; §16.7 asks for the author's explicit assent since three live tests assert the strict behaviour. |
+| Strict priority across legs, parallelism inside one | ? → O | §3.6. **Strict** priority is deliberately traded for an atomic reserve. Recorded here, not discovered later; §16.7 asks for the author's explicit assent since FOUR live tests assert the strict behaviour (`priority_and_the_window_survive_the_relay_being_many_runners`, `a_leg_that_is_not_dry_holds_its_window_but_not_for_ever`, `a_wide_window_does_not_leak_priority_to_the_next_leg`, `priority_at_the_entrance_is_priority_in_fact`). |
 | Dry vs blocked, and the bounded hold on errored pops | O | The rule existed because a leg yielding its window to a lower priority on a *wrong* answer gave 188 of the first 300 items to priority 1. There is no window to yield. |
 | `drain()`: the pinned pop | O | §4.3. |
 | `forward()`: one transaction per destination partition | R | §6.4, sharpened: one transaction per **claim**, and a claim is one source partition (`partitions(1)`), pushing to the same-named destination partition. The measured lesson (33 txn/s shared vs 603 txn/s disjoint) is the reason for `partitions(1)` and is quoted at that line. |
@@ -1613,13 +1614,17 @@ Each of these is one `#[ignore]`d live test against a real broker:
   without a recorded reason is a regression nobody will be able to reconstruct, and this
   repository's whole test culture — *every test names the failure it is buying* — is the thing
   the rewrite is most at risk of losing.
-* The `airbnb` fixture validates clean and warns about nothing, in the new vocabulary. If it
-  cannot, the schema is wrong, not the fixture.
+* The `airbnb` fixture validates clean, and warns about exactly one thing: `fanout-multiplies`,
+  which is §11's own mandated notice that a fan-out doubles what the vendor sees. A fixture with
+  a fan-out that warned about nothing would mean the rule was not wired, so the test asserts the
+  exact warning set rather than an empty one. The warns-about-nothing case is the smaller §3.8
+  `rrl` fixture, which has no fan-out. If either cannot, the schema is wrong, not the fixture.
 
 ### F. Migration
 
 * Every v1 document in the store at `PUT` time is accepted, mapped, and answered 200 with
-  warnings — **except** one carrying `breach[]`, which is refused with §16.6's message.
+  warnings. Nothing is refused; `breach[]` keeps its bound as `maxAttempts` and is warned
+  about (§16.6).
 * A round trip through `migrate::from_v1` of each of the four v1 example documents in the
   README produces a document that validates clean.
 * Terminal queue names are unchanged across the migration for a graph declared with the
@@ -1720,10 +1725,26 @@ Three options, none of them chosen here:
 what v1's breach rules covered. But this is a feature deletion or a feature redesign either
 way, and it is the one item in this document that most needs the author's word.
 
+**Resolved as recommended, 2026-08-21: (2) and (1), both.** `POST /v1/apps/:app/graphs/:g/reenter`
+takes `{ payload, txn, path?, attempt?, partition? }` and pushes into the ingress queue of the
+FIRST node of that path — the origin entry, so the item re-pays every budget on its path rather
+than skipping the ones upstream of where it failed. The transaction id is
+`derive(txn, "r{attempt}")`, so a caller reporting one item twice collapses on the broker's
+dedup and nothing keeps a table. The bound is `maxAttempts` on the document (default 3, range
+1–20, rule `max-attempts-range`), counted in `_gate.attempt`, which every relay hop now carries
+forward rather than rewriting — without that line the count resets at the first hop and the
+bound is not a bound.
+
+What did NOT come back is the TRIGGER. v1 watched the ack and re-entered by itself; v2 never
+sees an outcome, so re-entry is something the application asks for. `migrate` therefore maps
+`breach[]` to `maxAttempts` with a warning saying exactly that, instead of refusing the
+document — which also puts §12.1's promise back ("never a 422 for having been written last
+year").
+
 ### 16.7 Strict priority is traded for an atomic reserve
 
 §3.6 and §13.3. v1's priority is *drain leg 0 to exhaustion before looking at leg 1*, asserted
-by three live tests, one of them measuring that a priority-0 item overtakes ~200 bulk items
+by FOUR live tests, one of them measuring that a priority-0 item overtakes ~200 bulk items
 within `window + 20` positions. v2's priority is *the low path refuses itself at its share*,
 which guarantees the reserve atomically but does **not** guarantee that a high-priority item
 overtakes a queued low-priority one — a low-priority message already in the interior queue is

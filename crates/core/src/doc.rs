@@ -69,6 +69,21 @@ pub struct GraphDoc {
 
     pub paths: Vec<Path>,
 
+    /// How many times one item may re-enter this graph at the door it came in
+    /// at — `POST /v1/apps/:app/graphs/:g/reenter`, design §16.6.
+    ///
+    /// This is the bounded half of v1's breach machinery. v1 counted attempts
+    /// itself, because it saw every outcome through `POST /v1/leases/ack`; v2
+    /// never sees an outcome, so the application reports a throttle and asks for
+    /// the re-entry. The BOUND is still Gate's, because an unbounded re-entry is
+    /// a livelock a limiter would be paying for.
+    #[serde(
+        default,
+        rename = "maxAttempts",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_attempts: Option<u32>,
+
     /// Opt-in per-graph counters stream (§10.3 of the design). Off by default,
     /// on purpose: observability is a thing you switch on, not a thing that runs
     /// whether or not anyone is looking. Prod, 2026-08-21: v1's always-on

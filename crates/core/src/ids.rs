@@ -33,9 +33,10 @@ use sha1::{Digest, Sha1};
 /// changing it changes every id this build computes, which is a dedup reset for
 /// every graph at once.
 ///
-/// This is RFC 4122's own `NameSpace_DNS`. Using a well-known constant rather
-/// than a private one is deliberate — an operator checking a value by hand can
-/// find the sixteen bytes written down somewhere other than this file.
+/// This is RFC 4122's own `NameSpace_X500` (`…b814`; `NameSpace_DNS` is
+/// `…b810`). Using a well-known constant rather than a private one is
+/// deliberate — an operator checking a value by hand can find the sixteen bytes
+/// written down somewhere other than this file.
 pub const NS_GATE: [u8; 16] = [
     0x6b, 0xa7, 0xb8, 0x14, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
 ];

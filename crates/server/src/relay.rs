@@ -986,13 +986,25 @@ async fn refund_for(ctx: &Ctx, msgs: &[Message], ledger: &Ledger) {
 /// admission bypass — the same trust model as any queen queue.
 pub fn stamp(data: &Value, st: &StageRuntime, dest_node: &str) -> Value {
     let mut out = data.clone();
-    let meta = json!({
+    let mut meta = json!({
         "graph": st.graph,
         "path": st.stage.path,
         "hop": st.stage.hop + 1,
         "node": dest_node,
         "at": crate::now_ms(),
     });
+    // `attempt` is the one field that survives a hop rather than being rewritten
+    // by it. It is set by `api::reenter` at the origin door, and if a relay
+    // dropped it the item would reach the egress queue looking brand new — so
+    // the next report would re-enter it as attempt 1, for ever. The bound in
+    // §16.6 is only a bound because this line carries the count.
+    if let Some(a) = data
+        .get(GATE_META)
+        .and_then(|g| g.get("attempt"))
+        .and_then(|a| a.as_u64())
+    {
+        meta["attempt"] = json!(a);
+    }
     // A payload that is not an object cannot carry the stamp. It is forwarded
     // as it is rather than wrapped: wrapping would change the shape the
     // application's own consumer reads, which is a breaking change Gate has no

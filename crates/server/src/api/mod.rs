@@ -18,6 +18,7 @@ pub mod console;
 pub mod data;
 pub mod declare;
 pub mod eta;
+pub mod reenter;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -166,6 +167,16 @@ fn routes() -> Router<Shared> {
         .route(
             "/v1/graphs/:graph/nodes/:node/eta",
             get(eta::graph_eta_default),
+        )
+        // ---- re-entry: the per-item half of what a vendor's 429 does now
+        // (design §16.6). The aggregate half is the breaker below.
+        .route(
+            "/v1/apps/:app/graphs/:graph/reenter",
+            post(reenter::graph_reenter),
+        )
+        .route(
+            "/v1/graphs/:graph/reenter",
+            post(reenter::graph_reenter_default),
         )
         // ---- the breaker, which is what a vendor's 429 does now.
         .route(

@@ -22,6 +22,14 @@ use crate::cost::ok_payload_path;
 use crate::doc::{ok_name, Confidence, Cost, GraphDoc, PathElem};
 use crate::plan::{self, Plan};
 
+/// The largest claim a node may ask for. §12.2's clamp on v1's `pacing.batch`,
+/// enforced as a refusal.
+pub const MAX_BATCH: u32 = 1000;
+
+/// The most re-entries a document may allow one item (§16.6). v1's
+/// `breach-attempts` policed the same number for the same reason.
+pub const MAX_ATTEMPTS_CEILING: u32 = 20;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Problem {
     pub rule: &'static str,
@@ -269,9 +277,48 @@ fn budgets(doc: &GraphDoc, plan: &Plan, out: &mut Vec<Problem>) {
     // budgets — one of them is a lie about the ceiling.
     let mut shared: HashMap<&str, (&str, &str, i64, i64, u32)> = HashMap::new();
 
+    // The re-entry bound (§16.6). v1's `breach[].maxAttempts` policed the
+    // same number under `breach-attempts`, and it is policed for the same
+    // reason: zero is a re-entry endpoint that always refuses, and a large
+    // one is a livelock the limiter pays for.
+    if let Some(n) = doc.max_attempts {
+        if !(1..=MAX_ATTEMPTS_CEILING).contains(&n) {
+            out.push(p(
+                "max-attempts-range",
+                format!(
+                    "`maxAttempts` is {n}; it must be between 1 and {MAX_ATTEMPTS_CEILING}. \
+                     Zero is a re-entry that always refuses, and an unbounded one is a \
+                     livelock this limiter would be paying for."
+                ),
+            ));
+        }
+    }
+
     for (name, node) in &doc.nodes {
         let Some(np) = plan.node(name) else { continue };
         cost_rules(name, &node.cost, out);
+
+        // §12.2 maps v1's `pacing.batch` to this, "clamped to [1, 1000]". A
+        // declaration is refused rather than clamped, because a caller who asks
+        // for 5000 and is silently given 1000 has no way to find out.
+        //
+        // There is a ceiling here at all because a claim is what sizes the kv
+        // call: `Budgets::charge` chunks so no batch can exceed the broker's
+        // 256-op limit, but a scoped budget still mints one key per distinct
+        // value in the claim, so an unbounded batch is an unbounded number of
+        // round trips holding one lease.
+        if let Some(b) = node.batch {
+            if !(1..=MAX_BATCH).contains(&b) {
+                out.push(p(
+                    "batch-range",
+                    format!(
+                        "node `{name}` declares batch {b}. It must be between 1 and {MAX_BATCH}: \
+                         a scoped budget mints one counter per distinct value in the claim, so \
+                         the claim size is also the width of the kv call that pays for it."
+                    ),
+                ));
+            }
+        }
 
         if node.budgets.is_empty() {
             out.push(p(
@@ -734,10 +781,17 @@ pub fn warnings_with(doc: &GraphDoc, facts: &ExternalFacts) -> Vec<Problem> {
             }
         }
         if let Some(q) = np.ingress_queue.as_deref() {
+            // The broker's answer first, then the RESOLVED plan — not the raw
+            // document. A queue Gate owns has a width whether or not the
+            // declaration named one (`DEFAULT_INGRESS_PARTITIONS`), and reading
+            // the document meant this rule could never fire for exactly those
+            // queues: `ingress: true` carries no number, so it measured zero and
+            // said nothing, for the one case where Gate itself decides.
             let partitions = facts
                 .queues
                 .get(q)
                 .map(|f| f.partitions)
+                .or_else(|| plan.queue(q).and_then(|qs| qs.partitions))
                 .or_else(|| node.ingress.as_ref().and_then(|i| i.partitions()))
                 .unwrap_or(0);
             let concurrency = plan

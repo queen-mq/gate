@@ -158,10 +158,16 @@ fn a_sharded_scoped_budget_becomes_one_counter_per_value() {
     assert_eq!(b.scope_by.as_deref(), Some("payload.entity"));
 }
 
-/// The one refusal. Silently dropping a bounded-retry policy is the migration
-/// failure that gets discovered by a livelock.
+/// `breach[]` keeps its BOUND and loses its trigger, and the warning has to say
+/// which is which.
+///
+/// It was a refusal until re-entry shipped (§16.6 option 2), because silently
+/// dropping a bounded-retry policy is the migration failure that gets discovered
+/// by a livelock. Now the bound has a home — `maxAttempts` on the document,
+/// enforced by `POST .../reenter` — and §12.1's promise applies again: mapped
+/// and warned about, never a 422 for having been written last year.
 #[test]
-fn a_document_carrying_breach_rules_is_refused_with_a_pointer() {
+fn breach_rules_keep_their_bound_and_say_that_the_trigger_moved() {
     let mut spec: v1::GraphSpec = serde_json::from_str(V1_GRAPH).unwrap();
     spec.breach.push(v1::BreachRule {
         when: v1::BreachWhen {
@@ -169,15 +175,91 @@ fn a_document_carrying_breach_rules_is_refused_with_a_pointer() {
             outcome: None,
         },
         retry_to: "origin-entry".into(),
-        max_attempts: 3,
+        max_attempts: 5,
     });
-    let err = migrate::from_v1_graph(&spec).unwrap_err();
-    assert!(err.0.contains("backoff"), "{}", err.0);
-    assert!(
-        err.0.contains("§16.6") || err.0.contains("16.6"),
-        "{}",
-        err.0
+    let m = migrate::from_v1_graph(&spec).expect("mapped, not refused");
+    assert_eq!(
+        m.doc.max_attempts,
+        Some(5),
+        "the bound is the half that survives"
     );
+    let detail = m
+        .warnings
+        .iter()
+        .find(|p| p.rule == "breach")
+        .map(|p| p.detail.clone())
+        .expect("named in a warning");
+    assert!(
+        detail.contains("reenter"),
+        "the caller has to be told where the trigger went: {detail}"
+    );
+    assert!(
+        detail.contains("backoff"),
+        "and that the aggregate half is the breaker: {detail}"
+    );
+    // The document it produces must still be a legal v2 document.
+    assert!(gate_core::validate(&m.doc).is_empty(), "{:#?}", m.doc);
+}
+
+/// The re-entry bound is per document, and an absent `breach[]` leaves it
+/// unstated rather than inventing one.
+#[test]
+fn a_document_without_breach_rules_states_no_bound() {
+    let spec: v1::GraphSpec = serde_json::from_str(V1_GRAPH).unwrap();
+    let m = migrate::from_v1_graph(&spec).unwrap();
+    assert_eq!(m.doc.max_attempts, None);
+    assert!(!rules(&m.warnings).contains(&"breach"));
+    assert_eq!(
+        gate_core::compile(&m.doc).max_attempts,
+        gate_core::plan::DEFAULT_MAX_ATTEMPTS
+    );
+}
+
+/// `ceiling-minus-measured` is `share: 1 - floor`, and the floor has to be READ.
+///
+/// It meant "take what the higher lanes are not using, but never less than
+/// `floor` of the ceiling", so what it RESERVED for the higher lanes is
+/// `1 - floor`. Mapping every derived lane to 1.00 is not oversubscription —
+/// there is one counter — but it is the exact opposite of the reserve §3.6
+/// promises: the top path's headroom stops being a reserve the moment the low
+/// path can spend the counter to the ceiling too.
+#[test]
+fn a_derived_lane_cap_maps_to_the_reserve_its_floor_asked_for() {
+    let spec: v1::TargetSpec = serde_json::from_str(
+        r#"{"application":"a","name":"t","version":1,
+            "budgets":[{"id":"b","cap":1000,"periodSeconds":10,"alignment":"calendar",
+                        "confidence":"inferred"}],
+            "lanes":[{"name":"urgent","cap":"ceiling","concurrency":4,"default":true},
+                     {"name":"bulk","cap":"ceiling-minus-measured","concurrency":4,"floor":0.3}],
+            "cost":{"field":"w","default":1,"max":1}}"#,
+    )
+    .unwrap();
+    let m = migrate::from_v1_target(&spec).unwrap();
+    let share = |name: &str| {
+        m.doc
+            .paths
+            .iter()
+            .find(|p| p.name == name)
+            .and_then(|p| p.share)
+            .unwrap_or(-1.0)
+    };
+    assert_eq!(
+        share("urgent"),
+        1.0,
+        "share-top: the first lane reaches all"
+    );
+    assert_eq!(
+        share("bulk"),
+        0.7,
+        "1 - floor, rounded to the nearest 0.05 — not 1.0, which is what a floor nobody read gives"
+    );
+    let detail = m
+        .warnings
+        .iter()
+        .find(|p| p.rule == "lane-cap")
+        .map(|p| p.detail.clone())
+        .expect("the resolved number is named");
+    assert!(detail.contains("0.70"), "{detail}");
 }
 
 /// v1's cost was an `f64`; `kv.incr`'s delta is an `i64` on this wire. Rounding

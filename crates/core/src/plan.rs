@@ -44,6 +44,18 @@ pub const DEFAULT_INGRESS_PARTITIONS: u32 = 16;
 /// ceiling.
 pub const DEFAULT_BATCH: u32 = 200;
 
+/// How many times an item may re-enter a graph when the declaration does not
+/// say. v1's `breach[].maxAttempts` default, kept.
+pub const DEFAULT_MAX_ATTEMPTS: u32 = 3;
+
+/// The work lease a stage holds, in seconds, when nothing overrides it.
+///
+/// Lives here rather than only in `gate-server`'s knobs because the v1 migration
+/// has to tell a caller what their `pacing.leaseSeconds` became, and a warning
+/// quoting a number the build does not use is worse than no warning. Kept in
+/// step with `knobs::Knobs::default().lease_seconds`, which is the authority.
+pub const DEFAULT_LEASE_SECONDS: i64 = 10;
+
 /// A budget declared `assumed` is arithmetic on a guess.
 ///
 /// v1 defined this, unit-tested it, documented it in the README — *"an assumed
@@ -93,6 +105,9 @@ pub struct Plan {
     pub stages: Vec<Stage>,
     pub queues: Vec<QueueSpec>,
     pub counters_window_seconds: Option<u32>,
+    /// The re-entry bound, resolved (design §16.6). See
+    /// [`DEFAULT_MAX_ATTEMPTS`].
+    pub max_attempts: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -597,6 +612,7 @@ pub fn compile_with(doc: &GraphDoc, opts: &PlanOpts) -> Plan {
         stages,
         queues,
         counters_window_seconds: doc.counters.as_ref().map(|c| c.window_seconds),
+        max_attempts: doc.max_attempts.unwrap_or(DEFAULT_MAX_ATTEMPTS).max(1),
     }
 }
 

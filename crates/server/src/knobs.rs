@@ -96,7 +96,10 @@ impl Default for Knobs {
         Self {
             batch: 200,
             concurrency: None,
-            lease_seconds: 10,
+            // Kept in step with `gate_core::plan::DEFAULT_LEASE_SECONDS`, which
+            // the v1 migration quotes back at a caller whose `pacing.leaseSeconds`
+            // became a no-op.
+            lease_seconds: gate_core::plan::DEFAULT_LEASE_SECONDS as i32,
             poll_timeout: Duration::from_secs(30),
             renew_lease: Duration::from_secs(3),
             max_park: Duration::from_secs(30),
