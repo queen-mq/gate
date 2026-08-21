@@ -293,7 +293,7 @@ async fn admit(ctx: &Ctx, window: &[Message], kinds: &[Kind]) {
         return;
     }
 
-    let mut parks = 0u32;
+    let mut parked = Duration::ZERO;
     loop {
         let charges = grouped.charges(work.len());
         let attempt = match ctx.budgets.charge(&charges).await {
@@ -343,7 +343,7 @@ async fn admit(ctx: &Ctx, window: &[Message], kinds: &[Kind]) {
                 settle(ctx, window, kinds, 0).await;
                 return;
             }
-            match park_or_release(ctx, &charges, &attempt, &mut parks).await {
+            match park_or_release(ctx, &charges, &attempt, &mut parked).await {
                 Wait::Retry => continue,
                 Wait::Release => return,
             }
@@ -364,7 +364,7 @@ async fn admit(ctx: &Ctx, window: &[Message], kinds: &[Kind]) {
                         // Treat it as `n == 0`: an unbounded retry loop against
                         // a contended counter is how a limiter turns into a
                         // spin.
-                        match park_or_release(ctx, &prefix, &a, &mut parks).await {
+                        match park_or_release(ctx, &prefix, &a, &mut parked).await {
                             Wait::Retry => break,
                             Wait::Release => return,
                         }
@@ -429,7 +429,7 @@ async fn park_or_release(
     ctx: &Ctx,
     charges: &[Charge],
     attempt: &crate::budget::Attempt,
-    parks: &mut u32,
+    parked: &mut Duration,
 ) -> Wait {
     let st = &ctx.st;
     let k = knobs();
@@ -448,8 +448,13 @@ async fn park_or_release(
         .max()
         .unwrap_or(0);
 
-    if wait_ms <= k.park_threshold.as_millis() as i64 && *parks < k.max_parks {
-        *parks += 1;
+    let wait = Duration::from_millis(wait_ms.max(0) as u64);
+    // One comparison, and it is the whole rule: park while this handler can
+    // afford to keep holding the claim. There is no separate cutoff on the
+    // length of a single wait, because the measurement below says releasing
+    // costs about a minute — so a wait is worth parking through whenever the
+    // claim can be held that long, and worth releasing only when it cannot.
+    if *parked + wait <= k.max_park {
         st.counters.parked.fetch_add(1, Ordering::Relaxed);
         // The jitter is not decoration. Every worker refused in the same
         // sub-window reads the SAME `expiresAt` and would otherwise stampede the
@@ -457,6 +462,7 @@ async fn park_or_release(
         // incr/s and a lock convoy.
         let jitter = jitter_ms(wait_ms);
         let sleep = Duration::from_millis((wait_ms + jitter) as u64);
+        *parked += sleep;
         tokio::select! {
             _ = tokio::time::sleep(sleep) => Wait::Retry,
             // A redeclare must not wait out a park.
@@ -486,10 +492,11 @@ async fn park_or_release(
         // retry budget, so pacing with one would dead-letter work that is
         // merely waiting. That is the line that gives Gate a working DLQ back.
         st.counters.released.fetch_add(1, Ordering::Relaxed);
-        if *parks >= k.max_parks {
+        if *parked >= k.max_park {
             tracing::warn!(
-                stage = %st.key(), parks = *parks, wait_ms,
-                "parked to the limit and still refused; releasing the batch"
+                stage = %st.key(), parked_ms = parked.as_millis(), wait_ms,
+                "held this claim to the parking budget and is still refused; releasing it, which \
+                 costs about a minute before it is offered again"
             );
         }
         Wait::Release

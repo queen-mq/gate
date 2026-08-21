@@ -435,8 +435,7 @@ higher `version`, resume.
 | `GATE_STAGE_CONCURRENCY` | `max(4, source partitions)` | workers per stage |
 | `GATE_LEASE_SECONDS` | 30 | a **work** lease, renewed while a handler runs |
 | `GATE_POLL_TIMEOUT_SECONDS` | 30 | the parked long-poll window |
-| `GATE_PARK_THRESHOLD_MS` | 1500 | park below it, release above it |
-| `GATE_MAX_PARKS` | 3 | in-handler parks before releasing |
+| `GATE_MAX_PARK_MS` | 30000 | how long a handler may hold its claim waiting for a window; past it, it releases |
 | `GATE_RECONCILE_SECONDS` | 15 | how often a replica re-reads the store |
 | `PG_HOST` … | — | optional history |
 

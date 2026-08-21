@@ -20,7 +20,7 @@ pub struct Knobs {
     /// A **work** lease, not a pacing quantum. v1's was one second because the
     /// lease WAS the pacing; here the budget window is the pacing and the lease
     /// only has to outlive a handler — a charge, a transaction, and up to
-    /// `max_parks × park_threshold` of parking, which renewal covers anyway.
+    /// `max_park` of parking, which renewal covers anyway.
     ///
     /// Ten and not thirty, for a measured reason. Settling a claim IN FULL
     /// re-arms its partition in about seven milliseconds; settling a PREFIX of
@@ -55,12 +55,30 @@ pub struct Knobs {
     pub poll_timeout: Duration,
     /// How often a held claim is renewed while the handler is parked in-line.
     pub renew_lease: Duration,
-    /// Park below this, release above it. Just above the one-second sub-window
-    /// floor, so an ordinary rotation always parks rather than releasing.
-    pub park_threshold: Duration,
-    /// In-handler parks before the handler gives up and releases. An unbounded
-    /// park loop is a worker that never notices its graph was redeclared.
-    pub max_parks: u32,
+    /// How long one handler may hold its claim across in-handler parks before
+    /// it gives up and releases.
+    ///
+    /// **This is the whole park-or-release rule**, and it retires both of the
+    /// design's knobs for it — `GATE_MAX_PARKS`, a count, which bounds nothing
+    /// an operator cares about; and `GATE_PARK_THRESHOLD_MS`, a cutoff on the
+    /// length of one wait, which asks the wrong question. The right question is
+    /// "can I afford to hold this claim that long", and the answer is one
+    /// comparison: park while `parked + wait <= max_park`, release otherwise.
+    ///
+    /// Releasing costs about a MINUTE, not a lease (see
+    /// `relay::park_or_release`). Sixteen workers on a node with a one-second
+    /// window means fifteen of them find the counter full on every rotation; at
+    /// three parks they would each release and strand a whole claim for a
+    /// minute, and the node's throughput would collapse to one window's worth
+    /// per minute per partition. With thirty seconds of parking they wait their
+    /// turn instead, at one second a turn.
+    ///
+    /// The original reason for a small bound — "a worker that never notices its
+    /// graph was redeclared" — does not apply: every park is a `tokio::select!`
+    /// against the stage's cancel token, so a redeclare interrupts one
+    /// immediately. What the bound really buys is that a claim is not held for
+    /// ever by a handler waiting on a counter nobody is refilling.
+    pub max_park: Duration,
     /// Retries of the prefix charge when another worker takes the headroom
     /// between the two calls. An unbounded retry loop against a contended
     /// counter is how a limiter turns into a spin.
@@ -81,8 +99,7 @@ impl Default for Knobs {
             lease_seconds: 10,
             poll_timeout: Duration::from_secs(30),
             renew_lease: Duration::from_secs(3),
-            park_threshold: Duration::from_millis(1500),
-            max_parks: 3,
+            max_park: Duration::from_secs(30),
             max_prefix_retries: 2,
             retry_limit: 3,
         }
@@ -111,10 +128,9 @@ pub fn knobs() -> &'static Knobs {
                 env_u32("GATE_POLL_TIMEOUT_SECONDS").unwrap_or(30).max(1) as u64,
             ),
             renew_lease: d.renew_lease,
-            park_threshold: Duration::from_millis(
-                env_u32("GATE_PARK_THRESHOLD_MS").unwrap_or(1500) as u64,
-            ),
-            max_parks: env_u32("GATE_MAX_PARKS").unwrap_or(d.max_parks),
+            max_park: env_u32("GATE_MAX_PARK_MS")
+                .map(|n| Duration::from_millis(n as u64))
+                .unwrap_or(d.max_park),
             max_prefix_retries: d.max_prefix_retries,
             retry_limit: env_u32("GATE_RETRY_LIMIT")
                 .map(|n| n as i32)

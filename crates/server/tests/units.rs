@@ -128,14 +128,16 @@ fn a_drain_estimate_without_a_rate_says_so() {
 fn the_knobs_default_to_what_the_design_says() {
     let k = gate_server::knobs::Knobs::default();
     assert_eq!(k.batch, 200, "the per-claim batch");
-    assert_eq!(k.lease_seconds, 30, "a WORK lease, not a pacing quantum");
+    assert_eq!(
+        k.lease_seconds, 10,
+        "a WORK lease, not a pacing quantum — and short, because it is what a deferred tail waits"
+    );
     assert_eq!(k.poll_timeout.as_secs(), 30, "the parked long-poll window");
     assert_eq!(
-        k.park_threshold.as_millis(),
-        1500,
-        "just above the one-second sub-window floor, so an ordinary rotation always parks"
+        k.max_park.as_secs(),
+        30,
+        "a TIME budget, not a count of parks: releasing costs about a minute, so a worker waiting          its turn on a one-second window must be able to wait more than three of them"
     );
-    assert_eq!(k.max_parks, 3);
     assert_eq!(
         k.retry_limit, 3,
         "the DLQ is back: v1 had to disarm it because it paced by nacking"
