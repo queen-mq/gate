@@ -35,13 +35,17 @@ no rotation cursor, no meter loop, no state document.
 * **Prod, one hour.** The previous design made ~275,000 "is there work?" calls to
   move messages **963** times — 285 polls per relay. Nothing was broken; that is
   what a polling data plane costs while idle, and idle is most of the time. An
-  idle graph here costs `workers ÷ poll_timeout` pops a second and nothing else —
-  no depth probe, no state read, no meter tick. Measured on a seven-stage graph
-  with fifty-six parked polls: **112 broker requests in sixty seconds, or 6,720
-  an hour** — exactly what the formula predicts, and **forty-one times less**
-  than v1. Both knobs move it further: `GATE_POLL_TIMEOUT_SECONDS` is paid in
-  shutdown latency, `GATE_STAGE_CONCURRENCY` in how many partitions a stage
-  drains at once.
+  idle graph here costs `stages × workers × replicas ÷ poll_timeout` pops a
+  second and nothing else — no depth probe, no state read, no meter tick. And
+  the workers come from the BUDGET, not from the partition count: a limiter
+  never needs to drain faster than it admits, so a stage whose ceiling is 200
+  items a second gets one lane however many partitions the ordering is spread
+  over. The three graphs we run — sixteen stages, caps from 1.7 to 400 items a
+  second — are **sixteen parked polls per replica, about 1,900 an hour**,
+  against v1's 275,000. Three
+  knobs move it further: `GATE_POLL_TIMEOUT_SECONDS` is paid in shutdown
+  latency, `GATE_LANE_CAPACITY` in how much of a burst one lane absorbs, and
+  `GATE_STAGE_CONCURRENCY` overrides the derivation outright.
 * **Bench, 32-core VM.** The old counter-funnel relay topped out at **2.8k items/s**
   with tuple lock waits at 96–100%, because every admission was a write transaction
   on one partition row. A `txnload` with **disjoint lanes** — the shape this design
@@ -466,7 +470,8 @@ higher `version`, resume.
 | `GATE_PUBLIC_BIND` | — | the console, sign-in required |
 | `GATE_KV_NAMESPACE` | `gate` | where the counters and documents live |
 | `GATE_STAGE_BATCH` | 200 | the per-claim batch; also the divisor on the counter's traffic |
-| `GATE_STAGE_CONCURRENCY` | `max(4, source partitions)` | workers per stage |
+| `GATE_STAGE_CONCURRENCY` | derived, see `GATE_LANE_CAPACITY` | workers per stage, overriding the derivation |
+| `GATE_LANE_CAPACITY` | 1000 | what one lane drains, items/s. `workers = clamp(ceil(cap_rate / this), 1, partitions)` |
 | `GATE_LEASE_SECONDS` | 30 | a **work** lease, renewed while a handler runs |
 | `GATE_POLL_TIMEOUT_SECONDS` | 30 | the parked long-poll window |
 | `GATE_MAX_PARK_MS` | 30000 | how long a handler may hold its claim waiting for a window; past it, it releases |

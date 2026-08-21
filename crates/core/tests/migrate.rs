@@ -343,3 +343,38 @@ fn three_real_v1_graphs_migrate_into_documents_this_build_accepts() {
         }
     }
 }
+
+/// The three real graphs derive **one** worker per stage — which is the number
+/// three doc surfaces quote, so it is pinned here rather than left to drift.
+///
+/// These documents are the whole reason the rule changed. Every node in them
+/// declares `lanes[].concurrency: 8` and partitions in the dozens, so the old
+/// `max(4, partitions)` parked 128 consumers across sixteen stages; the tightest
+/// ceiling any of them actually admits is 400 items a second and the loosest 1.7,
+/// which one lane of `LANE_CAPACITY` covers with room to spare.
+///
+/// If this fails because a graph grew a stage, update the count. If it fails
+/// because a stage wants more than one lane, that is a real ceiling change and
+/// the idle-cost note in `README.md`, `DESIGN_GATE_V2.md` §15A and
+/// `knobs::Knobs::poll_timeout` all quote the old one.
+#[test]
+fn the_three_real_graphs_derive_one_worker_per_stage() {
+    let raw = include_str!("testdata/v1_channel_go_graphs.json");
+    let graphs: std::collections::BTreeMap<String, v1::GraphSpec> =
+        serde_json::from_str(raw).expect("the fixture must parse as v1 documents");
+
+    let mut total = 0;
+    for (name, spec) in &graphs {
+        let m = migrate::from_v1_graph(spec).expect("mapped");
+        let plan = gate_core::compile(&m.doc);
+        for s in &plan.stages {
+            assert_eq!(
+                s.concurrency, 1,
+                "`{name}`/`{}`/`{}` derived {} workers, not one",
+                s.path, s.node, s.concurrency
+            );
+            total += 1;
+        }
+    }
+    assert_eq!(total, 16, "sixteen stages across airbnb, vrbo and google");
+}

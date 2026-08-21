@@ -56,6 +56,43 @@ pub const DEFAULT_MAX_ATTEMPTS: u32 = 3;
 /// step with `knobs::Knobs::default().lease_seconds`, which is the authority.
 pub const DEFAULT_LEASE_SECONDS: i64 = 10;
 
+/// What one consumer lane drains, in items per second, for the purpose of
+/// deciding how many lanes a stage needs.
+///
+/// **A rate limiter's drain never needs to exceed its own cap.** Workers used to
+/// come from the partition count, which is a THROUGHPUT rule: size the consumer
+/// to the width of the queue, because the queue is what bounds you. Here it is
+/// not — the budget is. Admissible work is bounded by construction, so a stage
+/// whose ceiling is 200 items a second needs one lane, not sixteen, however many
+/// partitions the ordering happens to be spread over. Stage, measured: about 200
+/// gate consumers parked for a system whose largest declared budget is 400/s —
+/// one lane's worth, with the rate to spare.
+///
+/// One thousand, and deliberately pessimistic. The bench measured 3–13k items/s
+/// per lane batched, so this keeps at least 3x headroom against the low end.
+///
+/// **The burst, which is the case worth checking.** The worst a stage can be
+/// handed at once is a full window released in one go — `count` tokens. One lane
+/// at this rate drains a 2000-token window in about two seconds, well inside any
+/// pacing cadence, and the batch is the divisor on everything the lane actually
+/// does: at batch 200 that burst is ten claims.
+///
+/// Partitions do **not** shrink to match. They are the ordering identity — one
+/// partition is one order, end to end — and a single wildcard consumer drains
+/// all of them, one per claim, in randomised order under `FOR UPDATE SKIP
+/// LOCKED`. Fewer lanes than partitions costs latency at saturation and nothing
+/// else; fewer PARTITIONS would cost ordering, which is not available.
+pub const LANE_CAPACITY: u32 = 1000;
+
+/// The id the v1 migration gives the budget it invents for a node that declared
+/// none — a "pass-through" of a million a second, which exists only to satisfy
+/// `node-unscoped-budget` and limits nothing.
+///
+/// Named here because [`fitting_workers`] has to ignore it: it is a sentinel,
+/// not a measurement, and dividing it by a lane's capacity would ask for a
+/// thousand lanes for a node that paces nothing.
+pub const PASSTHROUGH_BUDGET_ID: &str = "passthrough";
+
 /// A budget declared `assumed` is arithmetic on a guess.
 ///
 /// v1 defined this, unit-tested it, documented it in the README — *"an assumed
@@ -72,8 +109,11 @@ pub const ASSUMED_FACTOR: f64 = 0.7;
 pub struct PlanOpts {
     pub batch: u32,
     /// A fleet-wide override for the per-stage worker count. `None` leaves the
-    /// derived default, which is `max(4, partitions of the source)`.
+    /// derived default — see [`fitting_workers`].
     pub concurrency: Option<u32>,
+    /// What one consumer lane can drain, in items per second. See
+    /// [`LANE_CAPACITY`].
+    pub lane_capacity: u32,
     /// Partition counts observed at the broker, by queue name. Empty in a pure
     /// test; filled at declare time for user-owned ingress queues, whose width
     /// Gate reads rather than chooses.
@@ -87,6 +127,7 @@ impl Default for PlanOpts {
         Self {
             batch: DEFAULT_BATCH,
             concurrency: None,
+            lane_capacity: LANE_CAPACITY,
             partitions: BTreeMap::new(),
             assumed_factor: 1.0,
         }
@@ -584,7 +625,9 @@ pub fn compile_with(doc: &GraphDoc, opts: &PlanOpts) -> Plan {
                     concurrency: node_doc
                         .and_then(|n| n.concurrency)
                         .or(opts.concurrency)
-                        .unwrap_or_else(|| partitions_hint.max(4))
+                        .unwrap_or_else(|| {
+                            fitting_workers(np, share, partitions_hint, opts.lane_capacity)
+                        })
                         .max(1),
                     destinations,
                 });
@@ -727,6 +770,52 @@ fn fitting_batch(np: &NodePlan, share: f64, declared: u32) -> u32 {
         Some(n) => declared.min(n.clamp(1, u32::MAX as i64) as u32),
         None => declared,
     }
+}
+
+/// How many workers one stage needs, given what it is allowed to admit.
+///
+/// ```text
+/// workers = clamp(ceil(cap_rate_per_sec / LANE_CAPACITY), 1, partitions)
+/// ```
+///
+/// `cap_rate_per_sec` is this stage's BINDING budget — the tightest of them,
+/// measured as what one sub-window admits over how long that sub-window is,
+/// because that is what is actually enforced — with this path's `share` applied,
+/// because that is this path's own ceiling on the shared counter.
+///
+/// **This replaces `max(4, partitions)`, which was the wrong rule for this
+/// service.** Sizing a consumer to the width of its queue is a throughput rule:
+/// it assumes the queue is what bounds you. In a rate limiter the BUDGET bounds
+/// you, by construction, so lanes beyond what the cap can feed are parked polls
+/// that can never have work. Stage, measured: ~200 gate consumers for a system
+/// whose largest declared budget is 400 items a second.
+///
+/// Only the UNSCOPED budgets, for the same reason `fitting_batch` uses them: a
+/// per-key budget is not a rate the node has. *100 photo deletions per listing
+/// per week* says nothing about how fast the node drains.
+///
+/// And not the migration's [`PASSTHROUGH_BUDGET_ID`], which is a sentinel and
+/// not a measurement: a million a second means "this node limits nothing", and
+/// dividing it by a lane would ask for a thousand lanes for a class node that
+/// paces no traffic of its own. A node left with no rate at all gets ONE worker,
+/// which is the honest answer — what such a node forwards is bounded by the
+/// tight node downstream of it, not by itself.
+///
+/// Clamped UP to `partitions` and never above it: a lane with no partition to
+/// claim finds nothing, for ever. Clamped DOWN to one: a stage with no workers
+/// is a queue nobody drains.
+fn fitting_workers(np: &NodePlan, share: f64, partitions: u32, lane_capacity: u32) -> u32 {
+    let capacity = lane_capacity.max(1) as f64;
+    let tightest = np
+        .unscoped()
+        .filter(|b| b.id != PASSTHROUGH_BUDGET_ID)
+        .map(|b| b.max_for(share) as f64 / b.window_sub_seconds.max(1) as f64)
+        .fold(f64::INFINITY, f64::min);
+    if !tightest.is_finite() {
+        return 1;
+    }
+    let want = (tightest / capacity).ceil().max(1.0);
+    (want as u32).clamp(1, partitions.max(1))
 }
 
 fn partitions_hint(opts: &PlanOpts, source: &str, node: Option<&Node>) -> u32 {

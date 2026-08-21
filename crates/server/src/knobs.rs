@@ -14,9 +14,14 @@ pub struct Knobs {
     /// ONCE per batch, so this is also the divisor on the shared counter's
     /// traffic.
     pub batch: u32,
-    /// Fleet-wide worker-count override. `None` leaves the derived default of
-    /// `max(4, partitions of the source)`.
+    /// Fleet-wide worker-count override. `None` leaves the derived default —
+    /// `gate_core::plan::fitting_workers`, which divides the stage's own ceiling
+    /// by `lane_capacity`.
     pub concurrency: Option<u32>,
+    /// What one consumer lane drains, items per second, for deciding how many
+    /// lanes a stage needs. `GATE_LANE_CAPACITY`; see
+    /// `gate_core::plan::LANE_CAPACITY` for why it is a thousand.
+    pub lane_capacity: u32,
     /// A **work** lease, not a pacing quantum. v1's was one second because the
     /// lease WAS the pacing; here the budget window is the pacing and the lease
     /// only has to outlive a handler — a charge, a transaction, and up to
@@ -43,15 +48,34 @@ pub struct Knobs {
     ///     stages × concurrency ÷ poll_timeout   pops per second
     /// ```
     ///
-    /// and nothing else — no depth probe, no state read, no meter tick. For the
-    /// flagship seven-stage graph at the derived default of sixteen workers that
-    /// is 112 parked polls, or **~13,400 pops an hour**: twenty times less than
-    /// the ~275,000 "is there work?" calls v1 was measured making in prod, and
-    /// not the zero the design's acceptance criterion asks for. Both knobs move
-    /// it and both cost something: `GATE_POLL_TIMEOUT_SECONDS` is paid in
-    /// shutdown latency (the pop does not notice a cancel until it returns), and
-    /// `GATE_STAGE_CONCURRENCY` is paid in how many partitions a stage can drain
-    /// at once. `gate-bench idle` measures the number rather than asserting it.
+    /// and nothing else — no depth probe, no state read, no meter tick.
+    ///
+    /// The worker count is DERIVED from the budget now
+    /// (`plan::fitting_workers`), and that is what makes this number small. The
+    /// three graphs we actually run — sixteen stages across airbnb, vrbo and
+    /// google, with caps between 1.7 and 400 items a second — derive **one**
+    /// worker per stage. Sixteen parked polls per replica, or about **1,900 pops
+    /// an hour**, against the ~275,000 "is there work?" calls v1 was measured
+    /// making in prod: a factor of a hundred and forty.
+    ///
+    /// It used to be `max(4, partitions)`, which is a throughput rule and the
+    /// wrong one here — the same sixteen stages parked 128 consumers for
+    /// ceilings a single lane covers with room to spare. Fleet-wide, the number
+    /// of consumers PARKED at any instant is
+    ///
+    /// ```text
+    ///     stages × derived_workers × replicas
+    /// ```
+    ///
+    /// so a graph that genuinely admits tens of thousands a second still gets
+    /// its lanes, up to the partition count — this shrinks the idle floor
+    /// without capping a graph that is actually busy.
+    ///
+    /// Three knobs move it and each costs something: `GATE_POLL_TIMEOUT_SECONDS`
+    /// is paid in shutdown latency (the pop does not notice a cancel until it
+    /// returns), `GATE_LANE_CAPACITY` is paid in how much of a burst one lane
+    /// must absorb, and `GATE_STAGE_CONCURRENCY` overrides the derivation
+    /// outright. `gate-bench idle` measures the number rather than asserting it.
     pub poll_timeout: Duration,
     /// How often a held claim is renewed while the handler is parked in-line.
     pub renew_lease: Duration,
@@ -96,6 +120,7 @@ impl Default for Knobs {
         Self {
             batch: 200,
             concurrency: None,
+            lane_capacity: gate_core::plan::LANE_CAPACITY,
             // Kept in step with `gate_core::plan::DEFAULT_LEASE_SECONDS`, which
             // the v1 migration quotes back at a caller whose `pacing.leaseSeconds`
             // became a no-op.
@@ -119,6 +144,9 @@ pub fn knobs() -> &'static Knobs {
     KNOBS.get_or_init(|| {
         let d = Knobs::default();
         Knobs {
+            lane_capacity: env_u32("GATE_LANE_CAPACITY")
+                .filter(|n| *n > 0)
+                .unwrap_or(d.lane_capacity),
             batch: env_u32("GATE_STAGE_BATCH")
                 .unwrap_or(d.batch)
                 .clamp(1, 1000),
