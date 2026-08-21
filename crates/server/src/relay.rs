@@ -1130,6 +1130,46 @@ mod tests {
         assert_eq!(obj["_gate"]["hop"], 1);
     }
 
+    /// The cursor commits to the HIGHEST position acked, so a settle with a gap
+    /// in it would commit past the gap and DROP what was in it. This is the
+    /// function that makes that impossible.
+    #[test]
+    fn a_settle_is_a_true_prefix_of_the_claim() {
+        use Kind::*;
+        // Foreign, work, foreign, work — admitting one work item settles up to
+        // and including the foreign message that follows it, and stops at the
+        // work item that was not admitted.
+        let kinds = vec![Foreign, Work, Foreign, Work, Work];
+        assert_eq!(
+            settle_end(&kinds, 0),
+            1,
+            "the leading foreign run, and no more"
+        );
+        assert_eq!(
+            settle_end(&kinds, 1),
+            3,
+            "one work item, and the foreign one behind it"
+        );
+        assert_eq!(settle_end(&kinds, 2), 4);
+        assert_eq!(settle_end(&kinds, 3), 5, "everything");
+    }
+
+    /// A claim that is entirely another path's is settled whole: it costs one
+    /// ack per message and it is what stops the cursor of a group on a shared
+    /// interior queue from standing still.
+    #[test]
+    fn a_claim_of_only_foreign_messages_settles_whole() {
+        let kinds = vec![Kind::Foreign, Kind::Foreign];
+        assert_eq!(settle_end(&kinds, 0), 2);
+    }
+
+    /// Nothing admitted and a work item at the head: nothing to settle, so the
+    /// handler parks or releases instead of committing an empty transaction.
+    #[test]
+    fn nothing_admitted_at_the_head_settles_nothing() {
+        assert_eq!(settle_end(&[Kind::Work, Kind::Foreign], 0), 0);
+    }
+
     #[test]
     fn the_jitter_stays_inside_its_span() {
         for wait in [0i64, 100, 1000, 100_000] {
