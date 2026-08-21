@@ -1118,6 +1118,85 @@ async fn a_refund_cannot_credit_a_window_it_never_charged() {
     let _ = budgets.clear(&[key]).await;
 }
 
+/// v1's push body carried `cost` beside the payload, and it still decides what
+/// an item spends.
+///
+/// v2 reads a cost from the payload at the node's declared `cost.path`, because
+/// a user-owned ingress queue has no envelope to put one in. A v1 caller sends
+/// it at the top level — §12.1 says the endpoint shapes do not move — and
+/// ignoring it charges every one of their items the declared default instead of
+/// what they asked for: a limiter quietly enforcing the wrong limit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn a_v1_push_body_still_says_what_an_item_costs() {
+    let Some(h) = harness("pushcost").await else {
+        return;
+    };
+    let out = egress_of("pushcost", &h.application);
+    let doc = json!({
+      "version": 1,
+      "nodes": {
+        "n": {
+          "ingress": true,
+          "egress": out,
+          "cost": { "path": "payload.httpCost", "default": 1, "max": 50 },
+          "budgets": [{ "id": "b", "count": 1000, "timeMs": 3600000, "subWindows": 1 }]
+        }
+      },
+      "paths": [{ "name": "main", "nodes": ["n"] }]
+    });
+    let (status, body) = h.put_graph("g", doc).await;
+    assert_eq!(status, 200, "declare: {body}");
+
+    // The v1 shape: `cost` at the top level, nothing in the payload.
+    let (status, res) = h
+        .push(
+            "g",
+            "n",
+            json!({ "op": "test", "partition": "p0", "cost": 7, "payload": { "n": 1 } }),
+        )
+        .await;
+    assert_eq!(status, 200, "{res}");
+    assert_eq!(
+        res["cost"],
+        json!(7),
+        "the door must answer what it charged"
+    );
+
+    assert_eq!(h.drain(&out, 1, Duration::from_secs(25)).await.len(), 1);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        h.counter(&h.key("g", "n", "b")).await,
+        7,
+        "the counter must hold what the caller declared, not the default of 1"
+    );
+
+    // A payload that carries its own cost wins: the producer meant that one.
+    let (status, res) = h
+        .push(
+            "g",
+            "n",
+            json!({ "op": "test", "partition": "p0", "cost": 7,
+                    "payload": { "httpCost": 2 } }),
+        )
+        .await;
+    assert_eq!(status, 200, "{res}");
+    assert_eq!(res["cost"], json!(2), "{res}");
+
+    // And a v1 cost above the node's ceiling is refused at the door, exactly as
+    // one written into the payload would be: it could never be admitted.
+    let (status, res) = h
+        .push(
+            "g",
+            "n",
+            json!({ "op": "test", "partition": "p0", "cost": 500, "payload": {} }),
+        )
+        .await;
+    assert_eq!(status, 422, "{res}");
+
+    h.cleanup("g").await;
+}
+
 /// A KV route that refuses is NOT a refusal.
 ///
 /// Reading a failed charge as a refusal would park the graph; reading it as an

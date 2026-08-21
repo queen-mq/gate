@@ -44,6 +44,19 @@ pub struct PushBody {
     /// collapse to one, so lag compresses the backlog instead of growing it.
     #[serde(default)]
     pub txn: Option<String>,
+    /// v1's push body carried the cost here, beside the payload; v2 reads it
+    /// from the payload at the node's declared `cost.path`, because a
+    /// user-owned ingress queue has no envelope to put it in.
+    ///
+    /// Kept, and NOT as a no-op. §12.1 says the endpoint shapes do not move, and
+    /// this is the field that decides how much budget an item spends: ignoring
+    /// it would charge every v1 caller's item the declared default instead of
+    /// what it asked for — a limiter quietly enforcing the wrong limit, which is
+    /// the failure this whole service exists to avoid. It is written into the
+    /// payload at the node's own cost path, so the relay reads it exactly as it
+    /// would read a producer's own.
+    #[serde(default)]
+    pub cost: Option<i64>,
     #[serde(default)]
     pub payload: Value,
 }
@@ -193,6 +206,15 @@ async fn push_into(
             }),
         );
     }
+    // v1's `cost`, written where v2 reads one. A zero or a negative is v1's
+    // "use the declared default" and is left alone; anything else lands at the
+    // node's own `cost.path` unless the payload already carries a value there,
+    // which the producer meant and this must not overwrite.
+    if let (Some(c), gate_core::Cost::Path(p)) = (body.cost.filter(|c| *c > 0), &np.cost) {
+        if gate_core::resolve(&item, &p.path).is_none() {
+            write_path(&mut item, &p.path, json!(c));
+        }
+    }
 
     // ---- the two refusals this door exists to make early.
     //
@@ -261,6 +283,35 @@ async fn push_into(
         "partition": partition,
         "cost": cost,
     }))
+}
+
+/// Write a value at a dotted payload path, creating the objects on the way.
+///
+/// The mirror of `gate_core::resolve`, and it exists for exactly one caller: the
+/// v1 push body's `cost`, which has to land where the compiled cost model reads
+/// one. A segment that is occupied by a non-object is left alone rather than
+/// replaced — this is a compatibility shim and it may not destroy a payload.
+fn write_path(data: &mut Value, path: &str, value: Value) {
+    let mut segs: Vec<&str> = path.split('.').collect();
+    if segs.first() != Some(&gate_core::PAYLOAD_ROOT) || segs.len() < 2 {
+        return;
+    }
+    segs.remove(0);
+    let last = segs.pop().expect("at least one segment");
+    let mut cur = data;
+    for s in segs {
+        if !cur.is_object() {
+            return;
+        }
+        cur = cur
+            .as_object_mut()
+            .expect("object")
+            .entry(s.to_string())
+            .or_insert_with(|| json!({}));
+    }
+    if let Some(map) = cur.as_object_mut() {
+        map.insert(last.to_string(), value);
+    }
 }
 
 /// A partition for a push that named none, so a queue Gate owns is as wide as
