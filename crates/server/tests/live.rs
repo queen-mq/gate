@@ -161,7 +161,46 @@ async fn spawn_server(app: api::Shared) -> String {
 async fn serve(url: &str) -> api::Shared {
     logs();
     let queen = Queen::connect(Config::new(url)).expect("connect");
+    sweep(&queen).await;
     Arc::new(api::App::new(queen, url.to_string()))
+}
+
+/// Remove the documents an earlier run left in the store, once per suite.
+///
+/// Every test owns a freshly named application (`it{micros}-{tag}`) and deletes
+/// its own graph on the happy path — but a test that FAILS leaves its document
+/// behind, and two of the tests here call `restore`, which is supposed to bring
+/// back everything the store holds and cannot be asked to skip the litter. A
+/// suite that gets slower every time it goes red is a suite people stop running.
+///
+/// Only the `it`-prefixed applications, so a broker shared with a real
+/// deployment loses nothing.
+async fn sweep(queen: &Queen) {
+    use std::sync::OnceLock;
+    static ONCE: OnceLock<()> = OnceLock::new();
+    if ONCE.set(()).is_err() {
+        return;
+    }
+    let Ok(res) = queen
+        .kv()
+        .get_prefix("gate", "graph:it")
+        .limit(1000)
+        .keys_only()
+        .send()
+        .await
+    else {
+        return;
+    };
+    let rows = res.rows.unwrap_or_default();
+    for row in &rows {
+        let _ = queen.kv().delete("gate", &row.key).send().await;
+    }
+    if !rows.is_empty() {
+        eprintln!(
+            "swept {} leftover graph document(s) from an earlier run",
+            rows.len()
+        );
+    }
 }
 
 fn logs() {
