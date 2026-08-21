@@ -27,6 +27,10 @@ const TTL: Duration = Duration::from_secs(2);
 
 #[derive(Default)]
 pub struct Depths {
+    // One map, keyed by queue (or `queue\u{1f}group`), holding the last answer
+    // and when it was given. Spelling the pair out as a type alias would name
+    // something nobody says out loud.
+    #[allow(clippy::type_complexity)]
     cache: RwLock<HashMap<String, (HashMap<String, u64>, Instant)>>,
 }
 
@@ -60,7 +64,6 @@ impl Depths {
             }
         }
     }
-
 
     /// The same read with the cache skipped, and the answer left in it.
     ///
@@ -142,7 +145,9 @@ impl Depths {
         match queen.admin().queue_depth(queue, Some(group)).await {
             Ok(v) => {
                 let out = depth_route(&v);
-                self.cache.write().insert(key, (out.clone(), Instant::now()));
+                self.cache
+                    .write()
+                    .insert(key, (out.clone(), Instant::now()));
                 Some(out)
             }
             // No fallback to the queue-level number, and this one is measured. The
@@ -189,7 +194,9 @@ impl Depths {
         match queen.admin().queue_depth(queue, Some(group)).await {
             Ok(v) => {
                 let out = depth_route(&v);
-                self.cache.write().insert(key, (out.clone(), Instant::now()));
+                self.cache
+                    .write()
+                    .insert(key, (out.clone(), Instant::now()));
                 out
             }
             Err(e) if e.status() == Some(404) => {
@@ -202,7 +209,9 @@ impl Depths {
                 // one round trip per caller, which is the thing the TTL exists
                 // to stop. Re-probed once per TTL, so an upgrade or a first push
                 // is noticed two seconds later.
-                self.cache.write().insert(key, (out.clone(), Instant::now()));
+                self.cache
+                    .write()
+                    .insert(key, (out.clone(), Instant::now()));
                 out
             }
             // The broker did not answer. Serve the last thing it DID say, stamped,
@@ -215,7 +224,9 @@ impl Depths {
                     .get(&key)
                     .map(|(v, _)| v.clone())
                     .unwrap_or_default();
-                self.cache.write().insert(key, (stale.clone(), Instant::now()));
+                self.cache
+                    .write()
+                    .insert(key, (stale.clone(), Instant::now()));
                 stale
             }
         }

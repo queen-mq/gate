@@ -1,149 +1,199 @@
-//! Where the declared targets live between restarts.
+//! Where the declared graphs live between restarts.
 //!
-//! `gate` has no database of its own, and that is a deliberate position:
-//! the work is in queen's log, the budget counters are in `queen_streams.state`
-//! keyed by partition, the cross-target ceilings are in `queen.kv`. Everything
-//! that matters is already durable in the Postgres queen owns, and adding a
-//! second data system to hold one more thing would be a second data system to
-//! run, size, back up and lose.
+//! `gate` has no database of its own, and that is a deliberate position: the
+//! work is in queen's log and the budget counters are rows in `queen.kv`.
+//! Everything that matters is already durable in the Postgres queen owns, and
+//! adding a second data system to hold one more thing would be a second data
+//! system to run, size, back up and lose.
 //!
-//! But the target SPECS were the exception, and not on purpose: they lived in a
+//! The declarations were the exception, and not on purpose: they lived in a
 //! HashMap in the process. A restart dropped every one of them while their
 //! queues stayed in the broker with nobody draining — 112 orphans after an
-//! afternoon of testing. So they go where they always belonged, which is the
-//! store queen already gives us for exactly this: a small durable value under a
-//! name we choose.
+//! afternoon of testing. So they go where they always belonged.
 //!
 //! `forever` rather than a TTL, and it is the one place in this codebase that
-//! asks for it: a configuration that expires is a configuration that vanishes
-//! at 3am for no reason anybody can reconstruct.
+//! asks for it: a configuration that expires is a configuration that vanishes at
+//! 3am for no reason anybody can reconstruct.
+
+#![allow(deprecated)]
 
 use queen_mq::{Expiry, Queen, Result};
-use gate_core::{GraphSpec, TargetSpec};
+
+use gate_core::{v1, GraphDoc};
 
 const NS: &str = "gate";
-const PREFIX: &str = "spec:";
-/// Graphs live under their own prefix and are the authority for their nodes: a
-/// node's projected target spec is deliberately NOT saved, so there is exactly one
-/// document to reconcile and no way for the two to disagree.
+
+/// v2 documents. Also where v1 `GraphSpec`s were kept, which is why the read
+/// below tries both.
 const GRAPH_PREFIX: &str = "graph:";
 
-fn key(app: &str, name: &str) -> String {
-    format!("{PREFIX}{app}:{name}")
-}
+/// v1 standalone `TargetSpec`s. Nothing writes here any more; the read exists so
+/// an upgrade brings them across instead of leaving their queues in the broker
+/// with nobody draining.
+const V1_TARGET_PREFIX: &str = "spec:";
 
 fn graph_key(app: &str, name: &str) -> String {
     format!("{GRAPH_PREFIX}{app}:{name}")
 }
 
+fn v1_target_key(app: &str, name: &str) -> String {
+    format!("{V1_TARGET_PREFIX}{app}:{name}")
+}
 
-pub async fn save(queen: &Queen, spec: &TargetSpec) -> Result<()> {
-    let value = serde_json::to_value(spec).map_err(|e| queen_mq::Error::Decode(e.to_string()))?;
+pub async fn save(queen: &Queen, doc: &GraphDoc) -> Result<()> {
+    let value = serde_json::to_value(doc).map_err(|e| queen_mq::Error::Decode(e.to_string()))?;
     queen
         .kv()
-        .put(NS, &key(&spec.application, &spec.name), value, Expiry::forever())
+        .put(
+            NS,
+            &graph_key(&doc.application, &doc.graph),
+            value,
+            Expiry::forever(),
+        )
         .send()
         .await?;
     Ok(())
 }
 
 pub async fn forget(queen: &Queen, app: &str, name: &str) -> Result<()> {
-    queen.kv().delete(NS, &key(app, name)).send().await?;
+    queen.kv().delete(NS, &graph_key(app, name)).send().await?;
+    // A graph that came across from a v1 standalone target keeps its old row
+    // until it is deleted too, or the next boot restores it and the delete looks
+    // like it did not take.
+    queen
+        .kv()
+        .delete(NS, &v1_target_key(app, name))
+        .send()
+        .await
+        .ok();
     Ok(())
 }
 
-/// Every spec this cell has been told about.
+/// What a prefix read found, and whether it found everything.
 ///
-/// A prefix is mandatory — a namespace is not a table to enumerate — which is
-/// why the specs are keyed under one rather than at the root.
-pub async fn load_all(queen: &Queen) -> Vec<TargetSpec> {
-    try_load_all(queen)
-        .await
-        .map(|s| s.items)
-        .unwrap_or_default()
+/// The distinction is the difference between "nobody declared that" and "we did
+/// not see it": the reconcile loop removes what the store no longer holds, and a
+/// page the broker clamped, or a row this build cannot parse, would otherwise
+/// read as a delete and tear down a running graph. So an incomplete read is
+/// allowed to ADD and CHANGE, and never to remove.
+pub struct Stored {
+    pub items: Vec<GraphDoc>,
+    pub complete: bool,
+    /// Documents that were read as v1 and mapped on the way in. The caller
+    /// re-saves them in the new shape, so this happens once per upgrade rather
+    /// than on every boot.
+    pub migrated: Vec<String>,
 }
 
+/// Every declaration this cell has been told about.
+///
+/// A prefix is mandatory — a namespace is not a table to enumerate — which is
+/// why the documents are keyed under one rather than at the root.
+pub async fn load_all(queen: &Queen) -> Stored {
+    try_load_all(queen).await.unwrap_or_else(|_| Stored {
+        items: Vec::new(),
+        complete: false,
+        migrated: Vec::new(),
+    })
+}
 
 /// The same read, with the failure kept.
 ///
 /// The reconcile loop removes what the store no longer holds, so it must be able
 /// to tell "nobody declared anything" from "the broker did not answer". Reading
 /// an error as an empty set would reap the entire fleet's configuration on a
-/// transient failure — which is the loudest possible way for a background task to
-/// be wrong.
-pub async fn try_load_all(queen: &Queen) -> Result<Stored<TargetSpec>> {
-    let res = queen.kv().get_prefix(NS, PREFIX).limit(1000).send().await?;
-    Ok(collect(res))
-}
-
-/// What a prefix read found, and whether it found everything.
-///
-/// The distinction is the difference between "nobody declared that" and "we did not
-/// see it": the reconcile loop removes what the store no longer holds, and a page
-/// the broker clamped, or a row this build cannot parse, would otherwise read as a
-/// delete and tear down a running target. So an incomplete read is allowed to ADD
-/// and CHANGE, and never to remove.
-pub struct Stored<T> {
-    pub items: Vec<T>,
-    pub complete: bool,
-}
-
-fn collect<T: serde::de::DeserializeOwned>(res: queen_mq::KvResult) -> Stored<T> {
-
-    let truncated = res.truncated();
-    let rows = res.rows.unwrap_or_default();
-    let mut items = Vec::with_capacity(rows.len());
+/// transient failure — which is the loudest possible way for a background task
+/// to be wrong.
+pub async fn try_load_all(queen: &Queen) -> Result<Stored> {
+    let mut items = Vec::new();
+    let mut migrated = Vec::new();
     let mut unreadable = 0usize;
-    for row in &rows {
-        match row.value.clone().map(serde_json::from_value::<T>) {
-            Some(Ok(v)) => items.push(v),
-            // A document written by a NEWER build (an unknown field, and every spec
-            // type refuses those on purpose) or a corrupt row. Counted, not ignored.
-            Some(Err(_)) | None => unreadable += 1,
-        }
-    }
-    if unreadable > 0 {
-        tracing::warn!(
-            unreadable,
-            "the store holds documents this build cannot read; nothing will be removed on this pass"
-        );
-    }
-    Stored { items, complete: !truncated && unreadable == 0 }
-}
+    let mut truncated = false;
 
-
-// --------------------------------------------------------------------- graphs
-
-pub async fn save_graph(queen: &Queen, g: &GraphSpec) -> Result<()> {
-    let value = serde_json::to_value(g).map_err(|e| queen_mq::Error::Decode(e.to_string()))?;
-    queen
-        .kv()
-        .put(NS, &graph_key(&g.application, &g.name), value, Expiry::forever())
-        .send()
-        .await?;
-    Ok(())
-}
-
-pub async fn forget_graph(queen: &Queen, app: &str, name: &str) -> Result<()> {
-    queen.kv().delete(NS, &graph_key(app, name)).send().await?;
-    Ok(())
-}
-
-pub async fn try_load_graphs(queen: &Queen) -> Result<Stored<GraphSpec>> {
     let res = queen
         .kv()
         .get_prefix(NS, GRAPH_PREFIX)
         .limit(1000)
         .send()
         .await?;
-    Ok(collect(res))
+    truncated |= res.truncated();
+    for row in res.rows.unwrap_or_default() {
+        let Some(value) = row.value else {
+            unreadable += 1;
+            continue;
+        };
+        match serde_json::from_value::<GraphDoc>(value.clone()) {
+            Ok(doc) => items.push(doc),
+            Err(_) => match serde_json::from_value::<v1::GraphSpec>(value) {
+                Ok(old) => match gate_core::migrate::from_v1_graph(&old) {
+                    Ok(m) => {
+                        migrated.push(m.doc.key());
+                        items.push(m.doc);
+                    }
+                    Err(refused) => {
+                        // A v1 graph carrying breach rules. It is NOT silently
+                        // dropped and it is NOT silently accepted with the
+                        // policy gone: the row stays where it is and the read is
+                        // incomplete, so nothing reaps anything on this pass.
+                        tracing::error!(
+                            key = %row.key, detail = %refused.0,
+                            "a stored v1 graph cannot be migrated; it is not running and nothing \
+                             will be removed on this pass"
+                        );
+                        unreadable += 1;
+                    }
+                },
+                // A document written by a NEWER build (an unknown field, and
+                // every document type refuses those on purpose) or a corrupt
+                // row. Counted, not ignored.
+                Err(_) => unreadable += 1,
+            },
+        }
+    }
+
+    // v1 standalone targets. Each becomes a one-node graph named for itself.
+    let res = queen
+        .kv()
+        .get_prefix(NS, V1_TARGET_PREFIX)
+        .limit(1000)
+        .send()
+        .await?;
+    truncated |= res.truncated();
+    for row in res.rows.unwrap_or_default() {
+        let Some(value) = row.value else {
+            unreadable += 1;
+            continue;
+        };
+        match serde_json::from_value::<v1::TargetSpec>(value) {
+            Ok(old) => match gate_core::migrate::from_v1_target(&old) {
+                Ok(m) => {
+                    if items.iter().any(|d| d.key() == m.doc.key()) {
+                        // Already declared as a graph. The graph wins, exactly
+                        // as v1's restore let a graph win over a stray target of
+                        // the same name.
+                        continue;
+                    }
+                    migrated.push(m.doc.key());
+                    items.push(m.doc);
+                }
+                Err(refused) => {
+                    tracing::error!(key = %row.key, detail = %refused.0, "a stored v1 target cannot be migrated");
+                    unreadable += 1;
+                }
+            },
+            Err(_) => unreadable += 1,
+        }
+    }
+
+    if unreadable > 0 {
+        tracing::warn!(
+            unreadable,
+            "the store holds documents this build cannot read; nothing will be removed on this pass"
+        );
+    }
+    Ok(Stored {
+        items,
+        complete: !truncated && unreadable == 0,
+        migrated,
+    })
 }
-
-pub async fn load_graphs(queen: &Queen) -> Vec<GraphSpec> {
-    try_load_graphs(queen)
-        .await
-        .map(|s| s.items)
-        .unwrap_or_default()
-}
-
-

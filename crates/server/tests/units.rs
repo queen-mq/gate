@@ -128,7 +128,11 @@ fn an_exhausted_window_answers_with_its_edge_and_not_with_infinity() {
     // And the same window with room in it admits the backlog now.
     let s = eta::admits(Alignment::Calendar, 100.0, 60, 20.0, 50.0, T);
     assert_eq!(s.seconds, Some(0.0));
-    assert_eq!(s.resets_at, T + 40_000, "the edge is a fact about the window");
+    assert_eq!(
+        s.resets_at,
+        T + 40_000,
+        "the edge is a fact about the window"
+    );
 }
 
 /// A backlog bigger than the cap does not fit in one window, and the answer is

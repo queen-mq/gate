@@ -1,616 +1,363 @@
-//! Declaring a graph: the nodes, the relays, and the atomicity of both.
+//! Declaring a graph: validate, compile, provision, run, store.
 //!
-//! A graph is declared whole. Validation runs over nodes, edges, `consume` and
-//! `breach` together — a cost ceiling that shrinks along an edge is not a property
-//! of either node — and provisioning either brings every node up or puts the
-//! previous topology back. Half a graph is the failure mode worth spending code to
-//! avoid: work enters at an entry that is running and stops at a node that is not,
-//! and from the outside that is indistinguishable from a limiter deciding to refuse
-//! everything.
-//!
-//! The nodes themselves are ordinary targets named `{graph}.{node}`. Nothing in the
-//! data plane learns what a graph is: the push, the gate runners, the admitted
-//! queues, the lease and the ack are the ones that were already there. What a graph
-//! adds is the relays between them, the entry/terminal rules, and one document that
-//! owns the lot.
+//! Atomic in the only sense that matters to a caller: either the whole document
+//! is running and stored, or nothing changed and the previous one is still
+//! serving. There are no per-node targets to swap one at a time any more, which
+//! removes most of what made v1's rollback delicate.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use gate_core::{utilisation_max, GraphSpec, TargetSpec};
 use serde_json::{json, Value};
 
-use crate::api::Shared;
-use crate::edge;
-use crate::registry::{GraphRuntime, RelayRuntime};
-use crate::{now_ms, store, supervisor};
+use gate_core::plan::{Plan, PlanOpts, QueueKind};
+use gate_core::{GraphDoc, Problem};
 
-/// Why a declare was refused, in the caller's terms.
+use crate::api::Shared;
+use crate::knobs::knobs;
+use crate::registry::GraphRuntime;
+use crate::supervisor;
+
 pub enum Refusal {
-    /// The document is wrong. 422.
     Invalid(String),
-    /// The document is fine but the cell cannot accept it: a name already owned,
-    /// or a migration without a version. 409.
     Conflict(String),
-    /// The broker refused to provision. 502.
     Gateway(String),
 }
 
-/// Who asked for this declare, which decides two things: whether the document is
-/// written back, and whether a migration-class change needs a version bump.
-#[derive(Clone, Copy, PartialEq)]
-enum Source {
-    /// A caller's `PUT`. The document is new to the cell, so both rules apply.
-    Caller,
-    /// The store, on a boot restore or a reconcile pass. The document is already
-    /// authoritative — some other replica's declare was accepted — so neither applies.
-    Store,
+impl Refusal {
+    pub fn message(&self) -> &str {
+        match self {
+            Refusal::Invalid(m) | Refusal::Conflict(m) | Refusal::Gateway(m) => m,
+        }
+    }
 }
 
-/// Declare a graph, atomically, as a caller asked. The caller holds the declare lock.
-pub async fn declare(app: &Shared, spec: GraphSpec) -> Result<Arc<GraphRuntime>, Refusal> {
-    declare_with(app, spec, Source::Caller).await
-}
-
-
-/// Bring up a graph the STORE already holds — a boot restore, or a reconcile pass
-/// applying another replica's declare.
+/// Compile a document against what the broker and the registry currently say.
 ///
-/// Two things differ from a caller's declare, and both are about the store being the
-/// authority rather than this process:
-///
-/// * the document is NOT written back. Saving a document that came from the store
-///   re-creates it, so a delete landing on another replica while this pass provisions
-///   would be undone — the delete having been acknowledged.
-/// * a migration-class change does NOT need a version bump. The bump rule protects a
-///   caller from re-founding counters by accident, and that judgement was already made
-///   where the declare was accepted. Enforcing it here against a replica-LOCAL runtime
-///   is how a replica wedges: a delete-and-redeclare at the same version is legal for
-///   the caller and refused for ever by every pod that still holds the old runtime,
-///   which is precisely the indefinite divergence the reconcile exists to end. Targets
-///   converge on the store for the same reason (their version check lives only in the
-///   API handler), and graphs must not be the exception.
-pub async fn declare_from_store(
-    app: &Shared,
-    spec: GraphSpec,
-) -> Result<Arc<GraphRuntime>, Refusal> {
-    declare_with(app, spec, Source::Store).await
+/// Two passes on purpose: the first plan exists only to learn which queues the
+/// document names, so the broker can be asked about the ones Gate does not own.
+/// Their partition count is a fact Gate READS rather than chooses, and it is
+/// what the per-stage worker count defaults from.
+pub async fn compile(app: &Shared, doc: &GraphDoc) -> (Plan, gate_core::ExternalFacts) {
+    let provisional = gate_core::compile(doc);
+    let queues = supervisor::probe(&app.queen, &provisional).await;
+
+    let mut partitions = std::collections::BTreeMap::new();
+    for (name, facts) in &queues {
+        if facts.partitions > 0 {
+            partitions.insert(name.clone(), facts.partitions);
+        }
+    }
+    let opts = PlanOpts {
+        batch: knobs().batch,
+        concurrency: knobs().concurrency,
+        partitions,
+        // §16.3 — the `assumed` discount is wired and NOT switched on. v1
+        // defined it, unit-tested it, documented it in the README and never
+        // applied it; turning it on changes what every existing `assumed` budget
+        // admits, which is a product decision and not one to make on the way
+        // past.
+        assumed_factor: 1.0,
+    };
+    let plan = gate_core::compile_with(doc, &opts);
+
+    let key = doc.key();
+    let facts = gate_core::ExternalFacts {
+        queues,
+        ingress_owners: app.registry.ingress_owners(&key),
+        egress_owners: app.registry.egress_owners(&key),
+    };
+    (plan, facts)
 }
 
-async fn declare_with(
+/// A caller's declare: everything below, plus the checks that only apply when a
+/// human (or their deploy) asked for the change.
+pub async fn declare(app: &Shared, doc: GraphDoc) -> Result<Value, Refusal> {
+    let _guard = app.declare_lock.lock().await;
+    declare_locked(app, doc, true).await
+}
+
+/// The declare itself. Separate because a sync declares a whole set and must
+/// hold the lock across all of them — a reconcile pass landing between two would
+/// see half a configuration and reap the other half.
+pub async fn declare_locked(
     app: &Shared,
-    spec: GraphSpec,
-    source: Source,
-) -> Result<Arc<GraphRuntime>, Refusal> {
+    doc: GraphDoc,
+    from_caller: bool,
+) -> Result<Value, Refusal> {
+    let key = doc.key();
+    let (plan, facts) = compile(app, &doc).await;
 
-
-    let problems = gate_core::validate_graph(&spec);
+    let problems = gate_core::validate_with(&doc, &facts);
     if !problems.is_empty() {
-        return Err(Refusal::Invalid(
-            problems
-                .iter()
-                .map(|p| p.to_string())
-                .collect::<Vec<_>>()
-                .join("; "),
-        ));
+        return Err(Refusal::Invalid(join(&problems)));
     }
 
-    let node_specs = spec.node_specs();
-    let previous = app.registry.graph(&spec.application, &spec.name);
-
-    // G10: one owner per queue family. A standalone target called `airbnb.ip` and
-    // a node `ip` of graph `airbnb` are the same queues with two declarers, and
-    // whichever wrote last would be enforcing.
-    for (node, ns) in &node_specs {
-        if let Some(existing) = app.registry.get(&spec.application, &ns.name) {
-            let ours = existing.graph.as_deref() == Some(spec.key().as_str());
-            if !ours {
-                return Err(Refusal::Conflict(match &existing.graph {
-                    Some(other) => format!(
-                        "node `{node}` would be the target `{}`, which graph `{other}` already owns",
-                        ns.name
-                    ),
-                    None => format!(
-                        "node `{node}` would be the target `{}`, which is already declared as a \
-                         standalone target: two owners of one queue family. Delete the target, or \
-                         rename the graph",
-                        ns.name
-                    ),
-                }));
-            }
-        }
-    }
-
-    // The same question of the store, for the same reason as the target side: a
-    // standalone target declared on another replica is not in this registry yet, and
-    // two owners of one queue family is the failure G10 exists to prevent.
-    if let Ok(stored) = store::try_load_all(&app.queen).await {
-        for (node, ns) in &node_specs {
-            if stored
-                .items
-                .iter()
-                .any(|t| t.application == ns.application && t.name == ns.name)
-            {
+    let old = app.registry.get(&doc.application, &doc.graph);
+    if from_caller {
+        if let Some(old) = &old {
+            if gate_core::needs_version_bump(&old.doc, &doc) && doc.version <= old.doc.version {
                 return Err(Refusal::Conflict(format!(
-                    "node `{node}` would be the target `{}`, which is declared as a standalone target \
-                     (on another replica): two owners of one queue family. Delete the target, or \
-                     rename the graph",
-                    ns.name
+                    "this change re-founds a counter or strands a queue (a new key starts at zero \
+                     while the old one counts down its TTL, and work already in an interior queue \
+                     has no consumer in the new plan): bump version above {}. Drain first — stop \
+                     pushing, wait for `waitingForBudget` to reach zero on every node, then \
+                     declare.",
+                    old.doc.version
                 )));
             }
         }
-    }
-
-    if let (Source::Caller, Some(old)) = (source, &previous) {
-        if gate_core::needs_graph_version_bump(&old.spec, &spec) && spec.version <= old.spec.version {
-            return Err(Refusal::Conflict(format!(
-
-                "this change re-founds a counter or a path (a new partition starts at zero): bump \
-                 version above {}",
-                old.spec.version
-            )));
+        // The same question of the STORE, because a declare lands on ONE
+        // replica: a graph declared a second ago on another pod is not in this
+        // registry yet. A store that will not answer is not a reason to refuse —
+        // the local check still stands.
+        if let Ok(stored) = crate::store::try_load_all(&app.queen).await {
+            for other in stored.items.iter().filter(|d| d.key() != key) {
+                let mine = gate_core::compile(other);
+                for (node, np) in &mine.nodes {
+                    let Some(q) = &np.ingress_queue else { continue };
+                    if plan
+                        .nodes
+                        .values()
+                        .any(|n| n.ingress_queue.as_deref() == Some(q.as_str()))
+                    {
+                        return Err(Refusal::Conflict(format!(
+                            "`{q}` is already the ingress of node `{node}` in graph `{}` (declared \
+                             on another replica). Two consumers of one queue in different groups \
+                             each get every message, which doubles what leaves.",
+                            other.key()
+                        )));
+                    }
+                }
+            }
         }
     }
 
-    // Relays first, and before any node moves: a relay forwarding into a node that
-    // is being restarted would push into a queue whose runner is down, which is
-    // work parked for as long as the declare takes.
-    if let Some(old) = &previous {
-        edge::stop_all(&old.relays).await;
-    }
-
-    // ---- provision every node, or put the old ones back.
-    let mut started: Vec<(String, Arc<crate::registry::TargetRuntime>)> = Vec::new();
-    for (node, ns) in &node_specs {
-        let old = app.registry.get(&spec.application, &ns.name);
-        match supervisor::swap(
-            &app.queen,
-            app.meter.clone(),
-            app.history.clone(),
-            old.as_ref(),
-            ns.clone(),
-            Some(spec.key()),
-        )
-        .await
-        {
-            Ok(rt) => {
-                app.registry.put(rt.clone());
-                started.push((node.clone(), rt));
-            }
-            Err(failed) => {
-                match failed.restored {
-                    Some(rt) => {
-                        app.registry.put(rt);
-                    }
-                    // Nothing is serving it: unregister, so a push is REFUSED rather
-                    // than accepted into a queue nobody drains.
-                    None => {
-                        app.registry.remove(&spec.application, &ns.name);
-                    }
+    // Stop-then-start, with the old document put back if the new one cannot be
+    // provisioned. Without that restore the graph is left stopped and still
+    // registered: it accepts pushes and admits nothing, for ever, which is the
+    // one failure an operator cannot recover from without knowing this code.
+    let rt = match supervisor::swap(
+        &app.queen,
+        &app.budgets,
+        app.traces.clone(),
+        old.as_ref(),
+        doc.clone(),
+        plan.clone(),
+    )
+    .await
+    {
+        Ok(rt) => rt,
+        Err(failed) => {
+            let detail = match failed.restored {
+                Some(rt) => {
+                    let version = rt.doc.version;
+                    app.registry.put(rt);
+                    format!(
+                        "provisioning failed: {}; still serving version {version}",
+                        failed.error
+                    )
                 }
-                rollback(app, &previous, &started).await;
+                None => {
+                    // Nothing is serving it. Unregister, so a push is refused —
+                    // recoverable — rather than accepted into a queue nobody
+                    // drains.
+                    app.registry.remove(&doc.application, &doc.graph);
+                    format!(
+                        "provisioning failed: {}; the old plan could not be restarted either, so \
+                         `{key}` is unregistered and will refuse pushes until a declare succeeds",
+                        failed.error
+                    )
+                }
+            };
+            return Err(Refusal::Gateway(detail));
+        }
+    };
+    app.registry.put(rt.clone());
+
+    if from_caller {
+        // Persisted only after the stages are actually up: a document saved for
+        // a graph that failed to provision would come back on the next boot and
+        // fail again, for ever.
+        match crate::store::save(&app.queen, &doc).await {
+            Ok(()) => rt.persisted.store(true, Ordering::Relaxed),
+            // A declare that did not persist is not a declare that happened.
+            //
+            // It used to warn and answer 200. With a reconcile loop that is a
+            // lie with a fifteen-second fuse: the store still holds the previous
+            // document, so the very next pass restarts this graph on it and the
+            // change the caller was told had landed is gone. The runtime keeps
+            // serving the new document until then — tearing it down would add an
+            // outage to a failed write — but the caller is told, so it can
+            // retry.
+            Err(e) => {
+                tracing::warn!(graph = %key, error = %e, "declared but not persisted");
                 return Err(Refusal::Gateway(format!(
-                    "node `{node}` could not be provisioned: {}",
-                    failed.error
+                    "`{key}` is running this document but it could not be stored ({e}), so it is \
+                     NOT durable: the next reconcile pass will restart it on the stored one. Retry \
+                     the declare"
                 )));
             }
         }
-    }
-
-    // ---- nodes the previous version had and this one does not.
-    if let Some(old) = &previous {
-        for (_, old_spec) in old.spec.node_specs() {
-            if node_specs.iter().any(|(_, ns)| ns.name == old_spec.name) {
-                continue;
-            }
-            if let Some(rt) = app.registry.remove(&spec.application, &old_spec.name) {
-                supervisor::stop_with(&app.queen, &rt).await;
-            }
-        }
-    }
-
-    let relays = start_relays(app, &spec, &node_specs);
-
-    let rt = Arc::new(GraphRuntime {
-        spec: spec.clone(),
-        relays,
-        node_keys: node_specs.iter().map(|(_, ns)| ns.key()).collect(),
-        persisted: std::sync::atomic::AtomicBool::new(false),
-    });
-    app.registry.put_graph(rt.clone());
-
-    // Persisted only once it is actually up, like a target: a document saved for a
-    // graph that failed to provision would come back on every boot and fail again.
-    if source == Source::Store {
-        // It came FROM the store, so it is already there — and writing it back would
-        // undo a delete that landed while this was provisioning.
+    } else {
         rt.persisted.store(true, Ordering::Relaxed);
-        return Ok(rt);
     }
 
-    match store::save_graph(&app.queen, &spec).await {
-        Ok(()) => rt.persisted.store(true, Ordering::Relaxed),
-        // Same as a target: a document that did not persist is not durable, and the next
-        // reconcile pass restores the stored one over it. The graph keeps running so the
-        // failure costs no traffic, and the caller is told so it can retry.
-        Err(e) => {
-            tracing::warn!(graph = %spec.key(), error = %e, "declared but not persisted");
-            return Err(Refusal::Gateway(format!(
-                "graph `{}` is running but its document could not be stored ({e}), so it is NOT \
-                 durable: the next reconcile pass will restore the stored one. Retry the declare",
-                spec.name
-            )));
-        }
-    }
-    Ok(rt)
+    Ok(resolved(&rt, &gate_core::warnings_with(&doc, &facts)))
 }
 
-
-
-/// One relay per destination node, each draining its upstreams in priority order.
-fn start_relays(
-    app: &Shared,
-    spec: &GraphSpec,
-    node_specs: &[(String, TargetSpec)],
-) -> Vec<Arc<RelayRuntime>> {
-    let spec_of = |node: &str| -> Option<TargetSpec> {
-        node_specs
-            .iter()
-            .find(|(n, _)| n == node)
-            .map(|(_, s)| s.clone())
-    };
-
-    let mut relays = Vec::new();
-    for dest in spec.merge_dests() {
-        let Some(dest_spec) = spec_of(&dest) else { continue };
-        // Lowest priority first; ties keep their declared order, which is the only
-        // tie-break a document offers.
-        let mut legs: Vec<edge::Leg> = spec
-            .in_edges(&dest)
-            .into_iter()
-            .filter_map(|e| {
-                spec_of(&e.from).map(|s| edge::Leg {
-                    node: e.from.clone(),
-                    priority: e.priority,
-                    spec: s,
-                })
-            })
-            .collect();
-        legs.sort_by_key(|l| l.priority);
-        relays.push(edge::spawn(
-            app.queen.clone(),
-            app.depths.clone(),
-            edge::Plan {
-                application: spec.application.clone(),
-                graph: spec.name.clone(),
-                dest_node: dest,
-                dest: dest_spec,
-                sources: legs,
-            },
-        ));
-    }
-    relays
+/// Apply a document the store already holds. No version-bump check, and no save.
+///
+/// The asymmetry is v1's and it is kept verbatim: enforcing the bump against a
+/// replica-local runtime is how a replica wedges on a legal delete-and-redeclare
+/// at the same version.
+pub async fn declare_from_store(app: &Shared, doc: GraphDoc) -> Result<(), Refusal> {
+    declare_locked(app, doc, false).await.map(|_| ())
 }
 
-/// Put the previous topology back after a failed declare: the nodes this attempt
-/// had already replaced, then the relays it had already stopped.
-async fn rollback(
-    app: &Shared,
-    previous: &Option<Arc<GraphRuntime>>,
-    started: &[(String, Arc<crate::registry::TargetRuntime>)],
-) {
-    let Some(old) = previous else {
-        // A first declare that failed leaves nothing behind, so the nodes it did
-        // bring up are torn down rather than left running half a graph.
-        for (_, rt) in started {
-            supervisor::stop_with(&app.queen, rt).await;
-            app.registry.remove(&rt.spec.application, &rt.spec.name);
-        }
-        return;
-    };
-    for (node, rt) in started {
-        let Some(old_spec) = old.spec.node_spec(node) else { continue };
-        if old_spec == rt.spec {
-            continue;
-        }
-        match supervisor::swap(
-            &app.queen,
-            app.meter.clone(),
-            app.history.clone(),
-            Some(rt),
-            old_spec,
-            Some(old.spec.key()),
-        )
-        .await
-        {
-            Ok(restored) => {
-                app.registry.put(restored);
-            }
-            // The same contract the declare loop honours, and for the same reason: a
-            // runtime that could not be restarted has been STOPPED, and leaving it
-            // registered is the one unrecoverable state — the node accepts pushes and
-            // admits nothing, for ever, because every route gates on registry presence
-            // and not on liveness. Unregistered it refuses pushes instead, which the
-            // reconcile loop then repairs on its next pass.
-            Err(f) => {
-                match f.restored {
-                    Some(restored) => {
-                        app.registry.put(restored);
-                    }
-                    None => {
-                        app.registry.remove(&rt.spec.application, &rt.spec.name);
-                    }
-                }
-                tracing::error!(
-                    graph = %old.spec.key(), node = %node, error = %f.error,
-                    "could not restore a node after a failed declare"
-                );
-            }
-
-        }
-    }
-    let relays = start_relays(app, &old.spec, &old.spec.node_specs());
-    app.registry.put_graph(Arc::new(GraphRuntime {
-        spec: old.spec.clone(),
-        relays,
-        node_keys: old.node_keys.clone(),
-        persisted: std::sync::atomic::AtomicBool::new(old.persisted.load(Ordering::Relaxed)),
-    }));
+pub async fn stop(rt: &Arc<GraphRuntime>) {
+    supervisor::stop(rt).await;
 }
 
-/// Stop the relays, stop the nodes, forget the document.
-pub async fn remove(app: &Shared, application: &str, name: &str) -> Result<bool, Refusal> {
-    // Not conditional on a runtime existing: a document whose provisioning keeps failing
-    // is exactly the one an operator needs to delete, and it never reaches the registry.
-    let registered = app.registry.graph(application, name).is_some();
-
-    // The document first: it is what the fleet reconciles against, so a graph torn
-    // down here but left in the store comes back within one interval — and the other
-    // replicas never stopped it at all.
-    store::forget_graph(&app.queen, application, name)
-        .await
-        .map_err(|e| {
-            Refusal::Gateway(format!(
-                "`{application}/{name}` was not deleted: the stored document could not be removed \
-                 ({e}), and it would come back on the next reconcile"
-            ))
-        })?;
-    if let Some(g) = app.registry.remove_graph(application, name) {
-        // Every node's cancel first: a runner notices one between polls, so the
-        // serial stops below then wait out ONE poll window between them all
-        // instead of one each.
-        for (_, ns) in g.spec.node_specs() {
-            if let Some(rt) = app.registry.get(application, &ns.name) {
-                supervisor::cancel(&rt);
-            }
-        }
-        edge::stop_all(&g.relays).await;
-        for (_, ns) in g.spec.node_specs() {
-            if let Some(rt) = app.registry.remove(application, &ns.name) {
-                supervisor::stop_with(&app.queen, &rt).await;
-            }
-        }
+/// Remove a graph.
+///
+/// The stored declaration goes FIRST: a delete that stops the stages and leaves
+/// the document behind is undone by the next reconcile pass, on this replica and
+/// on every other one. And a delete that cannot reach the store is refused
+/// rather than half-applied.
+pub async fn remove(app: &Shared, application: &str, name: &str) -> Result<Value, Refusal> {
+    let _guard = app.declare_lock.lock().await;
+    if let Err(e) = crate::store::forget(&app.queen, application, name).await {
+        return Err(Refusal::Gateway(format!(
+            "`{application}/{name}` was not deleted: the stored declaration could not be removed \
+             ({e}), and a delete that stops the stages and leaves the document behind is undone by \
+             the next reconcile pass"
+        )));
     }
-    Ok(registered)
-}
-
-
-
-/// Stop a graph's relays and nodes without forgetting the document — what the
-/// reconcile loop does before re-provisioning from a changed one.
-pub async fn stop(app: &Shared, g: &Arc<GraphRuntime>) {
-    // Cancel-all first — same reason as `remove`: serial stops after one
-    // cancel pass cost the longest poll window, not the sum.
-    for (_, ns) in g.spec.node_specs() {
-        if let Some(rt) = app.registry.get(&ns.application, &ns.name) {
-            supervisor::cancel(&rt);
+    match app.registry.get(application, name) {
+        Some(rt) => {
+            supervisor::stop(&rt).await;
+            app.registry.remove(application, name);
+            Ok(json!({ "ok": true, "registered": true }))
         }
-    }
-    edge::stop_all(&g.relays).await;
-    for (_, ns) in g.spec.node_specs() {
-        if let Some(rt) = app.registry.remove(&ns.application, &ns.name) {
-            supervisor::stop_with(&app.queen, &rt).await;
-        }
+        // Not running here is a success: the document is gone, which is what was
+        // asked for, and a graph whose provisioning keeps failing must still be
+        // removable.
+        None => Ok(json!({ "ok": true, "registered": false })),
     }
 }
 
-/// The declared graph plus what it is doing right now: depths per node, budget
-/// utilisation, lane state, and the lag on every edge.
-pub async fn view(app: &Shared, g: &Arc<GraphRuntime>) -> Value {
-    let now = now_ms();
-    let mut nodes = Vec::new();
-
-    for (name, ns) in g.spec.node_specs() {
-        let rt = app.registry.get(&ns.application, &ns.name);
-        let states = rt
-            .as_ref()
-            .map(|r| r.last_state.read().clone())
-            .unwrap_or_default();
-
-        let budgets: Vec<Value> = ns
-            .budgets
-            .iter()
-            .map(|b| {
-                // The worst shard and the worst key: a budget is as spent as the
-                // counter closest to refusing, and for a scoped budget there is no
-                // single number that is not somebody's maximum.
-                let used = states
-                    .values()
-                    .map(|s| utilisation_max(b, s, now))
-                    .fold(0.0f64, f64::max);
-                let keys: usize = states.values().map(|s| gate_core::key_count(b, s)).sum();
-                json!({
-                    "id": b.id,
-                    "cap": b.cap,
-                    "periodSeconds": b.period_seconds,
-                    "alignment": b.alignment,
-                    "scope": b.scope,
-                    "store": b.store,
-                    "confidence": b.confidence,
-                    "match": b.matcher,
-                    "maxKeys": b.max_keys,
-                    "keys": keys,
-                    "used": used * b.cap,
-                    "utilisation": used,
-                })
-            })
-            .collect();
-
-        let lanes: Vec<Value> = ns
-            .lanes
-            .iter()
-            .map(|l| {
-                let stats = rt
-                    .as_ref()
-                    .and_then(|r| r.lanes.get(&l.name))
-                    .map(|r| r.stats.read().clone())
-                    .unwrap_or_default();
-                json!({
-                    "name": l.name,
-                    "default": l.default,
-                    "cap_policy": l.cap,
-                    "admitted": stats.admitted,
-                    "denied": stats.denied,
-                    "calls": stats.calls,
-                    "throttled": stats.throttled,
-                    "retried": stats.retried,
-                    "exhausted": stats.exhausted,
-                    "last_denial_budget": stats.last_denial_budget,
-                    "state": if stats.denied > 0 { "pacing" } else { "flowing" },
-                })
-            })
-            .collect();
-
-        // Two backlogs with two owners: gate holding work back on purpose, and the
-        // caller's own consumers falling behind.
-        let waiting_for_budget: u64 = app
-            .depths
-            .pending(&app.queen, &ns.push_queue())
-            .await
-            .values()
-            .sum();
-        let mut waiting_for_workers = 0u64;
-        for l in &ns.lanes {
-            waiting_for_workers += app
-                .depths
-                .pending(&app.queen, &ns.admitted_queue(&l.name))
-                .await
-                .values()
-                .sum::<u64>();
-        }
-
-        nodes.push(json!({
-            "name": name,
-            "target": ns.name,
-            "entry": g.spec.is_entry(&name),
-            "consume": g.spec.is_consume(&name),
-            "running": rt.is_some(),
-            "shardBy": ns.shard_by,
-            "shards": ns.shard_count(),
-            "cost": ns.cost,
-            "pacing": ns.pacing,
-            "admitted": ns.admitted,
-            "budgets": budgets,
-            "lanes": lanes,
-            "waiting_for_budget": waiting_for_budget,
-            "waiting_for_workers": waiting_for_workers,
-        }));
-    }
-
-    // Edge lag is what the relay has not moved yet: pending on the source's
-    // admitted queues, which is the queue the relay reads.
-    let mut edges = Vec::new();
-    for e in &g.spec.edges {
-        let mut lag = 0u64;
-        if let Some(ns) = g.spec.node_spec(&e.from) {
-            for l in &ns.lanes {
-                lag += app
-                    .depths
-                    .pending(&app.queen, &ns.admitted_queue(&l.name))
-                    .await
-                    .values()
-                    .sum::<u64>();
-            }
-        }
-        edges.push(json!({
-            "from": e.from,
-            "to": e.to,
-            "priority": e.priority,
-            "lag": lag,
-            "group": edge::group_of(&g.spec.application, &g.spec.name, &e.from, &e.to),
-        }));
-    }
-
-    let relays: Vec<Value> = g
-        .relays
+fn join(problems: &[Problem]) -> String {
+    problems
         .iter()
-        .map(|r| {
-            json!({
-                "dest": r.dest,
-                "sources": r.sources.iter().map(|s| json!({
-                    "node": s.node, "priority": s.priority,
-                    // How many runners drain this leg: one per admitted partition
-                    // of the source, per lane. The number the edge's throughput
-                    // scales with, and the one a caller changes by declaring more
-                    // partitions on the source.
-                    "runners": s.runners,
-                })).collect::<Vec<_>>(),
-                "window": r.window,
-                "forwarded": r.forwarded(),
-                // Transactions committed. `forwarded / commits` is the average
-                // batch one relay transaction carried, and the destination's push
-                // partition serialises those transactions — so it is the number
-                // that explains this edge's throughput.
-                "commits": r.commits(),
-                "unroutable": r.unroutable(),
-                "duplicates": r.duplicates(),
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
 
-            })
-        })
-        .collect();
-
+/// What the declare answers: the whole compiled plan, so a caller never has to
+/// reconstruct it and never has to guess a queue name.
+pub fn resolved(rt: &Arc<GraphRuntime>, warnings: &[Problem]) -> Value {
+    let plan = &rt.plan;
     json!({
-        "application": g.spec.application,
-        "name": g.spec.name,
-        "version": g.spec.version,
-        "at": now,
-        "spec": g.spec,
-        "nodes": nodes,
-        "edges": edges,
-        "relays": relays,
-        "consume": g.spec.consume,
-        "breach": g.spec.breach,
-        "persisted": g.persisted.load(Ordering::Relaxed),
-        "warnings": gate_core::graph_warnings(&g.spec).iter().map(|p| p.to_string())
-            .collect::<Vec<_>>(),
+        "ok": true,
+        "application": rt.doc.application,
+        "graph": rt.doc.graph,
+        "version": rt.doc.version,
+        "resolved": {
+            "namespace": plan.namespace,
+            "queues": plan.queues.iter().map(|q| json!({
+                "name": q.name,
+                "kind": match q.kind {
+                    QueueKind::OwnedIngress => "ingress",
+                    QueueKind::Interior => "interior",
+                    QueueKind::Egress => "egress",
+                    QueueKind::UserIngress => "ingress (yours)",
+                },
+                "ownedByGate": matches!(q.kind, QueueKind::OwnedIngress | QueueKind::Interior),
+                "partitions": q.partitions,
+            })).collect::<Vec<_>>(),
+            "nodes": plan.nodes.iter().map(|(name, np)| json!({
+                "node": name,
+                "ingressQueue": np.ingress_queue,
+                "httpPush": np.ingress_http,
+                "egressQueue": np.egress_queue,
+                "egressGroup": np.egress_group,
+                "breakerKey": np.breaker_key,
+                // The per-path ceilings, so §3.6 is legible from the response:
+                // one counter, several ceilings, and the reserve is the gap
+                // above the tallest lower one.
+                "shares": np.shares,
+                "budgets": np.budgets.iter().map(|b| json!({
+                    "id": b.id,
+                    "key": b.key,
+                    "scopeBy": b.scope_by,
+                    "sharedKey": b.shared_key,
+                    "count": b.count,
+                    "timeMs": b.time_ms,
+                    "subWindows": b.sub_windows,
+                    "countSub": b.count_sub,
+                    "windowSubSeconds": b.window_sub_seconds,
+                    "ceilings": np.shares.iter()
+                        .map(|(p, s)| (p.clone(), b.max_for(*s)))
+                        .collect::<std::collections::BTreeMap<_, _>>(),
+                })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+            "stages": plan.stages.iter().map(stage_view).collect::<Vec<_>>(),
+            "counters": plan.counters_window_seconds,
+        },
+        "warnings": warnings.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
+        // The trust model changed and it must be said out loud, not discovered.
+        // v1 relied on its queues being undiscoverable (names derived, never
+        // told); v2 NAMES the egress queue in the declaration.
+        "trust": "write access to an interior or egress queue is admission bypass — the same trust \
+                  model as any queen queue. Gate paces what flows through it; it does not defend a \
+                  queue from a writer who already has the credentials.",
     })
 }
 
-/// Just the shape, for the console's diagram: no broker round trips, so it can be
-/// polled at whatever rate a drawing wants.
-pub fn topology(g: &GraphRuntime) -> Value {
+fn stage_view(s: &gate_core::plan::Stage) -> Value {
     json!({
-        "application": g.spec.application,
-        "name": g.spec.name,
-        "version": g.spec.version,
-        "nodes": g.spec.nodes.keys().map(|n| {
-            let spec = g.spec.node_spec(n).expect("declared");
-            json!({
-                "name": n,
-                "target": spec.name,
-                "entry": g.spec.is_entry(n),
-                "consume": g.spec.is_consume(n),
-                "budgets": spec.budgets.iter().map(|b| json!({
-                    "id": b.id, "cap": b.cap, "periodSeconds": b.period_seconds,
-                    "scope": b.scope, "confidence": b.confidence,
-                })).collect::<Vec<_>>(),
-                "shards": spec.shard_count(),
-                "shardBy": spec.shard_by,
-                "costMax": spec.cost.max,
-            })
-        }).collect::<Vec<_>>(),
-        "edges": g.spec.edges,
-        "consume": g.spec.consume,
-        "breach": g.spec.breach,
+        "path": s.path,
+        "node": s.node,
+        "hop": s.hop,
+        "priority": s.priority,
+        "share": s.share,
+        "source": s.source,
+        "group": s.group,
+        "batch": s.batch,
+        "concurrency": s.concurrency,
+        "checksForeign": s.check_foreign,
+        "destinations": s.destinations.iter().map(|d| json!({
+            "node": d.node,
+            "queue": d.queue,
+            "derivesTransactionId": d.derive_id,
+            "terminal": d.terminal,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// The topology, broker-free, so a drawing can poll it.
+pub fn topology(rt: &Arc<GraphRuntime>) -> Value {
+    json!({
+        "application": rt.doc.application,
+        "graph": rt.doc.graph,
+        "version": rt.doc.version,
+        "nodes": rt.plan.nodes.keys().map(|n| json!({
+            "node": n,
+            "ingress": rt.plan.nodes[n].ingress_queue.is_some(),
+            "egress": rt.plan.nodes[n].egress_queue.is_some(),
+            "paths": gate_core::plan::paths_through(&rt.plan, n),
+            "shares": rt.plan.nodes[n].shares,
+        })).collect::<Vec<_>>(),
+        "paths": rt.doc.paths.iter().map(|p| json!({
+            "name": p.name,
+            "priority": p.priority,
+            "share": p.share,
+            "hops": gate_core::plan::hop_names(p),
+        })).collect::<Vec<_>>(),
+        "edges": gate_core::plan::edges(&rt.doc).iter()
+            .map(|(a, b)| json!({ "from": a, "to": b }))
+            .collect::<Vec<_>>(),
     })
 }

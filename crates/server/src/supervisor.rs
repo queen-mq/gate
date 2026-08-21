@@ -1,203 +1,251 @@
-//! Provisioning a target: the queues, then one pinned gate per lane.
+//! Provisioning a graph: the queues Gate owns, then one consumer per stage.
 //!
-//! The caller never creates a queue and never names one. That is not politeness
-//! — it is what lets the topology change under a running caller, and what keeps
-//! the vendors out of this codebase entirely.
+//! The caller never creates a queue Gate owns and never names one. That is not
+//! politeness — it is what lets the topology change under a running caller. The
+//! exception is deliberate and is the most important operational change in v2: a
+//! node may name a queue the APPLICATION owns, and Gate then consumes it and
+//! never configures it. Producers push with their normal SDK, so Gate can be
+//! down without blocking ingest.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use parking_lot::RwLock;
-use queen_mq::{Queen, QueueOptions, Result};
-use gate_core::TargetSpec;
+use queen_mq::{Cancel, Queen, QueueOptions, Result};
 
-use crate::gate;
-use crate::registry::{LaneRuntime, TargetRuntime};
+use gate_core::plan::{Plan, QueueKind};
+use gate_core::GraphDoc;
 
-/// Provision a target and start its runners.
-///
-/// `owner` is `application/graph` when this target is a graph node. It changes
-/// nothing about how the target runs — a node IS a target — and everything about
-/// who may reap it and where its spec is kept.
+use crate::budget::Budgets;
+use crate::knobs::knobs;
+use crate::obs::Traces;
+use crate::registry::GraphRuntime;
+use crate::relay::{self, StageRuntime};
+
+/// Provision a graph and start its stages.
 pub async fn start(
     queen: &Queen,
-    meter: Arc<crate::meter::Meter>,
-    history: Option<Arc<crate::history::History>>,
-    spec: TargetSpec,
-    owner: Option<String>,
-) -> Result<Arc<TargetRuntime>> {
+    budgets: &Budgets,
+    traces: Arc<Traces>,
+    doc: GraphDoc,
+    plan: Plan,
+) -> Result<Arc<GraphRuntime>> {
+    provision(queen, &plan).await?;
 
-    // The push queue's lease is the pacing quantum AND the failover window, so
-    // it is set here, once, by the only owner. Nothing else may rewrite it.
-    let mut opts = QueueOptions::default();
-    opts.lease_time = Some(spec.pacing.lease_seconds as i32);
-    opts.retry_limit = Some(0);
-    queen
-        .queue(spec.push_queue())
-        .namespace(spec.namespace())
-        .configure(opts.clone())
-        .await?;
-
-    for lane in &spec.lanes {
-        let mut o = QueueOptions::default();
-        o.lease_time = Some(60);
-        queen
-            .queue(spec.admitted_queue(&lane.name))
-            .namespace(spec.namespace())
-            .configure(o)
-            .await?;
-    }
-    queen
-        .queue(spec.calls_queue())
-        .namespace(spec.namespace())
-        .create()
-        .await
-        .ok();
-
-    let mut lanes = HashMap::new();
-    for lane in &spec.lanes {
-        let effective = match &lane.cap {
-            gate_core::CapPolicy::Absolute(n) => Some(*n),
-            gate_core::CapPolicy::Share(f) => spec
-                .budgets
-                .iter()
-                .map(|b| b.rate_per_sec())
-                .fold(None, |a: Option<f64>, r| Some(a.map_or(r, |x| x.min(r))))
-                .map(|r| r * f),
-            // Ceiling and ceiling-minus-measured start unbounded: the target's
-            // own budgets are the only limit until the meter says otherwise.
-            _ => None,
+    let cancel = Cancel::new();
+    let mut stages = Vec::with_capacity(plan.stages.len());
+    for s in &plan.stages {
+        let Some(node) = plan.nodes.get(&s.node) else {
+            continue;
         };
-        lanes.insert(
-            lane.name.clone(),
-            Arc::new(LaneRuntime {
-                name: lane.name.clone(),
-                effective_cap: RwLock::new(effective),
-                measured_share: RwLock::new(None),
-                stats: RwLock::new(Default::default()),
-                cancel: queen_mq::Cancel::new(),
-            }),
-        );
+        stages.push(Arc::new(StageRuntime {
+            application: doc.application.clone(),
+            graph: doc.graph.clone(),
+            stage: s.clone(),
+            node: node.clone(),
+            counters: Default::default(),
+            last_refusal: parking_lot::RwLock::new(None),
+            cancel: cancel.clone(),
+        }));
     }
 
-    let rt = Arc::new(TargetRuntime {
-        spec: spec.clone(),
-        graph: owner,
-        persisted: std::sync::atomic::AtomicBool::new(false),
-        stopped: std::sync::atomic::AtomicBool::new(false),
-
-        lanes,
-
-        last_state: RwLock::new(HashMap::new()),
-        last_breach: RwLock::new(None),
-        handles: RwLock::new(Vec::new()),
-        meter_cancel: RwLock::new(None),
-        meter_task: RwLock::new(None),
-        pools: spec
-            .budgets
-            .iter()
-            .filter(|b| b.store == gate_core::Store::Kv)
-            .map(|b| {
-                Arc::new(crate::shared::Pool::new(crate::shared::SharedBudget {
-                    scope: spec.application.clone(),
-                    id: b.id.clone(),
-                    cap: b.cap as i64,
-                    period_seconds: b.period_seconds,
-                }))
-            })
-            .collect(),
+    let rt = Arc::new(GraphRuntime {
+        doc,
+        plan,
+        stages,
+        handles: parking_lot::RwLock::new(Vec::new()),
+        persisted: AtomicBool::new(false),
+        stopped: AtomicBool::new(false),
+        cancel,
     });
 
-    // One runner per lane, or per shard of a lane. Each one pins a partition, and
-    // the partition lease is what makes its counter single-writer.
-    //
-    // A failure part way has to STOP what is already running before it returns. A
-    // stream handle does not stop its runner when it is dropped — that is what the
-    // cancel token is for — so an early `?` here would leave a detached runner
-    // holding a partition of a spec nobody is registered against, and the next
-    // successful declare would put a second runner on that partition enforcing a
-    // different document.
-    for lane in rt.lanes.values() {
-        for shard in 0..spec.shard_count() {
-            if let Err(e) = gate::spawn(queen, meter.clone(), rt.clone(), lane.clone(), shard).await
-            {
-                // Stop what already started — and WAIT for it, exactly as a
-                // normal stop does. Cancels alone left the spawned runners
-                // parked in their polls while the caller's restore start()
-                // re-registered the same query ids with `reset: true`: a dying
-                // runner's late commit could clobber the freshly reset state —
-                // the same two-writers race stop() closes, on the failure path.
-                stop(&rt).await;
-                return Err(e);
-            }
-        }
+    // Spawning cannot fail here — `consume_batch` reports a broker refusal from
+    // inside the task, not from `spawn` — so there is no half-provisioned state
+    // to unwind. The failure that DOES need unwinding is `provision` above, and
+    // it happens before anything is running.
+    let mut handles = Vec::with_capacity(rt.stages.len());
+    for st in &rt.stages {
+        handles.push(relay::spawn(
+            queen.clone(),
+            budgets.clone(),
+            st.clone(),
+            traces.clone(),
+        ));
     }
+    *rt.handles.write() = handles;
 
-    crate::meter::spawn(queen.clone(), meter, history, rt.clone());
+    tracing::info!(
+        graph = %rt.key(), stages = rt.stages.len(), queues = rt.plan.queues.len(),
+        "graph running"
+    );
     Ok(rt)
 }
 
+/// The queues Gate owns, and only those.
+async fn provision(queen: &Queen, plan: &Plan) -> Result<()> {
+    let k = knobs();
+    for q in &plan.queues {
+        match q.kind {
+            // A WORK lease, renewed while a handler runs — not a pacing quantum.
+            // And `retry_limit` is a real number again: v1 had to set it to zero
+            // because it paced by nacking and could not tell waiting from
+            // failing. v2 paces by RELEASING, and queen charges no retry budget
+            // on lease expiry, so the DLQ is back and means what it says.
+            QueueKind::OwnedIngress | QueueKind::Interior => {
+                let opts = QueueOptions {
+                    lease_time: Some(k.lease_seconds),
+                    retry_limit: Some(k.retry_limit),
+                    ..Default::default()
+                };
+                queen
+                    .queue(&q.name)
+                    .namespace(&plan.namespace)
+                    .configure(opts)
+                    .await?;
+            }
+            // The application's queue. Created so its consumers can subscribe
+            // before Gate has pushed anything — a group that finds no queue is a
+            // 404 an application has to code around — and never configured: its
+            // retention, its lease and its partition count belong to whoever
+            // made it.
+            QueueKind::Egress => {
+                queen.queue(&q.name).create().await.ok();
+            }
+            // Consumed, never created. If it does not exist yet, Gate finds it
+            // on its first message; declare-time validation says so as a
+            // warning.
+            QueueKind::UserIngress => {}
+        }
+    }
+    Ok(())
+}
 
-pub async fn stop_with(queen: &Queen, rt: &Arc<TargetRuntime>) {
-    // Runners first, refund second. Released the other way round, a runner
-    // still unwinding sees its pool's allowance swapped to zero and spends the
-    // rest of its last batch on denials — harmless, but a lie in the denial
-    // stats. Stopped first, nothing can observe the pool between the refund
-    // and the runtime going away.
-    stop(rt).await;
-    for pool in &rt.pools {
-        pool.release(queen, crate::now_ms()).await;
+/// What the broker knows about the queues a declaration names.
+///
+/// Read at declare time only — nothing in the hot path reads a queue's shape.
+/// A broker that will not answer costs a caller some advice and never a
+/// refusal, which is why every rule that reads this is a warning.
+pub async fn probe(queen: &Queen, plan: &Plan) -> BTreeMap<String, gate_core::QueueFacts> {
+    let mut out = BTreeMap::new();
+    for q in &plan.queues {
+        if q.kind != QueueKind::UserIngress {
+            continue;
+        }
+        match queen.admin().queue(&q.name).await {
+            Ok(v) => {
+                let partitions = v
+                    .get("partitions")
+                    .and_then(|p| p.as_array())
+                    .map(|a| a.len() as u32)
+                    .unwrap_or(0);
+                let retention = v
+                    .get("queue")
+                    .and_then(|q| q.get("retentionSeconds"))
+                    .or_else(|| v.get("retentionSeconds"))
+                    .and_then(|r| r.as_i64())
+                    .filter(|r| *r > 0)
+                    .map(|r| format!("{r} seconds"));
+                out.insert(
+                    q.name.clone(),
+                    gate_core::QueueFacts {
+                        exists: true,
+                        partitions,
+                        retention,
+                    },
+                );
+            }
+            // A 404 is BOTH "no such queue" and "this broker does not route the
+            // detail"; either way there is nothing to report and nothing to
+            // refuse.
+            Err(_) => {
+                out.insert(
+                    q.name.clone(),
+                    gate_core::QueueFacts {
+                        exists: false,
+                        partitions: 0,
+                        retention: None,
+                    },
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Fire every cancel a runtime owns, without waiting for anything.
+///
+/// Split out of [`stop`] so a caller tearing down MANY graphs can cancel them
+/// all first and only then await: a stage notices its cancel between polls, so N
+/// stops after one cancel-all pass cost the longest single poll window and not
+/// the sum of N of them.
+pub fn cancel(rt: &Arc<GraphRuntime>) {
+    // Before the cancels, so nothing can observe a runtime whose stages are
+    // going away and still believe it is serving.
+    rt.stopped.store(true, Ordering::Relaxed);
+    rt.cancel.cancel();
+    for st in &rt.stages {
+        st.cancel.cancel();
     }
 }
 
-/// Stop the old runtime and start a new spec in its place, keeping the target
+pub async fn stop(rt: &Arc<GraphRuntime>) {
+    cancel(rt);
+    // Await the tasks themselves rather than sleeping a guess. v1's fixed 600ms
+    // was sized for a 250ms poll window; the moment the window grew it stopped
+    // covering it, and a swap could start the NEW consumer while the old one was
+    // still parked. A stage notices its cancel between polls, so each await here
+    // is bounded by one poll window; the timeout is a wedge guard for a
+    // black-holed poll, and on expiry the task is merely detached — it still
+    // exits at its next check.
+    let handles: Vec<_> = std::mem::take(&mut *rt.handles.write());
+    let budget = knobs().poll_timeout + std::time::Duration::from_secs(2);
+    for h in handles {
+        let _ = tokio::time::timeout(budget, h).await;
+    }
+}
+
+/// Stop the old runtime and start a new document in its place, keeping the graph
 /// serving whatever happens.
 ///
 /// The failure this exists for: `start` fails half way (the broker refuses a
-/// `configure`), and the target is left stopped but still registered — it accepts
+/// `configure`) and the graph is left stopped but still registered — it accepts
 /// pushes and admits nothing, which is unrecoverable without an operator. So the
-/// old spec is restarted, and if even that fails the caller is told to unregister:
-/// a target that refuses pushes is recoverable, a queue nobody drains is not.
+/// old document is restarted, and if even that fails the caller is told to
+/// unregister: a graph that refuses pushes is recoverable, a queue nobody drains
+/// is not.
 pub async fn swap(
     queen: &Queen,
-    meter: Arc<crate::meter::Meter>,
-    history: Option<Arc<crate::history::History>>,
-    old: Option<&Arc<TargetRuntime>>,
-    spec: TargetSpec,
-    owner: Option<String>,
-) -> std::result::Result<Arc<TargetRuntime>, SwapFailed> {
+    budgets: &Budgets,
+    traces: Arc<Traces>,
+    old: Option<&Arc<GraphRuntime>>,
+    doc: GraphDoc,
+    plan: Plan,
+) -> std::result::Result<Arc<GraphRuntime>, SwapFailed> {
     if let Some(old) = old {
-        stop_with(queen, old).await;
+        stop(old).await;
     }
-    match start(queen, meter.clone(), history.clone(), spec, owner.clone()).await {
+    match start(queen, budgets, traces.clone(), doc, plan).await {
         Ok(rt) => Ok(rt),
         Err(e) => {
             let restored = match old {
-                Some(old) => start(
-                    queen,
-                    meter,
-                    history,
-                    old.spec.clone(),
-                    old.graph.clone(),
-                )
-                .await
-                .ok()
-                .inspect(|rt| {
-
-                    // The old spec's place in the store did not change because a new
-                    // one failed to start. Carrying the flag over is what stops the
-                    // reconcile loop reading this runtime as "declared here, never
-                    // persisted" and re-saving a target another replica has deleted.
-                    rt.persisted.store(
-                        old.persisted.load(std::sync::atomic::Ordering::Relaxed),
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                }),
-
+                Some(old) => start(queen, budgets, traces, old.doc.clone(), old.plan.clone())
+                    .await
+                    .ok()
+                    .inspect(|rt| {
+                        // The old document's place in the store did not change
+                        // because a new one failed to start. Carrying the flag over
+                        // is what stops the reconcile loop reading this runtime as
+                        // "declared here, never persisted" and re-saving a graph
+                        // another replica has deleted.
+                        rt.persisted
+                            .store(old.persisted.load(Ordering::Relaxed), Ordering::Relaxed);
+                    }),
                 None => None,
             };
-
-            Err(SwapFailed { error: e.to_string(), restored })
+            Err(SwapFailed {
+                error: e.to_string(),
+                restored,
+            })
         }
     }
 }
@@ -205,59 +253,7 @@ pub async fn swap(
 /// A provisioning failure, and whatever is serving now.
 pub struct SwapFailed {
     pub error: String,
-    /// The old runtime, restarted. `None` means nothing is serving this target and
-    /// the caller must unregister it.
-    pub restored: Option<Arc<TargetRuntime>>,
-}
-
-/// Fire every cancel a runtime owns, without waiting for anything.
-///
-/// Split out of [`stop`] so a caller tearing down MANY targets can cancel them
-/// all first and only then await: the runners notice a cancel between polls,
-/// so N stops after one cancel-all pass cost the longest single poll window,
-/// not the sum of N of them.
-pub fn cancel(rt: &Arc<TargetRuntime>) {
-    // Before the cancels, so nothing can observe a runtime whose runners are going away
-    // and still believe it is serving.
-    rt.stopped
-        .store(true, std::sync::atomic::Ordering::Relaxed);
-    for lane in rt.lanes.values() {
-        lane.cancel.cancel();
-    }
-    if let Some(c) = rt.meter_cancel.read().as_ref() {
-        c.cancel();
-    }
-}
-
-pub async fn stop(rt: &Arc<TargetRuntime>) {
-    cancel(rt);
-    // Await the runners themselves rather than sleeping a guess. The old fixed
-    // sleep was sized for a 250ms poll window; the moment the window grew it
-    // stopped covering it, and a swap could start the NEW runner while the old
-    // one was still parked in a poll — two writers on one state document, with
-    // `reset: true` on the new one for the old one's late commit to clobber.
-    // A runner notices its cancel between polls, so each await here is bounded
-    // by one poll window plus one cycle; the timeout is a wedge guard (a black-
-    // holed poll), and on expiry the loop task is merely detached — it still
-    // exits at its next is_stopped check, which is the old behaviour.
-    let handles: Vec<_> = std::mem::take(&mut *rt.handles.write());
-    for h in handles {
-        let _ = tokio::time::timeout(
-            crate::gate::STREAM_MAX_WAIT + std::time::Duration::from_secs(2),
-            h.stop(),
-        )
-        .await;
-    }
-    // The meter too — it is the one caller of Pool::top_up, so stop_with's
-    // refund must not run while it can still observe the pools. Its poll is a
-    // second long and it re-checks its cancel right after the poll, so this
-    // await is short; the timeout is the same wedge guard as above.
-    let meter_task = rt.meter_task.write().take();
-    if let Some(t) = meter_task {
-        let _ = tokio::time::timeout(
-            crate::gate::STREAM_MAX_WAIT + std::time::Duration::from_secs(2),
-            t,
-        )
-        .await;
-    }
+    /// The old runtime, restarted. `None` means nothing is serving this graph
+    /// and the caller must unregister it.
+    pub restored: Option<Arc<GraphRuntime>>,
 }

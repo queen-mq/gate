@@ -24,7 +24,6 @@
 //! Each test owns a freshly named application, so they neither see each other's
 //! queues nor each other's stored specs.
 
-
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -59,7 +58,6 @@ struct Harness {
 /// runtime on its own thread, so blocking one thread is exactly the intent — the other test
 /// threads wait rather than interleaving their traffic with this one's.
 fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
-
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
 
     // A poisoned lock means an earlier test panicked, which its own failure already
@@ -68,7 +66,6 @@ fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
 }
-
 
 /// A server in this process on an ephemeral port, plus an application name nobody
 /// else will use.
@@ -86,10 +83,8 @@ fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
 /// this one's.
 #[allow(clippy::await_holding_lock)]
 async fn harness(tag: &str) -> Option<Harness> {
-
     let serial = one_at_a_time();
     let url = match queen_url() {
-
         Some(u) => u,
         None => {
             // In automation a missing broker is the failure, not the excuse: this suite
@@ -123,11 +118,12 @@ async fn harness(tag: &str) -> Option<Harness> {
     })
 }
 
-
 /// The real router, on an ephemeral port: every test drives the HTTP surface a caller
 /// drives, rather than the functions behind it.
 async fn spawn_server(app: api::Shared) -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
     let addr = listener.local_addr().expect("addr");
     let router = api::router(app);
     tokio::spawn(async move {
@@ -137,7 +133,6 @@ async fn spawn_server(app: api::Shared) -> String {
 }
 
 async fn serve(url: &str) -> api::Shared {
-
     logs();
     let queen = Queen::connect(Config::new(url)).expect("connect");
     Arc::new(api::App::new(queen, url.to_string()))
@@ -157,7 +152,6 @@ fn logs() {
             .try_init();
     });
 }
-
 
 impl Harness {
     async fn put_graph(&self, name: &str, doc: Value) -> (u16, Value) {
@@ -194,7 +188,8 @@ impl Harness {
     }
 
     async fn ack(&self, body: Value) -> (u16, Value) {
-        self.send(reqwest::Method::POST, "/v1/leases/ack", Some(body)).await
+        self.send(reqwest::Method::POST, "/v1/leases/ack", Some(body))
+            .await
     }
 
     async fn send(&self, method: reqwest::Method, path: &str, body: Option<Value>) -> (u16, Value) {
@@ -372,7 +367,11 @@ impl FaultyBroker {
 
     /// How many requests have gone through whose path contains `marker`.
     fn hits(&self, marker: &str) -> usize {
-        self.seen.read().iter().filter(|p| p.contains(marker)).count()
+        self.seen
+            .read()
+            .iter()
+            .filter(|p| p.contains(marker))
+            .count()
     }
 
     fn forget(&self) {
@@ -400,7 +399,9 @@ async fn faulty_broker(real: &str) -> FaultyBroker {
         absent: absent.clone(),
         seen: seen.clone(),
     };
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
     let addr = listener.local_addr().expect("addr");
     let app = axum::Router::new()
         .fallback(axum::routing::any(proxy))
@@ -408,7 +409,12 @@ async fn faulty_broker(real: &str) -> FaultyBroker {
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    FaultyBroker { url: format!("http://{addr}"), refuse, absent, seen }
+    FaultyBroker {
+        url: format!("http://{addr}"),
+        refuse,
+        absent,
+        seen,
+    }
 }
 
 async fn proxy(
@@ -479,7 +485,6 @@ fn wide(id: &str) -> Value {
             "confidence": "inferred" })
 }
 
-
 fn chain_doc() -> Value {
     json!({
       "version": 1,
@@ -497,10 +502,16 @@ fn chain_doc() -> Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn an_edge_moves_every_item_once_and_only_once() {
-    let Some(h) = harness("edge").await else { return };
+    let Some(h) = harness("edge").await else {
+        return;
+    };
     let (status, body) = h.put_graph("g", chain_doc()).await;
     assert_eq!(status, 200, "declare: {body}");
-    assert_eq!(body["warnings"], json!([]), "declare bought caveats: {body}");
+    assert_eq!(
+        body["warnings"],
+        json!([]),
+        "declare bought caveats: {body}"
+    );
 
     const N: usize = 40;
     for i in 0..N {
@@ -517,7 +528,12 @@ async fn an_edge_moves_every_item_once_and_only_once() {
 
     let got = h.drain("g", "ip", "g.ip", N, Duration::from_secs(90)).await;
     let seen: HashSet<i64> = got.iter().filter_map(|p| p["n"].as_i64()).collect();
-    assert_eq!(got.len(), N, "expected {N} through the graph, got {}", got.len());
+    assert_eq!(
+        got.len(),
+        N,
+        "expected {N} through the graph, got {}",
+        got.len()
+    );
     assert_eq!(seen.len(), N, "an item was relayed twice");
 
     // The item carries the envelope Gate stamped at its entry, which is what a
@@ -566,7 +582,9 @@ async fn an_edge_moves_every_item_once_and_only_once() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn an_interior_queue_belongs_to_the_graph_and_not_to_a_caller() {
-    let Some(h) = harness("interior").await else { return };
+    let Some(h) = harness("interior").await else {
+        return;
+    };
     let (status, body) = h.put_graph("g", chain_doc()).await;
     assert_eq!(status, 200, "declare: {body}");
 
@@ -583,7 +601,10 @@ async fn an_interior_queue_belongs_to_the_graph_and_not_to_a_caller() {
     // And pushing into an interior push queue would skip every budget upstream.
     let (status, body) = h.push("g", "ip", json!({ "op": "message.post" })).await;
     assert_eq!(status, 409, "{body}");
-    assert!(body["error"].as_str().unwrap_or_default().contains("entry"), "{body}");
+    assert!(
+        body["error"].as_str().unwrap_or_default().contains("entry"),
+        "{body}"
+    );
 
     // A node that does not exist is a 404, not a 409.
     let (status, _) = h.push("g", "nope", json!({ "op": "x" })).await;
@@ -595,7 +616,9 @@ async fn an_interior_queue_belongs_to_the_graph_and_not_to_a_caller() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn a_throttled_call_re_enters_at_its_entry_until_its_attempts_run_out() {
-    let Some(h) = harness("retro").await else { return };
+    let Some(h) = harness("retro").await else {
+        return;
+    };
     // One node, entry and terminal at once: the shortest path that shows a retry
     // being paced rather than amplified.
     let doc = json!({
@@ -652,7 +675,11 @@ async fn a_throttled_call_re_enters_at_its_entry_until_its_attempts_run_out() {
             .await;
         assert_eq!(status, 200, "{ack}");
         if expected_attempt < 2 {
-            assert_eq!(ack["retried"], json!(1), "a throttle inside the cap re-enters: {ack}");
+            assert_eq!(
+                ack["retried"],
+                json!(1),
+                "a throttle inside the cap re-enters: {ack}"
+            );
             assert_eq!(ack["exhausted"], json!(0));
         } else {
             assert_eq!(ack["retried"], json!(0), "the cap must hold: {ack}");
@@ -692,7 +719,9 @@ async fn a_throttled_call_re_enters_at_its_entry_until_its_attempts_run_out() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn priority_at_the_entrance_is_priority_in_fact() {
-    let Some(h) = harness("priority").await else { return };
+    let Some(h) = harness("priority").await else {
+        return;
+    };
     // A slow terminal, so the merge is where the queue actually forms: 5 per second
     // means a window of 2 x 5 x 1s = 10 items in front of the gate, and everything
     // else waits in the lane it was pushed to.
@@ -714,7 +743,9 @@ async fn priority_at_the_entrance_is_priority_in_fact() {
     });
     let (status, body) = h.put_graph("g", doc).await;
     assert_eq!(status, 200, "declare: {body}");
-    let window = body["resolved"]["relays"][0]["window"].as_u64().expect("window");
+    let window = body["resolved"]["relays"][0]["window"]
+        .as_u64()
+        .expect("window");
     assert_eq!(window, 10, "2 x 5/s x 1s: {body}");
 
     for i in 0..200 {
@@ -772,8 +803,10 @@ async fn priority_at_the_entrance_is_priority_in_fact() {
         drained += items.len();
         if !items.is_empty() {
             let (status, ack) = h
-                .ack(json!({ "lease": body["lease"], "application": h.application,
-                             "target": "g.ip", "lane": "default", "op": "x" }))
+                .ack(
+                    json!({ "lease": body["lease"], "application": h.application,
+                             "target": "g.ip", "lane": "default", "op": "x" }),
+                )
                 .await;
             assert_eq!(status, 200, "{ack}");
         }
@@ -803,7 +836,9 @@ async fn priority_at_the_entrance_is_priority_in_fact() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn a_shard_serialises_one_key_and_lets_another_through() {
-    let Some(h) = harness("shard").await else { return };
+    let Some(h) = harness("shard").await else {
+        return;
+    };
     // One photo deletion per listing per minute, at a cardinality no single state
     // document could hold: 20,000 keys over 8 shards.
     let doc = json!({
@@ -831,7 +866,11 @@ async fn a_shard_serialises_one_key_and_lets_another_through() {
     assert_eq!(status, 200, "declare: {body}");
 
     // Two listings that hash apart.
-    let photos = h.app.registry.get(&h.application, "g.photos").expect("node");
+    let photos = h
+        .app
+        .registry
+        .get(&h.application, "g.photos")
+        .expect("node");
     let (mut a, mut b) = (None, None);
     for i in 0..200 {
         let key = format!("listing-{i}");
@@ -857,7 +896,9 @@ async fn a_shard_serialises_one_key_and_lets_another_through() {
         assert_eq!(status, 200, "{out}");
     }
 
-    let got = h.drain("g", "photos", "g.photos", 2, Duration::from_secs(60)).await;
+    let got = h
+        .drain("g", "photos", "g.photos", 2, Duration::from_secs(60))
+        .await;
     let entities: Vec<&str> = got.iter().filter_map(|p| p["entity"].as_str()).collect();
     assert!(entities.contains(&a.as_str()), "{entities:?}");
     assert!(
@@ -866,7 +907,9 @@ async fn a_shard_serialises_one_key_and_lets_another_through() {
     );
     // The second push for the same listing is held: the limit is per key, and the
     // key is what a shard is.
-    let more = h.drain("g", "photos", "g.photos", 1, Duration::from_secs(4)).await;
+    let more = h
+        .drain("g", "photos", "g.photos", 1, Duration::from_secs(4))
+        .await;
     assert!(
         more.is_empty(),
         "the same listing got through twice inside its window: {more:?}"
@@ -875,10 +918,17 @@ async fn a_shard_serialises_one_key_and_lets_another_through() {
     // A push with no shard dimension has no shard to belong to, and is refused
     // rather than defaulted into somebody else's counter.
     let (status, body) = h
-        .push("g", "photos", json!({ "op": "photo.delete", "payload": { "connection": "c1" } }))
+        .push(
+            "g",
+            "photos",
+            json!({ "op": "photo.delete", "payload": { "connection": "c1" } }),
+        )
         .await;
     assert_eq!(status, 422, "{body}");
-    assert!(body["error"].as_str().unwrap_or_default().contains("shard"), "{body}");
+    assert!(
+        body["error"].as_str().unwrap_or_default().contains("shard"),
+        "{body}"
+    );
 
     h.cleanup("g").await;
 }
@@ -886,7 +936,9 @@ async fn a_shard_serialises_one_key_and_lets_another_through() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn a_second_replica_converges_on_the_stored_spec() {
-    let Some(h) = harness("reconcile").await else { return };
+    let Some(h) = harness("reconcile").await else {
+        return;
+    };
     let url = queen_url().expect("checked");
 
     let spec = |cap: f64| {
@@ -929,7 +981,10 @@ async fn a_second_replica_converges_on_the_stored_spec() {
         .await;
     assert_eq!(status, 200, "{body}");
     gate_server::reconcile(&b).await;
-    let on_b = b.registry.get(&h.application, "airbnb").expect("still there");
+    let on_b = b
+        .registry
+        .get(&h.application, "airbnb")
+        .expect("still there");
     assert_eq!(
         on_b.spec.budgets[0].cap, 200.0,
         "the second replica kept enforcing the old cap"
@@ -954,7 +1009,10 @@ async fn a_second_replica_converges_on_the_stored_spec() {
     let (status, body) = h.put_graph("g", chain_doc()).await;
     assert_eq!(status, 200, "{body}");
     gate_server::reconcile(&b).await;
-    assert!(b.registry.graph(&h.application, "g").is_some(), "graph not restored");
+    assert!(
+        b.registry.graph(&h.application, "g").is_some(),
+        "graph not restored"
+    );
     assert!(
         b.registry.get(&h.application, "g.ip").is_some(),
         "a restored graph must bring its nodes up"
@@ -968,7 +1026,11 @@ async fn a_second_replica_converges_on_the_stored_spec() {
         )
         .await;
     assert_eq!(status, 200, "{body}");
-    assert_eq!(body["removed"], json!([]), "a sync reaped a graph node: {body}");
+    assert_eq!(
+        body["removed"],
+        json!([]),
+        "a sync reaped a graph node: {body}"
+    );
     assert!(h.app.registry.get(&h.application, "g.ip").is_some());
 
     h.cleanup("g").await;
@@ -978,7 +1040,9 @@ async fn a_second_replica_converges_on_the_stored_spec() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn a_failed_provisioning_leaves_the_old_spec_serving() {
-    let Some(h) = harness("restore").await else { return };
+    let Some(h) = harness("restore").await else {
+        return;
+    };
     // Through the DECLARE ROUTE, against a broker that refuses one `configure` — which
     // is what the plan asked for, and what the handler's own recovery branch needs in
     // order to be the thing under test rather than something a test re-implements.
@@ -1034,7 +1098,9 @@ async fn a_failed_provisioning_leaves_the_old_spec_serving() {
     // target left stopped but registered accepts pushes and drains nothing for ever.
     let (status, body) = {
         let res = http
-            .post(format!("{base}/v1/apps/{application}/targets/airbnb/lanes/bulk/push"))
+            .post(format!(
+                "{base}/v1/apps/{application}/targets/airbnb/lanes/bulk/push"
+            ))
             .json(&json!({ "op": "x", "payload": { "connection": "c1" } }))
             .send()
             .await
@@ -1067,7 +1133,9 @@ async fn a_failed_provisioning_leaves_the_old_spec_serving() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn a_declare_that_cannot_be_restored_leaves_nothing_registered() {
-    let Some(h) = harness("unregister").await else { return };
+    let Some(h) = harness("unregister").await else {
+        return;
+    };
     // The other half of the contract: when the OLD spec cannot be restarted either,
     // nothing is serving the target — and a registered target that admits nothing is the
     // one state an operator cannot recover from. So it is unregistered, pushes are
@@ -1102,7 +1170,10 @@ async fn a_declare_that_cannot_be_restored_leaves_nothing_registered() {
     let status = res.status().as_u16();
     let body = res.text().await.unwrap_or_default();
     assert_eq!(status, 502, "{body}");
-    assert!(body.contains("unregistered"), "the handler must say so: {body}");
+    assert!(
+        body.contains("unregistered"),
+        "the handler must say so: {body}"
+    );
     assert!(
         app.registry.get(&application, "airbnb").is_none(),
         "a stopped runtime must not be left registered"
@@ -1110,12 +1181,18 @@ async fn a_declare_that_cannot_be_restored_leaves_nothing_registered() {
 
     // A push is refused rather than accepted into a queue nothing drains.
     let res = http
-        .post(format!("{base}/v1/apps/{application}/targets/airbnb/lanes/bulk/push"))
+        .post(format!(
+            "{base}/v1/apps/{application}/targets/airbnb/lanes/bulk/push"
+        ))
         .json(&json!({ "op": "x", "payload": { "connection": "c1" } }))
         .send()
         .await
         .expect("push");
-    assert_eq!(res.status().as_u16(), 404, "a push was accepted with nothing serving it");
+    assert_eq!(
+        res.status().as_u16(),
+        404,
+        "a push was accepted with nothing serving it"
+    );
 
     // And the reconcile loop repairs it from the store, which still holds version 1.
     broker.allow();
@@ -1127,7 +1204,9 @@ async fn a_declare_that_cannot_be_restored_leaves_nothing_registered() {
         "the reconcile pass did not bring the target back"
     );
     let res = http
-        .post(format!("{base}/v1/apps/{application}/targets/airbnb/lanes/bulk/push"))
+        .post(format!(
+            "{base}/v1/apps/{application}/targets/airbnb/lanes/bulk/push"
+        ))
         .json(&json!({ "op": "x", "payload": { "connection": "c1" } }))
         .send()
         .await
@@ -1140,7 +1219,9 @@ async fn a_declare_that_cannot_be_restored_leaves_nothing_registered() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn one_owner_per_queue_family() {
-    let Some(h) = harness("owner").await else { return };
+    let Some(h) = harness("owner").await else {
+        return;
+    };
     let (status, body) = h.put_graph("g", chain_doc()).await;
     assert_eq!(status, 200, "{body}");
 
@@ -1188,7 +1269,13 @@ async fn one_owner_per_queue_family() {
     assert_eq!(status, 200, "{body}");
     let (status, body) = h.put_graph("h", chain_doc()).await;
     assert_eq!(status, 409, "{body}");
-    assert!(body["error"].as_str().unwrap_or_default().contains("standalone"), "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("standalone"),
+        "{body}"
+    );
 
     let _ = h
         .send(
@@ -1203,7 +1290,9 @@ async fn one_owner_per_queue_family() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn the_console_can_draw_what_is_running() {
-    let Some(h) = harness("console").await else { return };
+    let Some(h) = harness("console").await else {
+        return;
+    };
     let (status, body) = h.put_graph("g", chain_doc()).await;
     assert_eq!(status, 200, "{body}");
 
@@ -1261,7 +1350,9 @@ async fn the_console_can_draw_what_is_running() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn a_node_cannot_be_reached_through_the_target_routes() {
-    let Some(h) = harness("bypass").await else { return };
+    let Some(h) = harness("bypass").await else {
+        return;
+    };
     let (status, body) = h.put_graph("g", chain_doc()).await;
     assert_eq!(status, 200, "{body}");
 
@@ -1279,7 +1370,10 @@ async fn a_node_cannot_be_reached_through_the_target_routes() {
             None,
         )
         .await;
-    assert_eq!(status, 409, "an interior queue was popped through the target route: {body}");
+    assert_eq!(
+        status, 409,
+        "an interior queue was popped through the target route: {body}"
+    );
 
     let (status, body) = h
         .send(
@@ -1288,8 +1382,14 @@ async fn a_node_cannot_be_reached_through_the_target_routes() {
             Some(json!({ "op": "message.post", "payload": { "connection": "c1" } })),
         )
         .await;
-    assert_eq!(status, 409, "a terminal was pushed to through the target route: {body}");
-    assert!(body["error"].as_str().unwrap_or_default().contains("graph"), "{body}");
+    assert_eq!(
+        status, 409,
+        "a terminal was pushed to through the target route: {body}"
+    );
+    assert!(
+        body["error"].as_str().unwrap_or_default().contains("graph"),
+        "{body}"
+    );
 
     h.cleanup("g").await;
 }
@@ -1297,7 +1397,9 @@ async fn a_node_cannot_be_reached_through_the_target_routes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn a_batch_ack_re_enters_only_the_items_the_caller_names() {
-    let Some(h) = harness("breached").await else { return };
+    let Some(h) = harness("breached").await else {
+        return;
+    };
     // One node, so the item comes straight back to where it can be popped again.
     let doc = json!({
       "version": 1,
@@ -1333,11 +1435,13 @@ async fn a_batch_ack_re_enters_only_the_items_the_caller_names() {
     let (status, body) = h.next("g", "calls", 10, 2_000).await;
     assert_eq!(status, 200, "{body}");
     let items = body["items"].as_array().cloned().unwrap_or_default();
-    assert!(items.len() >= 2, "expected one lease with several items: {body}");
+    assert!(
+        items.len() >= 2,
+        "expected one lease with several items: {body}"
+    );
     let last = items.len() - 1;
     let throttled_id = items[last]["id"].as_str().expect("id").to_string();
     let throttled_n = items[last]["payload"]["n"].clone();
-
 
     let (status, ack) = h
         .ack(json!({
@@ -1352,17 +1456,26 @@ async fn a_batch_ack_re_enters_only_the_items_the_caller_names() {
         }))
         .await;
     assert_eq!(status, 200, "{ack}");
-    assert_eq!(ack["retried"], json!(1), "only the named item re-enters: {ack}");
+    assert_eq!(
+        ack["retried"],
+        json!(1),
+        "only the named item re-enters: {ack}"
+    );
     assert_eq!(
         ack["acked"],
         json!(items.len()),
         "and the whole lease is still settled: {ack}"
     );
 
-
     // And it is the right one.
-    let back = h.drain("g", "calls", "g.calls", 1, Duration::from_secs(60)).await;
-    assert_eq!(back.len(), 1, "the throttled item did not come back: {back:?}");
+    let back = h
+        .drain("g", "calls", "g.calls", 1, Duration::from_secs(60))
+        .await;
+    assert_eq!(
+        back.len(),
+        1,
+        "the throttled item did not come back: {back:?}"
+    );
     assert_eq!(back[0]["n"], throttled_n);
     assert_eq!(back[0]["_gate"]["attempt"], json!(1));
 
@@ -1372,7 +1485,9 @@ async fn a_batch_ack_re_enters_only_the_items_the_caller_names() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn an_impossible_retry_is_reported_and_still_settles_the_work() {
-    let Some(h) = harness("refused").await else { return };
+    let Some(h) = harness("refused").await else {
+        return;
+    };
     // A graph with no breach rule at all: a caller asking for a re-entry is asking for
     // something this graph does not declare.
     let (status, body) = h.put_graph("g", chain_doc()).await;
@@ -1396,7 +1511,10 @@ async fn an_impossible_retry_is_reported_and_still_settles_the_work() {
             lease = b["lease"].clone();
         }
     }
-    assert!(lease.as_array().is_some(), "nothing arrived at the terminal");
+    assert!(
+        lease.as_array().is_some(),
+        "nothing arrived at the terminal"
+    );
 
     // The work has already been done by the time this ack arrives. Refusing to settle
     // it would have it redelivered and done AGAIN, so the refusal is reported in the
@@ -1417,7 +1535,10 @@ async fn an_impossible_retry_is_reported_and_still_settles_the_work() {
     assert_eq!(ack["acked"], json!(1));
     assert_eq!(ack["retried"], json!(0));
     assert!(
-        ack["refused"].as_str().unwrap_or_default().contains("breach rule"),
+        ack["refused"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("breach rule"),
         "the answer should say why nothing was retried: {ack}"
     );
 
@@ -1427,7 +1548,9 @@ async fn an_impossible_retry_is_reported_and_still_settles_the_work() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn an_ack_that_arrives_twice_settles_once_and_retries_once() {
-    let Some(h) = harness("replay").await else { return };
+    let Some(h) = harness("replay").await else {
+        return;
+    };
     // A caller whose ack timed out sends it again. The retro push is keyed by the
     // attempt, so the second copy hits the broker's dedup — which inside a
     // transaction is a HARD error that rolls the ack back with it. Left alone, that
@@ -1473,13 +1596,21 @@ async fn an_ack_that_arrives_twice_settles_once_and_retries_once() {
 
     let (status, again) = h.ack(ack).await;
     assert_eq!(status, 200, "a replayed ack must not fail: {again}");
-    assert_eq!(again["retried"], json!(0), "and must not retry twice: {again}");
+    assert_eq!(
+        again["retried"],
+        json!(0),
+        "and must not retry twice: {again}"
+    );
 
     // Exactly one re-entry exists, carrying attempt 1.
-    let back = h.drain("g", "calls", "g.calls", 1, Duration::from_secs(60)).await;
+    let back = h
+        .drain("g", "calls", "g.calls", 1, Duration::from_secs(60))
+        .await;
     assert_eq!(back.len(), 1, "{back:?}");
     assert_eq!(back[0]["_gate"]["attempt"], json!(1));
-    let extra = h.drain("g", "calls", "g.calls", 1, Duration::from_secs(4)).await;
+    let extra = h
+        .drain("g", "calls", "g.calls", 1, Duration::from_secs(4))
+        .await;
     assert!(extra.is_empty(), "the item was re-entered twice: {extra:?}");
 
     h.cleanup("g").await;
@@ -1488,7 +1619,9 @@ async fn an_ack_that_arrives_twice_settles_once_and_retries_once() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn an_overlapping_ack_keeps_the_new_items_re_entry() {
-    let Some(h) = harness("overlap").await else { return };
+    let Some(h) = harness("overlap").await else {
+        return;
+    };
     // The ack is positional — "you settle the first N" — so a consumer finishing a
     // lease in two goes necessarily re-sends the prefix it already settled. The
     // prefix's re-entry is then a duplicate, and a duplicate is a HARD error inside a
@@ -1552,13 +1685,21 @@ async fn an_overlapping_ack_keeps_the_new_items_re_entry() {
     );
 
     // Both items are now waiting for budget again, each once.
-    let back = h.drain("g", "calls", "g.calls", 2, Duration::from_secs(60)).await;
+    let back = h
+        .drain("g", "calls", "g.calls", 2, Duration::from_secs(60))
+        .await;
     let mut seen: Vec<i64> = back.iter().filter_map(|p| p["n"].as_i64()).collect();
     seen.sort();
     let mut want: Vec<i64> = ns.iter().filter_map(|n| n.as_i64()).collect();
     want.sort();
-    assert_eq!(seen, want, "every throttled item should have re-entered exactly once");
-    assert!(back.iter().all(|p| p["_gate"]["attempt"] == json!(1)), "{back:?}");
+    assert_eq!(
+        seen, want,
+        "every throttled item should have re-entered exactly once"
+    );
+    assert!(
+        back.iter().all(|p| p["_gate"]["attempt"] == json!(1)),
+        "{back:?}"
+    );
 
     h.cleanup("g").await;
 }
@@ -1566,7 +1707,9 @@ async fn an_overlapping_ack_keeps_the_new_items_re_entry() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn an_ack_that_names_the_wrong_target_says_so() {
-    let Some(h) = harness("naming").await else { return };
+    let Some(h) = harness("naming").await else {
+        return;
+    };
     let doc = json!({
       "version": 1,
       "nodes": {
@@ -1611,7 +1754,10 @@ async fn an_ack_that_names_the_wrong_target_says_so() {
     assert_eq!(status, 200, "the work is still settled: {ack}");
     assert_eq!(ack["retried"], json!(0));
     let refused = ack["refused"].as_str().unwrap_or_default();
-    assert!(refused.contains("no target"), "the answer must say what was skipped: {ack}");
+    assert!(
+        refused.contains("no target"),
+        "the answer must say what was skipped: {ack}"
+    );
     assert!(
         refused.contains("{graph}.{node}"),
         "and how a node is addressed: {ack}"
@@ -1623,7 +1769,9 @@ async fn an_ack_that_names_the_wrong_target_says_so() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn a_replica_converges_on_a_redeclared_graph_instead_of_wedging() {
-    let Some(h) = harness("wedge").await else { return };
+    let Some(h) = harness("wedge").await else {
+        return;
+    };
     let url = queen_url().expect("checked");
 
     // A version bump protects a CALLER from re-founding counters by accident. Enforcing
@@ -1683,7 +1831,9 @@ async fn a_replica_converges_on_a_redeclared_graph_instead_of_wedging() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn replaying_the_relays_own_transaction_forwards_nothing_twice() {
-    let Some(h) = harness("replay-relay").await else { return };
+    let Some(h) = harness("replay-relay").await else {
+        return;
+    };
     let (status, body) = h.put_graph("g", chain_doc()).await;
     assert_eq!(status, 200, "{body}");
 
@@ -1700,7 +1850,11 @@ async fn replaying_the_relays_own_transaction_forwards_nothing_twice() {
         assert_eq!(status, 200);
     }
 
-    let src = h.app.registry.get(&h.application, "g.messages").expect("node");
+    let src = h
+        .app
+        .registry
+        .get(&h.application, "g.messages")
+        .expect("node");
     let dst = h.app.registry.get(&h.application, "g.ip").expect("node");
     let group = gate_server::edge::group_of(&h.application, "g", "messages", "ip");
 
@@ -1744,7 +1898,10 @@ async fn replaying_the_relays_own_transaction_forwards_nothing_twice() {
             .expect("stage")
     };
 
-    relay_txn().commit().await.expect("the first forward must land");
+    relay_txn()
+        .commit()
+        .await
+        .expect("the first forward must land");
     let replayed = relay_txn().commit().await;
     let err = replayed.expect_err("a replayed relay transaction must not commit twice");
     let text = err.to_string();
@@ -1756,7 +1913,12 @@ async fn replaying_the_relays_own_transaction_forwards_nothing_twice() {
     // And the graph still delivers every item once — no copy, none lost.
     let got = h.drain("g", "ip", "g.ip", N, Duration::from_secs(90)).await;
     let seen: HashSet<i64> = got.iter().filter_map(|p| p["n"].as_i64()).collect();
-    assert_eq!(seen.len(), N, "expected {N} distinct items, saw {}: {got:?}", seen.len());
+    assert_eq!(
+        seen.len(),
+        N,
+        "expected {N} distinct items, saw {}: {got:?}",
+        seen.len()
+    );
     assert_eq!(got.len(), N, "an item was delivered twice");
 
     h.cleanup("g").await;
@@ -1773,7 +1935,9 @@ async fn replaying_the_relays_own_transaction_forwards_nothing_twice() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn a_relay_batch_poisoned_by_a_duplicate_still_settles_every_item() {
-    let Some(h) = harness("poison").await else { return };
+    let Some(h) = harness("poison").await else {
+        return;
+    };
     // 5/s at the terminal: a window of 2 x 5 x 1s = 10, so with 30 items in flight the
     // relay is holding most of them and cannot have forwarded the tail.
     let doc = json!({
@@ -1792,7 +1956,11 @@ async fn a_relay_batch_poisoned_by_a_duplicate_still_settles_every_item() {
     let (status, body) = h.put_graph("g", doc).await;
     assert_eq!(status, 200, "{body}");
 
-    let src = h.app.registry.get(&h.application, "g.messages").expect("node");
+    let src = h
+        .app
+        .registry
+        .get(&h.application, "g.messages")
+        .expect("node");
     let dst = h.app.registry.get(&h.application, "g.ip").expect("node");
 
     const N: usize = 30;
@@ -1854,7 +2022,10 @@ async fn a_relay_batch_poisoned_by_a_duplicate_still_settles_every_item() {
     let seen: HashSet<i64> = got.iter().filter_map(|p| p["n"].as_i64()).collect();
     let mut missing: Vec<usize> = (0..N).filter(|i| !seen.contains(&(*i as i64))).collect();
     missing.sort();
-    assert!(missing.is_empty(), "the relay lost items to a poisoned batch: {missing:?}");
+    assert!(
+        missing.is_empty(),
+        "the relay lost items to a poisoned batch: {missing:?}"
+    );
     assert_eq!(got.len(), N, "an item arrived twice");
 
     // And it took the recovery path rather than never seeing the duplicate at all.
@@ -1882,7 +2053,11 @@ async fn a_relay_batch_poisoned_by_a_duplicate_still_settles_every_item() {
         .await;
     assert_eq!(status, 200);
     let after = h.drain("g", "ip", "g.ip", 1, Duration::from_secs(60)).await;
-    assert_eq!(after.len(), 1, "the relay stopped forwarding after the duplicate");
+    assert_eq!(
+        after.len(),
+        1,
+        "the relay stopped forwarding after the duplicate"
+    );
     assert_eq!(after[0]["n"], json!(99));
 
     h.cleanup("g").await;
@@ -1928,10 +2103,16 @@ fn sharded_chain(partitions: u32) -> Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn a_connections_items_keep_their_order_across_parallel_relay_runners() {
-    let Some(h) = harness("relay-order").await else { return };
+    let Some(h) = harness("relay-order").await else {
+        return;
+    };
     let (status, body) = h.put_graph("g", sharded_chain(16)).await;
     assert_eq!(status, 200, "declare: {body}");
-    assert_eq!(body["warnings"], json!([]), "declare bought caveats: {body}");
+    assert_eq!(
+        body["warnings"],
+        json!([]),
+        "declare bought caveats: {body}"
+    );
     // The mechanism, asserted before anything that depends on it: sixteen partitions on
     // the source is sixteen runners on the edge. Without this the test could pass on a
     // relay that never parallelised at all.
@@ -1960,8 +2141,15 @@ async fn a_connections_items_keep_their_order_across_parallel_relay_runners() {
     }
 
     let want = CONNECTIONS * EACH;
-    let got = h.drain("g", "ip", "g.ip", want, Duration::from_secs(90)).await;
-    assert_eq!(got.len(), want, "expected {want} through the graph, got {}", got.len());
+    let got = h
+        .drain("g", "ip", "g.ip", want, Duration::from_secs(90))
+        .await;
+    assert_eq!(
+        got.len(),
+        want,
+        "expected {want} through the graph, got {}",
+        got.len()
+    );
 
     // Order per connection, in arrival order at the terminal. Nothing is asserted about
     // how two connections interleave — they are different partitions and the graph never
@@ -1979,7 +2167,11 @@ async fn a_connections_items_keep_their_order_across_parallel_relay_runners() {
             );
         }
     }
-    assert_eq!(last.len(), CONNECTIONS, "not every connection arrived: {last:?}");
+    assert_eq!(
+        last.len(),
+        CONNECTIONS,
+        "not every connection arrived: {last:?}"
+    );
 
     h.cleanup("g").await;
 }
@@ -2000,7 +2192,9 @@ async fn a_connections_items_keep_their_order_across_parallel_relay_runners() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn a_redelivered_relay_is_refused_even_when_the_relay_is_sharded() {
-    let Some(h) = harness("relay-dup").await else { return };
+    let Some(h) = harness("relay-dup").await else {
+        return;
+    };
     let mut doc = sharded_chain(16);
     // 10/s at the terminal: a window of 2 x 10 x 1s = 20.
     doc["nodes"]["ip"]["budgets"] = json!([
@@ -2024,11 +2218,19 @@ async fn a_redelivered_relay_is_refused_even_when_the_relay_is_sharded() {
         assert_eq!(status, 200);
     }
 
-    let src = h.app.registry.get(&h.application, "g.messages").expect("node");
+    let src = h
+        .app
+        .registry
+        .get(&h.application, "g.messages")
+        .expect("node");
     let dst = h.app.registry.get(&h.application, "g.ip").expect("node");
     let group = gate_server::edge::group_of(&h.application, "g", "messages", "ip");
     let partitions = src.spec.admitted.partition_names();
-    assert_eq!(partitions.len(), 16, "the source ring is not what was declared");
+    assert_eq!(
+        partitions.len(),
+        16,
+        "the source ring is not what was declared"
+    );
 
     // Claim one the way a runner does: pinned to a single partition, under the edge's
     // group. The real runners are competing for the same claims, so this sweeps the ring
@@ -2082,7 +2284,10 @@ async fn a_redelivered_relay_is_refused_even_when_the_relay_is_sharded() {
             })
             .expect("stage")
     };
-    relay_txn().commit().await.expect("the first forward must land");
+    relay_txn()
+        .commit()
+        .await
+        .expect("the first forward must land");
     let err = relay_txn()
         .commit()
         .await
@@ -2096,7 +2301,12 @@ async fn a_redelivered_relay_is_refused_even_when_the_relay_is_sharded() {
     // And the graph still delivers every item exactly once, across all sixteen runners.
     let got = h.drain("g", "ip", "g.ip", N, Duration::from_secs(90)).await;
     let seen: HashSet<i64> = got.iter().filter_map(|p| p["n"].as_i64()).collect();
-    assert_eq!(seen.len(), N, "expected {N} distinct items, saw {}", seen.len());
+    assert_eq!(
+        seen.len(),
+        N,
+        "expected {N} distinct items, saw {}",
+        seen.len()
+    );
     assert_eq!(got.len(), N, "an item was delivered twice");
 
     h.cleanup("g").await;
@@ -2118,7 +2328,9 @@ async fn a_redelivered_relay_is_refused_even_when_the_relay_is_sharded() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn priority_and_the_window_survive_the_relay_being_many_runners() {
-    let Some(h) = harness("relay-priority").await else { return };
+    let Some(h) = harness("relay-priority").await else {
+        return;
+    };
     // 5 per second at the terminal: a window of 2 x 5 x 1s = 10 items in front of the
     // gate. Sixteen runners per leg against a window of ten is the interesting case —
     // it is smaller than the runner count, so a per-runner slice would be visible.
@@ -2141,10 +2353,19 @@ async fn priority_and_the_window_survive_the_relay_being_many_runners() {
     });
     let (status, body) = h.put_graph("g", doc).await;
     assert_eq!(status, 200, "declare: {body}");
-    let window = body["resolved"]["relays"][0]["window"].as_u64().expect("window");
+    let window = body["resolved"]["relays"][0]["window"]
+        .as_u64()
+        .expect("window");
     assert_eq!(window, 10, "2 x 5/s x 1s: {body}");
-    for leg in body["resolved"]["relays"][0]["sources"].as_array().expect("legs") {
-        assert_eq!(leg["runners"].as_u64(), Some(16), "leg {leg} is not sharded");
+    for leg in body["resolved"]["relays"][0]["sources"]
+        .as_array()
+        .expect("legs")
+    {
+        assert_eq!(
+            leg["runners"].as_u64(),
+            Some(16),
+            "leg {leg} is not sharded"
+        );
     }
 
     // A flood on the low-priority leg, spread over every partition of it.
@@ -2205,8 +2426,10 @@ async fn priority_and_the_window_survive_the_relay_being_many_runners() {
         drained += items.len();
         if !items.is_empty() {
             let (status, ack) = h
-                .ack(json!({ "lease": body["lease"], "application": h.application,
-                             "target": "g.ip", "lane": "default", "op": "x" }))
+                .ack(
+                    json!({ "lease": body["lease"], "application": h.application,
+                             "target": "g.ip", "lane": "default", "op": "x" }),
+                )
                 .await;
             assert_eq!(status, 200, "{ack}");
         }
@@ -2251,7 +2474,9 @@ async fn priority_and_the_window_survive_the_relay_being_many_runners() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn a_leg_that_is_not_dry_holds_its_window_but_not_for_ever() {
-    let Some(h) = harness("stall").await else { return };
+    let Some(h) = harness("stall").await else {
+        return;
+    };
     let broker = faulty_broker(&queen_url().expect("checked")).await;
     let app = Arc::new(api::App::new(
         Queen::connect(Config::new(&broker.url)).expect("connect"),
@@ -2286,7 +2511,12 @@ async fn a_leg_that_is_not_dry_holds_its_window_but_not_for_ever() {
         .send()
         .await
         .expect("declare");
-    assert_eq!(res.status().as_u16(), 200, "{}", res.text().await.unwrap_or_default());
+    assert_eq!(
+        res.status().as_u16(),
+        200,
+        "{}",
+        res.text().await.unwrap_or_default()
+    );
 
     // Every read of the high-priority leg's admitted queue now fails. Its runners do
     // not come back empty — they come back with an error, which is the state the rule
@@ -2311,18 +2541,18 @@ async fn a_leg_that_is_not_dry_holds_its_window_but_not_for_ever() {
     let upstream = bulk.spec.admitted_queue("default");
     let waiting = |queue: String| {
         let app = app.clone();
-        async move { app.depths.pending_now(&app.queen, &queue).await.values().sum::<u64>() }
+        async move {
+            app.depths
+                .pending_now(&app.queen, &queue)
+                .await
+                .values()
+                .sum::<u64>()
+        }
     };
     // What the relay has FORWARDED, not what is sitting at the destination: the
     // terminal's own gate admits what arrives within the second, so a depth read
     // there is zero whether the relay is holding or racing.
-    let forwarded = || {
-        app.registry
-            .graph(&application, "g")
-            .expect("graph")
-            .relays[0]
-            .forwarded()
-    };
+    let forwarded = || app.registry.graph(&application, "g").expect("graph").relays[0].forwarded();
 
     // The low-priority leg has work and the destination has room, so the ONLY thing
     // between them is the rule under test.
@@ -2373,7 +2603,9 @@ async fn a_leg_that_is_not_dry_holds_its_window_but_not_for_ever() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn the_reconcile_loop_converges_a_second_replica_on_its_own() {
-    let Some(h) = harness("loop").await else { return };
+    let Some(h) = harness("loop").await else {
+        return;
+    };
     let url = queen_url().expect("checked");
 
     let spec = |cap: f64| {
@@ -2456,7 +2688,9 @@ async fn the_reconcile_loop_converges_a_second_replica_on_its_own() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn a_wide_window_does_not_leak_priority_to_the_next_leg() {
-    let Some(h) = harness("leak").await else { return };
+    let Some(h) = harness("leak").await else {
+        return;
+    };
     // 1500 per 10s -> 150/s -> a window of 2 x 150 x 1s = 300, wider than the 200 a
     // single forward carries.
     let doc = json!({
@@ -2499,8 +2733,10 @@ async fn a_wide_window_does_not_leak_priority_to_the_next_leg() {
                         .post(format!(
                             "{base}/v1/apps/{application}/graphs/g/nodes/{node}/push"
                         ))
-                        .json(&json!({ "op": "m.post", "txn": format!("{kind}-{task}-{i}"),
-                                       "payload": { "connection": "c1", "kind": kind } }))
+                        .json(
+                            &json!({ "op": "m.post", "txn": format!("{kind}-{task}-{i}"),
+                                       "payload": { "connection": "c1", "kind": kind } }),
+                        )
                         .send()
                         .await;
                 }
@@ -2509,7 +2745,11 @@ async fn a_wide_window_does_not_leak_priority_to_the_next_leg() {
     }
 
     // Wait for both legs to be deep — and say so rather than asserting on an empty queue.
-    let prices = h.app.registry.get(&h.application, "g.prices").expect("node");
+    let prices = h
+        .app
+        .registry
+        .get(&h.application, "g.prices")
+        .expect("node");
     let bulk_node = h.app.registry.get(&h.application, "g.bulk").expect("node");
     let started = Instant::now();
     let (mut deep_urgent, mut deep_bulk) = (0u64, 0u64);
@@ -2567,7 +2807,11 @@ async fn a_wide_window_does_not_leak_priority_to_the_next_leg() {
     for w in writers {
         w.abort();
     }
-    assert!(order.len() >= 300, "only {} items were forwarded", order.len());
+    assert!(
+        order.len() >= 300,
+        "only {} items were forwarded",
+        order.len()
+    );
 
     // While priority 0 has a backlog, priority 1 waits. A pass that popped each leg once
     // mixed in a third of the window.
@@ -2589,7 +2833,9 @@ async fn a_wide_window_does_not_leak_priority_to_the_next_leg() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn a_declare_that_cannot_be_stored_is_not_acknowledged() {
-    let Some(h) = harness("durable").await else { return };
+    let Some(h) = harness("durable").await else {
+        return;
+    };
     let broker = faulty_broker(&queen_url().expect("checked")).await;
     let app = Arc::new(api::App::new(
         Queen::connect(Config::new(&broker.url)).expect("connect"),
@@ -2609,7 +2855,12 @@ async fn a_declare_that_cannot_be_stored_is_not_acknowledged() {
           "cost": { "field": "httpCost", "default": 1, "max": 1 }
         })
     };
-    let res = http.put(&url).json(&spec(1000.0)).send().await.expect("declare");
+    let res = http
+        .put(&url)
+        .json(&spec(1000.0))
+        .send()
+        .await
+        .expect("declare");
     assert_eq!(res.status().as_u16(), 200);
 
     // Only the kv write is refused: provisioning succeeds, the store does not. The key is in
@@ -2617,17 +2868,27 @@ async fn a_declare_that_cannot_be_stored_is_not_acknowledged() {
     // target declare goes near it.
     broker.refuse("/api/v1/kv/gate/spec");
 
-
-    let res = http.put(&url).json(&spec(200.0)).send().await.expect("declare");
+    let res = http
+        .put(&url)
+        .json(&spec(200.0))
+        .send()
+        .await
+        .expect("declare");
     let status = res.status().as_u16();
     let body = res.text().await.unwrap_or_default();
     assert_eq!(status, 502, "{body}");
-    assert!(body.contains("NOT durable"), "the caller must be told: {body}");
+    assert!(
+        body.contains("NOT durable"),
+        "the caller must be told: {body}"
+    );
     broker.allow();
 
     // And the reconcile pass puts the stored spec back, which is what the answer said.
     gate_server::reconcile(&app).await;
-    let rt = app.registry.get(&application, "airbnb").expect("still serving");
+    let rt = app
+        .registry
+        .get(&application, "airbnb")
+        .expect("still serving");
     assert_eq!(
         rt.spec.budgets[0].cap, 1000.0,
         "the un-stored declare should have been reverted to the stored spec"
@@ -2643,7 +2904,9 @@ async fn a_declare_that_cannot_be_stored_is_not_acknowledged() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn a_target_that_cannot_be_provisioned_can_still_be_deleted() {
-    let Some(h) = harness("undeletable").await else { return };
+    let Some(h) = harness("undeletable").await else {
+        return;
+    };
     let broker = faulty_broker(&queen_url().expect("checked")).await;
     let app = Arc::new(api::App::new(
         Queen::connect(Config::new(&broker.url)).expect("connect"),
@@ -2710,7 +2973,9 @@ async fn a_target_that_cannot_be_provisioned_can_still_be_deleted() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn a_depth_the_broker_will_not_report_falls_back_to_the_last_one() {
-    let Some(h) = harness("depth").await else { return };
+    let Some(h) = harness("depth").await else {
+        return;
+    };
     let broker = faulty_broker(&queen_url().expect("checked")).await;
     let app = Arc::new(api::App::new(
         Queen::connect(Config::new(&broker.url)).expect("connect"),
@@ -2738,7 +3003,9 @@ async fn a_depth_the_broker_will_not_report_falls_back_to_the_last_one() {
     // One per ten minutes, so a few pushes stay pending and the depth is a real number.
     for i in 0..5 {
         let res = http
-            .post(format!("{base}/v1/apps/{application}/targets/airbnb/lanes/bulk/push"))
+            .post(format!(
+                "{base}/v1/apps/{application}/targets/airbnb/lanes/bulk/push"
+            ))
             .json(&json!({ "op": "x", "txn": format!("d{i}"), "payload": { "connection": "c1" } }))
             .send()
             .await
@@ -2752,24 +3019,17 @@ async fn a_depth_the_broker_will_not_report_falls_back_to_the_last_one() {
     let mut good = 0u64;
     while started.elapsed() < Duration::from_secs(45) && good == 0 {
         tokio::time::sleep(Duration::from_millis(300)).await;
-        good = app
-            .depths
-            .pending(&app.queen, &queue)
-            .await
-            .values()
-            .sum();
+        good = app.depths.pending(&app.queen, &queue).await.values().sum();
     }
-    assert!(good > 0, "nothing was pending, so this test has no number to hold on to");
+    assert!(
+        good > 0,
+        "nothing was pending, so this test has no number to hold on to"
+    );
 
     // Now the admin API stops answering, and the cached answer goes stale.
     broker.refuse("/api/v1/resources/queues");
     tokio::time::sleep(Duration::from_millis(2_200)).await;
-    let during: u64 = app
-        .depths
-        .pending(&app.queen, &queue)
-        .await
-        .values()
-        .sum();
+    let during: u64 = app.depths.pending(&app.queen, &queue).await.values().sum();
     assert_eq!(
         during, good,
         "an unanswered depth read was reported as an empty queue"
@@ -2777,7 +3037,10 @@ async fn a_depth_the_broker_will_not_report_falls_back_to_the_last_one() {
     // And the relay's own read says "unknown" rather than "empty", which is what stops it
     // forwarding a full window against a depth it does not know.
     assert!(
-        app.depths.try_pending_now(&app.queen, &queue).await.is_none(),
+        app.depths
+            .try_pending_now(&app.queen, &queue)
+            .await
+            .is_none(),
         "the relay must be told the depth is unknown"
     );
 
@@ -2799,7 +3062,9 @@ async fn a_depth_the_broker_will_not_report_falls_back_to_the_last_one() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn an_eta_answers_from_the_declared_schedule_when_the_window_is_spent() {
-    let Some(h) = harness("etabudget").await else { return };
+    let Some(h) = harness("etabudget").await else {
+        return;
+    };
     let (status, body) = h
         .put_target(
             "airbnb",
@@ -2837,7 +3102,11 @@ async fn an_eta_answers_from_the_declared_schedule_when_the_window_is_spent() {
 
     assert_eq!(body["state"], json!("waiting-budget"), "{body}");
     assert_eq!(body["waitingForBudget"], json!(8), "{body}");
-    assert_eq!(body["boundBy"], json!("ip"), "the budget that is holding it: {body}");
+    assert_eq!(
+        body["boundBy"],
+        json!("ip"),
+        "the budget that is holding it: {body}"
+    );
     // Eight units at two per window: this window is spent, so the wait is the
     // rest of it plus three whole ones. Never infinity, and never zero, which
     // are the two things a measured rate would have said here.
@@ -2846,7 +3115,11 @@ async fn an_eta_answers_from_the_declared_schedule_when_the_window_is_spent() {
         (1800.0..=2400.0).contains(&eta),
         "expected the rest of this window plus three more, got {eta}: {body}"
     );
-    assert_eq!(body["aheadCost"], json!(8.0), "eight items at the declared cost of one: {body}");
+    assert_eq!(
+        body["aheadCost"],
+        json!(8.0),
+        "eight items at the declared cost of one: {body}"
+    );
 
     let resets = body["windowResetsAt"].as_i64().expect("a window edge");
     let at = body["at"].as_i64().expect("an instant");
@@ -2855,7 +3128,10 @@ async fn an_eta_answers_from_the_declared_schedule_when_the_window_is_spent() {
         "the next edge is ahead and inside one period: {body}"
     );
     assert!(
-        body["assumes"].as_str().unwrap_or("").contains("no earlier than"),
+        body["assumes"]
+            .as_str()
+            .unwrap_or("")
+            .contains("no earlier than"),
         "the answer must say it is a bound: {body}"
     );
 
@@ -2875,7 +3151,9 @@ async fn an_eta_answers_from_the_declared_schedule_when_the_window_is_spent() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn an_eta_tells_a_budget_backlog_from_a_worker_one() {
-    let Some(h) = harness("etaworkers").await else { return };
+    let Some(h) = harness("etaworkers").await else {
+        return;
+    };
     let (status, body) = h
         .put_target(
             "airbnb",
@@ -2936,7 +3214,9 @@ async fn an_eta_tells_a_budget_backlog_from_a_worker_one() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn an_interior_leg_is_measured_against_the_relay_that_drains_it() {
-    let Some(h) = harness("etanode").await else { return };
+    let Some(h) = harness("etanode").await else {
+        return;
+    };
     let (status, body) = h.put_graph("g", chain_doc()).await;
     assert_eq!(status, 200, "declare: {body}");
 
@@ -2999,7 +3279,9 @@ async fn an_interior_leg_is_measured_against_the_relay_that_drains_it() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn an_eta_against_an_older_broker_still_costs_one_probe_per_ttl() {
-    let Some(h) = harness("etattl").await else { return };
+    let Some(h) = harness("etattl").await else {
+        return;
+    };
     let broker = faulty_broker(&queen_url().expect("checked")).await;
     let app = Arc::new(api::App::new(
         Queen::connect(Config::new(&broker.url)).expect("connect"),
@@ -3024,7 +3306,9 @@ async fn an_eta_against_an_older_broker_still_costs_one_probe_per_ttl() {
 
     for i in 0..4 {
         let res = http
-            .post(format!("{base}/v1/apps/{application}/targets/airbnb/lanes/bulk/push"))
+            .post(format!(
+                "{base}/v1/apps/{application}/targets/airbnb/lanes/bulk/push"
+            ))
             .json(&json!({ "op": "x", "txn": format!("t{i}"), "payload": { "connection": "c1" } }))
             .send()
             .await
@@ -3043,7 +3327,9 @@ async fn an_eta_against_an_older_broker_still_costs_one_probe_per_ttl() {
     let started = Instant::now();
     for _ in 0..ASKS {
         let res = http
-            .get(format!("{base}/v1/apps/{application}/targets/airbnb/eta?lane=bulk"))
+            .get(format!(
+                "{base}/v1/apps/{application}/targets/airbnb/eta?lane=bulk"
+            ))
             .send()
             .await
             .expect("eta");

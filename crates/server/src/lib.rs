@@ -1,27 +1,40 @@
-//! gate: an egress rate limiter that runs as a streaming gate on QueenMQ.
+//! gate: an egress rate limiter built out of plain queen primitives.
 //!
 //! A library with a thin binary on top, so the graph and the reconcile loop can
 //! be driven from a test against a real broker rather than only from a running
 //! deployment.
+//!
+//! Three primitives, used directly, are the whole data plane:
+//!
+//! * **`kv.incr` with `max` is the admission decision.** `applied` IS the
+//!   verdict; a refusal consumes nothing and returns the current value.
+//! * **The transaction wire is the relay.** `ack + push`, atomic, one source
+//!   partition per claim, same-named destination partition.
+//! * **A wildcard long-poll is the scheduler.** The broker picks candidates in
+//!   randomised order under `FOR UPDATE SKIP LOCKED`, so N workers spread across
+//!   partitions with no coordination at all.
+//!
+//! What is left of Gate at runtime is one consumer per DAG edge set. The control
+//! plane — declarations, validation, the console, sign-in, the document store —
+//! is unchanged in shape.
 
 pub mod api;
 pub mod auth;
+pub mod breaker;
+pub mod budget;
 pub mod depth;
-pub mod edge;
 pub mod eta;
-pub mod gate;
 pub mod graph;
 pub mod history;
-pub mod meter;
+pub mod knobs;
+pub mod obs;
 pub mod registry;
-pub mod shared;
+pub mod relay;
 pub mod store;
 pub mod supervisor;
 pub mod webapp;
 
-/// One clock for the whole process. The gate has its own — the stream runtime's
-/// `stream_time_ms` — and the two must not be confused: that one is sampled
-/// once per cycle and is what the budget arithmetic runs on.
+/// One clock for the whole process.
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -33,7 +46,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use queen_mq::{Config, Queen};
-
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -72,15 +84,17 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     if public_bind.is_some() && auth.is_none() && dev_email.is_none() {
-        return Err("GATE_PUBLIC_BIND is set but GOOGLE_CLIENT_ID is not: the public listener \
+        return Err(
+            "GATE_PUBLIC_BIND is set but GOOGLE_CLIENT_ID is not: the public listener \
                     exists to be authenticated, and starting it open would put the control \
                     plane on the internet. For local work set GATE_DEV_EMAIL instead."
-            .into());
+                .into(),
+        );
     }
 
-    // History is optional: the gate needs nothing from it, so a cell without a
-    // database limits traffic exactly as well and simply cannot answer "how
-    // were we doing last Tuesday".
+    // History is optional: the data plane needs nothing from it, so a cell
+    // without a database limits traffic exactly as well and simply cannot answer
+    // "how were we doing last Tuesday".
     let history = match history::History::connect().await {
         Some(Ok(h)) => Some(Arc::new(h)),
         Some(Err(e)) => return Err(e.into()),
@@ -94,28 +108,30 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = Arc::new(api::App {
         auth,
+        budgets: budget::Budgets::new(queen.clone()),
         queen,
         registry: Default::default(),
-        meter: Arc::new(meter::Meter::default()),
         depths: Arc::new(depth::Depths::default()),
+        traces: Arc::new(obs::Traces::default()),
         history: history.clone(),
         queen_url: queen_url.clone(),
         started_ms: now_ms(),
+        broker: parking_lot::RwLock::new(None),
         declare_lock: tokio::sync::Mutex::new(()),
     });
 
-    // Everything queen owns came back on its own; the specs are the one thing
-    // this process invented, so it is the one thing it has to go and fetch.
-    // Without this a restart leaves the queues in the broker with nobody
+    // Everything queen owns came back on its own; the declarations are the one
+    // thing this process invented, so they are the one thing it has to go and
+    // fetch. Without this a restart leaves the queues in the broker with nobody
     // draining them, which looks from the outside exactly like a limiter that
     // has decided to refuse everything.
     restore(&app).await;
 
     // And keep it that way. A declare lands on ONE replica, and without this the
-    // fleet enforces whichever spec each pod happens to hold — indefinitely, and
-    // with the looser one winning, because the tighter pod simply admits less of
-    // the same traffic. There is no reconcile in the broker to lean on: the specs
-    // are the one thing gate owns.
+    // fleet enforces whichever document each pod happens to hold —
+    // indefinitely, and with the looser one winning, because the tighter pod
+    // simply admits less of the same traffic. There is no reconcile in the
+    // broker to lean on: the declarations are the one thing gate owns.
     spawn_reconcile(
         app.clone(),
         std::time::Duration::from_secs(
@@ -125,13 +141,12 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or(15),
         ),
     );
+    spawn_counters(app.clone());
 
-
-
-    // Two listeners, the SAME router. The internal one has no authentication
-    // and is reachable only from inside the cluster; the public one requires a
-    // session on every route. Not "every route except the control plane" —
-    // every route, so there is no path table for an ingress rule to get wrong.
+    // Two listeners, the SAME router. The internal one has no authentication and
+    // is reachable only from inside the cluster; the public one requires a
+    // session on every route. Not "every route except the control plane" — every
+    // route, so there is no path table for an ingress rule to get wrong.
     let internal = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!(%bind, %queen_url, "gate listening (internal, no auth)");
 
@@ -144,8 +159,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
 
-    // Retention on its own slow clock: O(space) work does not belong on the
-    // same tick as O(work) work.
+    // Retention on its own slow clock: O(space) work does not belong on the same
+    // tick as O(work) work.
     if let Some(h) = history.clone() {
         tokio::spawn(async move {
             loop {
@@ -156,24 +171,21 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let internal_app = api::router(app.clone());
-    let _ = &internal_app;
-
     match public {
         Some(l) => {
             let public_app = api::public_router(app.clone());
-            tokio::try_join!(
-                async { axum::serve(internal, internal_app).await },
-                async { axum::serve(l, public_app).await },
-            )?;
+            tokio::try_join!(async { axum::serve(internal, internal_app).await }, async {
+                axum::serve(l, public_app).await
+            },)?;
         }
         None => axum::serve(internal, internal_app).await?,
     }
     Ok(())
 }
 
-/// The loop itself, with its interval passed rather than read from the environment —
-/// so a test can drive the wiring (the task, the period, its turn at the declare lock)
-/// and not just the pass it performs.
+/// The loop itself, with its interval passed rather than read from the
+/// environment — so a test can drive the wiring (the task, the period, its turn
+/// at the declare lock) and not just the pass it performs.
 pub fn spawn_reconcile(
     app: api::Shared,
     every: std::time::Duration,
@@ -186,225 +198,169 @@ pub fn spawn_reconcile(
     })
 }
 
-/// Bring back everything that was declared, at boot.
+/// The opt-in counters flush.
 ///
-/// Graphs first, then standalone targets: a graph owns the targets `{graph}.{node}`
-/// and a stale spec of that name in the target store must not be allowed to take
-/// over a node's queues — so if both exist, the graph wins and the stray is skipped.
-pub async fn restore(app: &api::Shared) {
-    let _guard = app.declare_lock.lock().await;
-    for spec in store::load_graphs(&app.queen).await {
-        let key = spec.key();
-        match graph::declare_from_store(app, spec).await {
+/// **Off unless a graph declares `counters`.** That is the point of the
+/// architecture: observability is a thing you switch on, not a thing that runs
+/// whether or not anyone is looking. v1's meter ran at 1Hz per target whatever
+/// the console was doing, and it was 9,949 of the 275,000 idle calls an hour.
+///
+/// It reads the stages' own `AtomicU64`s and writes the DELTA since the last
+/// pass, so two replicas writing the same minute is the normal case rather than
+/// a race: they saw different halves of the traffic and the row is the sum.
+pub fn spawn_counters(app: api::Shared) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut last: HashMap<String, (u64, u64, u64)> = HashMap::new();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            let now = now_ms();
+            let minute = now / 60_000 * 60_000;
 
-            Ok(_) => tracing::info!(graph = %key, "restored"),
-            Err(e) => tracing::warn!(graph = %key, error = %refusal(&e), "could not restore"),
-        }
-    }
-    for spec in store::load_all(&app.queen).await {
-        let name = spec.key();
-        if let Some(g) = app
-            .registry
-            .graph_owning_target(&spec.application, &spec.name)
-        {
-            tracing::warn!(
-                target_name = %name, graph = %g.spec.key(),
-                "a stored target has the name of a graph node; the graph owns it, so the target is \
-                 not restored"
-            );
-            continue;
-        }
-        match supervisor::start(&app.queen, app.meter.clone(), app.history.clone(), spec, None).await
-        {
-            Ok(rt) => {
-                rt.persisted.store(true, std::sync::atomic::Ordering::Relaxed);
-                app.registry.put(rt);
-                tracing::info!(target_name = %name, "restored");
+            if let Some(h) = app.history.as_ref() {
+                for g in app.registry.all() {
+                    if g.plan.counters_window_seconds.is_none() {
+                        continue;
+                    }
+                    let mut per_target: HashMap<String, HashMap<String, history::Bucket>> =
+                        HashMap::new();
+                    for s in &g.stages {
+                        let key = format!("{}/{}", g.key(), s.key());
+                        let c = &s.counters;
+                        let o = std::sync::atomic::Ordering::Relaxed;
+                        let now3 = (
+                            c.admitted.load(o),
+                            c.deferred.load(o) + c.released.load(o),
+                            c.cost.load(o),
+                        );
+                        let was = last.insert(key, now3).unwrap_or((0, 0, 0));
+                        let d = (
+                            now3.0.saturating_sub(was.0),
+                            now3.1.saturating_sub(was.1),
+                            now3.2.saturating_sub(was.2),
+                        );
+                        if d == (0, 0, 0) {
+                            continue;
+                        }
+                        per_target
+                            .entry(format!("{}.{}", g.doc.graph, s.stage.node))
+                            .or_default()
+                            .insert(
+                                s.stage.path.clone(),
+                                history::Bucket {
+                                    admitted: d.0,
+                                    denied: d.1,
+                                    cost_estimated: d.2 as f64,
+                                    ..Default::default()
+                                },
+                            );
+                    }
+                    for (target, paths) in per_target {
+                        h.add(&g.doc.application, &target, minute, &paths).await;
+                    }
+                }
+                // The refusal ring, on the same cadence. Bounded and
+                // drop-oldest, so a flush that misses a pass loses the oldest
+                // denials and never blocks the hot path.
+                let traces = app.traces.drain();
+                if !traces.is_empty() {
+                    h.add_traces(&traces).await;
+                }
             }
-            Err(e) => tracing::warn!(target_name = %name, error = %e, "could not restore"),
         }
-    }
+    })
 }
 
-fn refusal(r: &graph::Refusal) -> String {
-    match r {
-        graph::Refusal::Invalid(m) | graph::Refusal::Conflict(m) | graph::Refusal::Gateway(m) => {
-            m.clone()
+/// Bring back everything that was declared, at boot.
+pub async fn restore(app: &api::Shared) {
+    let _guard = app.declare_lock.lock().await;
+    let stored = store::load_all(&app.queen).await;
+    for doc in stored.items {
+        let key = doc.key();
+        let migrated = stored.migrated.contains(&key);
+        match graph::declare_from_store(app, doc.clone()).await {
+            Ok(_) => {
+                tracing::info!(graph = %key, migrated, "restored");
+                // Re-save in the new shape so the mapping happens once per
+                // upgrade rather than on every boot — and so the next reconcile
+                // pass diffs a v2 document against a v2 document rather than
+                // re-mapping and re-declaring for ever.
+                if migrated {
+                    match store::save(&app.queen, &doc).await {
+                        Ok(()) => {
+                            tracing::info!(graph = %key, "migrated document stored in the v2 shape")
+                        }
+                        Err(e) => {
+                            tracing::warn!(graph = %key, error = %e, "could not store the migrated document")
+                        }
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(graph = %key, error = %e.message(), "could not restore"),
         }
     }
 }
 
 /// One pass of the reconcile loop: make this replica's runtimes match the store.
 ///
-/// The store is the authority and the diff is by value — `TargetSpec` and
-/// `GraphSpec` both derive `PartialEq`, so "changed" is exact rather than a
-/// heuristic on a version number that a hot change does not bump.
+/// The store is the authority and the diff is by value — `GraphDoc` derives
+/// `PartialEq`, so "changed" is exact rather than a heuristic on a version
+/// number that a hot change does not bump.
 ///
 /// Two asymmetries are deliberate. A read that FAILS ends the pass: reading an
 /// error as an empty store would reap the whole fleet's configuration on one
-/// transient failure. And a runtime whose spec was never persisted is not removed —
-/// it is re-saved — because a declare whose store write failed looks exactly like a
-/// delete from here, and one of those two readings is unrecoverable.
+/// transient failure. And a runtime whose document was never persisted is not
+/// removed — it is re-saved — because a declare whose store write failed looks
+/// exactly like a delete from here, and one of those two readings is
+/// unrecoverable.
 pub async fn reconcile(app: &api::Shared) {
     let _guard = app.declare_lock.lock().await;
 
-    // ---- graphs. Before targets, because a graph owns node targets and the target
-    // pass must see the ownership that this pass establishes.
-    match store::try_load_graphs(&app.queen).await {
-        Err(e) => {
-            tracing::warn!(error = %e, "reconcile: could not read the graph store; keeping what is running");
-            return;
-        }
-        Ok(stored) => {
-            let complete = stored.complete;
-            let mut want: HashMap<String, gate_core::GraphSpec> =
-                stored.items.into_iter().map(|s| (s.key(), s)).collect();
-
-            for g in app.registry.graphs() {
-                match want.remove(&g.spec.key()) {
-                    // Unchanged document, and every node it names is running. The
-                    // second half matters: a node that could not be provisioned and
-                    // could not be restored is unregistered, and comparing documents
-                    // alone would leave it down for ever while its relay kept feeding
-                    // a queue with no gate on it.
-                    Some(spec)
-                        if spec == g.spec
-                            // Running, not merely registered: a node whose restore
-                            // failed is registered-and-stopped or gone, and either way
-                            // this graph needs provisioning again.
-                            && spec.node_specs().iter().all(|(_, ns)| {
-                                app.registry
-                                    .get(&ns.application, &ns.name)
-                                    .is_some_and(|rt| rt.is_running())
-                            }) => {}
-
-
-                    Some(spec) => {
-                        tracing::info!(graph = %spec.key(), "reconcile: re-declaring a graph that is changed or not fully up");
-
-                        if let Err(e) = graph::declare_from_store(app, spec).await {
-                            tracing::warn!(graph = %g.spec.key(), error = %refusal(&e),
-                                           "reconcile: could not apply the stored graph");
-                        }
-                    }
-                    // Absent from the store. A removal only if we are sure we SAW the
-                    // whole store: a clamped page or a document this build cannot
-                    // parse must never read as a delete.
-                    None if !complete => {}
-                    None => {
-                        if g.persisted.load(std::sync::atomic::Ordering::Relaxed) {
-                            tracing::info!(graph = %g.spec.key(), "reconcile: removing a graph the store no longer holds");
-                            graph::stop(app, &g).await;
-                            app.registry
-                                .remove_graph(&g.spec.application, &g.spec.name);
-                        } else if store::save_graph(&app.queen, &g.spec).await.is_ok() {
-                            g.persisted.store(true, std::sync::atomic::Ordering::Relaxed);
-                        }
-                    }
-
-                }
-            }
-            for (key, spec) in want {
-                tracing::info!(graph = %key, "reconcile: declaring a graph from the store");
-                if let Err(e) = graph::declare_from_store(app, spec).await {
-
-                    tracing::warn!(graph = %key, error = %refusal(&e), "reconcile: could not declare");
-                }
-            }
-        }
-    }
-
-    // ---- standalone targets.
     let stored = match store::try_load_all(&app.queen).await {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!(error = %e, "reconcile: could not read the target store; keeping what is running");
+            tracing::warn!(error = %e, "reconcile: could not read the store; keeping what is running");
             return;
         }
     };
     let complete = stored.complete;
-    let mut want: HashMap<String, gate_core::TargetSpec> =
-        stored.items.into_iter().map(|s| (s.key(), s)).collect();
-
+    let mut want: HashMap<String, gate_core::GraphDoc> =
+        stored.items.into_iter().map(|d| (d.key(), d)).collect();
 
     for rt in app.registry.all() {
-        // A node is not in the target store by design: its graph document is the
-        // authority, and the graph pass above has already applied it.
-        if rt.graph.is_some() {
-            want.remove(&rt.spec.key());
-            continue;
-        }
-        match want.remove(&rt.spec.key()) {
-            Some(spec) if spec == rt.spec => {}
-            Some(spec) => {
-                tracing::info!(target_name = %spec.key(), "reconcile: restarting on the stored spec");
-                swap_in(app, Some(&rt), spec).await;
+        match want.remove(&rt.key()) {
+            // Unchanged document, and it is actually running. The second half
+            // matters: a graph whose provisioning failed is registered-and-
+            // stopped, and comparing documents alone would leave it down for
+            // ever while its ingress queue kept filling.
+            Some(doc) if doc == rt.doc && rt.is_running() => {}
+            Some(doc) => {
+                tracing::info!(graph = %doc.key(), "reconcile: re-declaring a graph that is changed or not fully up");
+                if let Err(e) = graph::declare_from_store(app, doc).await {
+                    tracing::warn!(graph = %rt.key(), error = %e.message(),
+                                   "reconcile: could not apply the stored document");
+                }
             }
-            // Same rule as for graphs: an incomplete read may add and change, never
-            // remove.
+            // Absent from the store. A removal only if we are sure we SAW the
+            // whole store: a clamped page, or a document this build cannot
+            // parse, must never read as a delete.
             None if !complete => {}
-            None if rt.persisted.load(std::sync::atomic::Ordering::Relaxed) => {
-
-                tracing::info!(target_name = %rt.spec.key(), "reconcile: removing a target the store no longer holds");
-                supervisor::stop_with(&app.queen, &rt).await;
-                app.registry.remove(&rt.spec.application, &rt.spec.name);
-            }
-            // Declared here, never persisted. Retry the save rather than tear down a
-            // live target on the strength of a write that failed.
             None => {
-                if store::save(&app.queen, &rt.spec).await.is_ok() {
-                    rt.persisted.store(true, std::sync::atomic::Ordering::Relaxed);
+                if rt.persisted.load(std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!(graph = %rt.key(), "reconcile: removing a graph the store no longer holds");
+                    supervisor::stop(&rt).await;
+                    app.registry.remove(&rt.doc.application, &rt.doc.graph);
+                } else if store::save(&app.queen, &rt.doc).await.is_ok() {
+                    rt.persisted
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
     }
 
-    for (key, spec) in want {
-        if app
-            .registry
-            .graph_owning_target(&spec.application, &spec.name)
-            .is_some()
-        {
-            continue;
+    for (key, doc) in want {
+        tracing::info!(graph = %key, "reconcile: declaring a graph from the store");
+        if let Err(e) = graph::declare_from_store(app, doc).await {
+            tracing::warn!(graph = %key, error = %e.message(), "reconcile: could not declare");
         }
-        tracing::info!(target_name = %key, "reconcile: starting a target from the store");
-        swap_in(app, None, spec).await;
-    }
-}
-
-async fn swap_in(
-    app: &api::Shared,
-    old: Option<&Arc<registry::TargetRuntime>>,
-    spec: gate_core::TargetSpec,
-) {
-    let key = spec.key();
-    match supervisor::swap(
-        &app.queen,
-        app.meter.clone(),
-        app.history.clone(),
-        old,
-        spec,
-        None,
-    )
-    .await
-    {
-        Ok(rt) => {
-            rt.persisted.store(true, std::sync::atomic::Ordering::Relaxed);
-            app.registry.put(rt);
-        }
-        Err(f) => match f.restored {
-            Some(rt) => {
-                app.registry.put(rt);
-                tracing::warn!(target_name = %key, error = %f.error,
-                               "reconcile: could not apply the stored spec; still serving the old one");
-            }
-            None => {
-                if let Some((a, n)) = key.split_once('/') {
-                    app.registry.remove(a, n);
-                }
-                tracing::error!(target_name = %key, error = %f.error,
-                                "reconcile: could not provision, and nothing is serving it");
-            }
-        },
     }
 }

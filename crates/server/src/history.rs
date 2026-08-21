@@ -26,7 +26,24 @@ use deadpool_postgres::{Config as PgConfig, Pool, Runtime};
 use serde_json::{json, Value};
 use tokio_postgres::NoTls;
 
-use crate::meter::Bucket;
+/// One window's increments for one (node, path).
+///
+/// `target` is `{graph}.{node}` and `lane` is the PATH — the DDL is v1's,
+/// unchanged, and a node IS what a target was. Keeping the column names means
+/// ninety days of history survive the rewrite.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Bucket {
+    pub admitted: u64,
+    pub denied: u64,
+    /// v1 counted vendor calls here, through the calls queue. There is no ack in
+    /// v2, so nothing counts a call: it stays in the DDL and stays zero rather
+    /// than being repurposed into a number that would mean something else in the
+    /// same column.
+    pub calls: u64,
+    pub throttled: u64,
+    pub cost_estimated: f64,
+    pub cost_actual: f64,
+}
 
 /// Always-virgin, like the broker's own schema: created on every boot, costs
 /// nothing when it is already there, and removes the class of bug where two
@@ -97,7 +114,10 @@ impl History {
         let pool = cfg
             .create_pool(Some(Runtime::Tokio1), NoTls)
             .map_err(|e| format!("history pool: {e}"))?;
-        let client = pool.get().await.map_err(|e| format!("history connect: {e}"))?;
+        let client = pool
+            .get()
+            .await
+            .map_err(|e| format!("history connect: {e}"))?;
         client
             .batch_execute(SCHEMA)
             .await
@@ -109,7 +129,9 @@ impl History {
     /// normal case, not a race: they saw different halves of the traffic, and
     /// the row is the sum.
     pub async fn add(&self, app: &str, target: &str, minute: i64, lanes: &HashMap<String, Bucket>) {
-        let Ok(client) = self.pool.get().await else { return };
+        let Ok(client) = self.pool.get().await else {
+            return;
+        };
         for (lane, b) in lanes {
             let _ = client
                 .execute(
@@ -135,7 +157,9 @@ impl History {
     }
 
     pub async fn rollups(&self, app: &str, target: &str, minutes: i64) -> Vec<Value> {
-        let Ok(client) = self.pool.get().await else { return vec![] };
+        let Ok(client) = self.pool.get().await else {
+            return vec![];
+        };
         let since = (crate::now_ms() / 60_000 * 60_000) - minutes * 60_000;
         let rows = client
             .query(
@@ -164,8 +188,8 @@ impl History {
                 by_minute.push((m, HashMap::new(), [0.0; 6]));
             }
             let slot = by_minute.last_mut().expect("just pushed");
-            for i in 0..6 {
-                slot.2[i] += v[i];
+            for (acc, x) in slot.2.iter_mut().zip(v.iter()) {
+                *acc += x;
             }
             slot.1.insert(
                 lane,
@@ -190,7 +214,9 @@ impl History {
     /// Admissions per second for one lane, from the table rather than from
     /// whatever this replica happened to see.
     pub async fn rate_per_sec(&self, app: &str, target: &str, lane: &str, now_ms: i64) -> f64 {
-        let Ok(client) = self.pool.get().await else { return 0.0 };
+        let Ok(client) = self.pool.get().await else {
+            return 0.0;
+        };
         let current = now_ms / 60_000 * 60_000;
         let rows = client
             .query(
@@ -230,13 +256,7 @@ impl History {
     /// across the fleet, so a replica holds its own gate counters whole but only
     /// a share of the cost events, and its ratio of the two is biased by
     /// however the events happened to split. The row sums both halves.
-    pub async fn avg_cost(
-        &self,
-        app: &str,
-        target: &str,
-        lane: &str,
-        now_ms: i64,
-    ) -> Option<f64> {
+    pub async fn avg_cost(&self, app: &str, target: &str, lane: &str, now_ms: i64) -> Option<f64> {
         let client = self.pool.get().await.ok()?;
         let current = now_ms / 60_000 * 60_000;
         let row = client
@@ -259,51 +279,13 @@ impl History {
         Some(cost / items as f64)
     }
 
-    /// The share of the ceiling the OTHER lanes spent in the last complete
-    /// minute — the input to `ceiling-minus-measured`.
-    ///
-    /// This has to come from the table and not from the replica's own ring:
-    /// with several replicas each sees a slice of the traffic, would each
-    /// conclude the other lanes are idle, and would each hand the derived lane
-    /// the whole residual. The lane would then oversubscribe by roughly the
-    /// number of replicas — the same defect the lane shares were introduced to
-    /// fix, arriving by a different door.
-    pub async fn measured_share(
-        &self,
-        app: &str,
-        target: &str,
-        except_lane: &str,
-        ceiling_per_min: f64,
-        now_ms: i64,
-    ) -> Option<f64> {
-        if ceiling_per_min <= 0.0 {
-            return None;
-        }
-        let client = match self.pool.get().await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!("measured_share: no connection: {e}");
-                return None;
-            }
-        };
-        let current = now_ms / 60_000 * 60_000;
-        let row = match client
-            .query_opt(
-                "SELECT COALESCE(SUM(admitted), 0)::BIGINT FROM gate.rollups
-                 WHERE application=$1 AND target=$2 AND lane <> $3 AND minute = $4",
-                &[&app, &target, &except_lane, &(current - 60_000)],
-            )
-            .await
-        {
-            Ok(r) => r?,
-            Err(e) => {
-                tracing::warn!("measured_share: {e}");
-                return None;
-            }
-        };
-        let others: i64 = row.try_get(0).ok()?;
-        Some((others as f64 / ceiling_per_min).clamp(0.0, 1.0))
-    }
+    // `measured_share` lived here. It fed `ceiling-minus-measured`, which
+    // divided one ceiling between lanes that each held their own copy of the
+    // counters — and it HAD to come from this table rather than a replica's ring
+    // because with several replicas each would conclude the other lanes were
+    // idle and each would hand the derived lane the whole residual. There is one
+    // counter now, so N ceilings cannot oversubscribe it, and the whole argument
+    // evaporates with the feature.
 
     /// Admissions per minute for every target, over the last `minutes`.
     ///
@@ -311,7 +293,9 @@ impl History {
     /// dashboard draws every application at once, and N round trips to draw one
     /// picture is how a console starts costing more than the thing it watches.
     pub async fn flow(&self, minutes: i64, now_ms: i64) -> Vec<(String, String, i64, i64)> {
-        let Ok(client) = self.pool.get().await else { return vec![] };
+        let Ok(client) = self.pool.get().await else {
+            return vec![];
+        };
         let since = now_ms / 60_000 * 60_000 - minutes * 60_000;
         let rows = client
             .query(
@@ -335,19 +319,21 @@ impl History {
             .collect()
     }
 
-    pub async fn add_traces(&self, rows: &[crate::meter::Trace]) {
+    pub async fn add_traces(&self, rows: &[crate::obs::Trace]) {
         if rows.is_empty() {
             return;
         }
-        let Ok(client) = self.pool.get().await else { return };
+        let Ok(client) = self.pool.get().await else {
+            return;
+        };
         for t in rows {
             let _ = client
                 .execute(
                     "INSERT INTO gate.traces (at, application, target, lane, op, outcome, budget_id, calls)
                      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
                     &[
-                        &t.at, &t.application, &t.target, &t.lane, &t.op, &t.outcome,
-                        &t.budget_id, &(t.calls as i64),
+                        &t.at, &t.application, &format!("{}.{}", t.graph, t.node),
+                        &t.path, &t.op, &t.outcome, &t.budget_id, &0i64,
                     ],
                 )
                 .await;
@@ -355,7 +341,9 @@ impl History {
     }
 
     pub async fn traces(&self, outcome: Option<&str>, limit: i64) -> Vec<Value> {
-        let Ok(client) = self.pool.get().await else { return vec![] };
+        let Ok(client) = self.pool.get().await else {
+            return vec![];
+        };
         let rows = match outcome {
             Some(o) => {
                 client
@@ -400,7 +388,9 @@ impl History {
     /// same tick as `O(work)` work — the same reason the broker's own purge has
     /// a separate interval.
     pub async fn prune(&self, rollup_days: i64, trace_days: i64) {
-        let Ok(client) = self.pool.get().await else { return };
+        let Ok(client) = self.pool.get().await else {
+            return;
+        };
         let now = crate::now_ms();
         let _ = client
             .execute(

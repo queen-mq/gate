@@ -53,7 +53,10 @@ fn serve(path: &str, req: &HeaderMap) -> Response {
             {
                 return (
                     StatusCode::NOT_MODIFIED,
-                    [(header::ETAG, etag.as_str()), (header::CACHE_CONTROL, "no-cache")],
+                    [
+                        (header::ETAG, etag.as_str()),
+                        (header::CACHE_CONTROL, "no-cache"),
+                    ],
                 )
                     .into_response();
             }

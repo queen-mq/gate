@@ -22,7 +22,9 @@ use std::time::{Duration, Instant};
 use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
-use jsonwebtoken::{decode, decode_header, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{
+    decode, decode_header, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation,
+};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -112,7 +114,10 @@ impl AuthConfig {
         // rather than from the request's Host header, because behind an ingress
         // that header is whatever the caller sent — and it decides where Google
         // sends the authorisation code.
-        format!("{}/api/auth/google/callback", self.public_url.trim_end_matches('/'))
+        format!(
+            "{}/api/auth/google/callback",
+            self.public_url.trim_end_matches('/')
+        )
     }
 }
 
@@ -161,10 +166,22 @@ fn validate_google_claims(
         Some(n) if n == expected_nonce => {}
         _ => return Err(ClaimErr::NonceMismatch),
     }
-    let sub = claims.sub.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    let Some(sub) = sub else { return Err(ClaimErr::MissingSub) };
-    let email = claims.email.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    let Some(email) = email else { return Err(ClaimErr::MissingEmail) };
+    let sub = claims
+        .sub
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(sub) = sub else {
+        return Err(ClaimErr::MissingSub);
+    };
+    let email = claims
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(email) = email else {
+        return Err(ClaimErr::MissingEmail);
+    };
     if !truthy(claims.email_verified.as_ref()) {
         return Err(ClaimErr::EmailUnverified);
     }
@@ -172,13 +189,17 @@ fn validate_google_claims(
     if !allowed_domains.is_empty() {
         let hd = claims.hd.as_deref().unwrap_or("").trim().to_lowercase();
         let domain = email.rsplit_once('@').map(|(_, d)| d).unwrap_or("");
-        let ok = allowed_domains.iter().any(|d| d == &hd)
-            || allowed_domains.iter().any(|d| d == domain);
+        let ok =
+            allowed_domains.iter().any(|d| d == &hd) || allowed_domains.iter().any(|d| d == domain);
         if !ok {
             return Err(ClaimErr::DomainNotAllowed);
         }
     }
-    Ok(Session { sub: sub.to_string(), email, exp: 0 })
+    Ok(Session {
+        sub: sub.to_string(),
+        email,
+        exp: 0,
+    })
 }
 
 fn truthy(v: Option<&Value>) -> bool {
@@ -235,17 +256,19 @@ async fn verify_id_token(
     let (n, e) = keys["keys"]
         .as_array()
         .and_then(|ks| {
-            ks.iter().find(|k| k["kid"].as_str() == Some(&kid)).map(|k| {
-                (
-                    k["n"].as_str().unwrap_or("").to_string(),
-                    k["e"].as_str().unwrap_or("").to_string(),
-                )
-            })
+            ks.iter()
+                .find(|k| k["kid"].as_str() == Some(&kid))
+                .map(|k| {
+                    (
+                        k["n"].as_str().unwrap_or("").to_string(),
+                        k["e"].as_str().unwrap_or("").to_string(),
+                    )
+                })
         })
         .ok_or("no matching jwks key")?;
     let key = DecodingKey::from_rsa_components(&n, &e).map_err(|e| format!("jwks key: {e}"))?;
     let mut v = Validation::new(Algorithm::RS256);
-    v.set_audience(&[cfg.client_id.clone()]);
+    v.set_audience(std::slice::from_ref(&cfg.client_id));
     v.set_issuer(&GOOGLE_ISSUERS);
     decode::<GoogleClaims>(id_token, &key, &v)
         .map(|d| d.claims)
@@ -261,12 +284,19 @@ pub struct Auth {
 
 impl Auth {
     pub fn new(cfg: AuthConfig) -> Self {
-        Self { cfg, http: reqwest::Client::new() }
+        Self {
+            cfg,
+            http: reqwest::Client::new(),
+        }
     }
 
     fn sign<T: Serialize>(&self, claims: &T) -> Result<String, String> {
-        encode(&Header::default(), claims, &EncodingKey::from_secret(&self.cfg.secret))
-            .map_err(|e| e.to_string())
+        encode(
+            &Header::default(),
+            claims,
+            &EncodingKey::from_secret(&self.cfg.secret),
+        )
+        .map_err(|e| e.to_string())
     }
 
     pub fn verify_session(&self, token: &str) -> Option<Session> {
@@ -340,11 +370,7 @@ pub async fn callback(
 
     let mut v = Validation::new(Algorithm::HS256);
     v.set_required_spec_claims(&["exp"]);
-    let st = match decode::<StateClaims>(
-        state,
-        &DecodingKey::from_secret(&auth.cfg.secret),
-        &v,
-    ) {
+    let st = match decode::<StateClaims>(state, &DecodingKey::from_secret(&auth.cfg.secret), &v) {
         Ok(d) => d.claims,
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid or expired state").into_response(),
     };
@@ -366,7 +392,9 @@ pub async fn callback(
     {
         Ok(r) => match r.json().await {
             Ok(v) => v,
-            Err(e) => return (StatusCode::BAD_GATEWAY, format!("token decode: {e}")).into_response(),
+            Err(e) => {
+                return (StatusCode::BAD_GATEWAY, format!("token decode: {e}")).into_response()
+            }
         },
         Err(e) => return (StatusCode::BAD_GATEWAY, format!("token exchange: {e}")).into_response(),
     };
@@ -398,7 +426,11 @@ pub async fn callback(
         // Deliberately does not echo the rejected domain: the caller knows which
         // account they used, and this reply is reachable by anyone.
         Err(ClaimErr::DomainNotAllowed) => {
-            return (StatusCode::FORBIDDEN, "google account domain is not allowed").into_response()
+            return (
+                StatusCode::FORBIDDEN,
+                "google account domain is not allowed",
+            )
+                .into_response()
         }
         Err(ClaimErr::EmailUnverified) => {
             return (StatusCode::FORBIDDEN, "provider email is not verified").into_response()
@@ -432,7 +464,10 @@ pub async fn logout() -> Response {
     (
         StatusCode::SEE_OTHER,
         [
-            (header::SET_COOKIE, format!("{COOKIE}=; Path=/; HttpOnly; Max-Age=0")),
+            (
+                header::SET_COOKIE,
+                format!("{COOKIE}=; Path=/; HttpOnly; Max-Age=0"),
+            ),
             (header::LOCATION, "/".to_string()),
         ],
     )
@@ -468,7 +503,11 @@ pub fn dev_identity(cfg: Option<&AuthConfig>) -> Option<Session> {
             return None;
         }
     }
-    Some(Session { sub: format!("dev:{email}"), email, exp: 0 })
+    Some(Session {
+        sub: format!("dev:{email}"),
+        email,
+        exp: 0,
+    })
 }
 
 /// `true` when the console is running without a Google client at all.
