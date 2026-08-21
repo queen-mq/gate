@@ -183,14 +183,16 @@ const status = computed(() => {
 
       <!-- ------------------------------------------------- breaches -->
       <section class="mt-10">
-        <h2 class="section-title">Recent breaches
+        <h2 class="section-title">Recent backoffs
           <span class="section-count">the only proof our numbers are wrong</span>
         </h2>
         <div class="card">
           <div v-if="!breaches.length" class="px-6 py-10 text-center">
             <p class="text-[13.5px] text-fg-2">No vendor has throttled us recently.</p>
             <p class="text-[12.5px] text-fg-3 mt-1">
-              Either the caps are right, or nothing has pushed against them.
+              Either the caps are right, or nothing has pushed against them. A throttle is reported
+              to <span class="font-mono">POST …/nodes/{node}/backoff</span>, which spends the node's
+              window so every path stops.
             </p>
           </div>
           <div v-else class="divide-y divide-line">
@@ -200,7 +202,9 @@ const status = computed(() => {
               <span class="chip">{{ traceRef(b).name }}</span>
               <span v-if="traceRef(b).scoped"
                     class="chip text-fg-3 hidden sm:inline-flex">{{ traceRef(b).application }}</span>
-              <span class="font-mono text-[12px] text-bad truncate flex-1">{{ b.budget_id || b.op || 'unattributed' }}</span>
+              <span class="font-mono text-[12px] text-bad truncate flex-1">
+                backed off {{ b.retryAfterSeconds }}s<span v-if="b.by" class="text-fg-3"> by {{ b.by }}</span>
+              </span>
               <span class="text-fg-3 text-[12px] tabular-nums whitespace-nowrap">{{ ago(b.at) }}</span>
             </RouterLink>
           </div>
