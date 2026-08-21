@@ -423,7 +423,7 @@ dependencies = [
 
 [[package]]
 name = "gate-bench"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "queen-mq",
  "reqwest",
@@ -434,7 +434,7 @@ dependencies = [
 
 [[package]]
 name = "gate-core"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -443,7 +443,7 @@ dependencies = [
 
 [[package]]
 name = "gate-e2e"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "queen-mq",
  "reqwest",
@@ -454,7 +454,7 @@ dependencies = [
 
 [[package]]
 name = "gate-server"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "axum",
  "chrono",
