@@ -279,3 +279,67 @@ fn a_fractional_cost_is_rounded_up_and_named() {
     assert_eq!(m.doc.nodes["t"].cost.max(), 3);
     assert!(rules(&m.warnings).contains(&"cost"));
 }
+
+/// Three real v1 documents, and the property that matters most about all of
+/// them: what the migration produces must be a document this build ACCEPTS.
+///
+/// The fixture is channel-go's own three graphs, captured from its source: the
+/// declarations a live caller PUTs on every boot of every replica. They are here
+/// because a mapping that answers 200 and produces something `validate` refuses
+/// is not a mapping — and that is exactly what this build did, in three
+/// different ways at once, until the integration ran:
+///
+/// * `subwindow-range` — `rolling` over a DAY mapped to 86400 sub-windows,
+///   which validation refuses above 3600.
+/// * `cost-fits` — a daily ceiling divided into one-second sub-windows admits
+///   fewer calls per second than `cost.max: 100`, which every one of these
+///   documents declares. An item that cannot fit a sub-window can never be
+///   admitted, so the document is refused rather than accepted and stalled.
+/// * `share-rounds-out` — the same arithmetic seen from the path's side.
+///
+/// §12.1 is the promise this pins: a v1 document is *"accepted, mapped, and
+/// answered 200 with warnings naming every field that was mapped or ignored —
+/// never a silent success and never a 422 for having been written last year"*.
+#[test]
+fn three_real_v1_graphs_migrate_into_documents_this_build_accepts() {
+    let raw = include_str!("testdata/v1_channel_go_graphs.json");
+    let graphs: std::collections::BTreeMap<String, v1::GraphSpec> =
+        serde_json::from_str(raw).expect("the fixture must parse as v1 documents");
+    assert_eq!(graphs.len(), 3, "airbnb, vrbo and google");
+
+    for (name, spec) in &graphs {
+        let m = migrate::from_v1_graph(spec)
+            .unwrap_or_else(|e| panic!("`{name}` was refused rather than mapped: {}", e.0));
+        let problems = gate_core::validate(&m.doc);
+        assert!(
+            problems.is_empty(),
+            "`{name}` migrated into a document this build refuses: {problems:#?}"
+        );
+
+        // And the subdivision it chose is arithmetic anyone can check: every
+        // sub-window holds at least one of the largest items the node declares,
+        // and divides its period exactly.
+        let plan = gate_core::compile(&m.doc);
+        for (node, np) in &plan.nodes {
+            let ceiling = np.cost.max();
+            for b in &np.budgets {
+                assert!(
+                    b.count_sub >= ceiling,
+                    "`{name}`/`{node}`/`{}`: a sub-window admits {} and one item may cost {ceiling}",
+                    b.id,
+                    b.count_sub
+                );
+                assert_eq!(
+                    b.window_sub_seconds * b.sub_windows as i64 * 1000,
+                    b.time_ms,
+                    "`{name}`/`{node}`/`{}`: {} sub-windows of {}s do not add up to {}ms, so the \
+                     enforced rate is not the declared one",
+                    b.id,
+                    b.sub_windows,
+                    b.window_sub_seconds,
+                    b.time_ms
+                );
+            }
+        }
+    }
+}

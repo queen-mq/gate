@@ -60,7 +60,43 @@ fn default_lane_name(lanes: &[v1::Lane]) -> String {
 
 // ------------------------------------------------------------------ budgets
 
-fn budget(b: &v1::Budget, out: &mut Vec<Problem>, node: &str) -> Budget {
+/// How many sub-windows a migrated `rolling` budget gets.
+///
+/// The aim is one-second sub-windows, and three ceilings cut it down. **Every
+/// one of them is a rule this document has to pass afterwards** — a migration
+/// that produces a document its own validator refuses is not a migration, and
+/// §12.1 promises a v1 document is answered 200 with warnings and never a 422
+/// for having been written last year.
+///
+/// * `subwindow-range`: at most 3600. A day at one-second sub-windows is 86400,
+///   which was refused outright.
+/// * `subwindow-fits`: at most `count`, or each sub-window carries less than one
+///   and the budget enforces `N` per window instead of `count`.
+/// * `cost-fits`: at most `count / cost.max`, or a sub-window cannot hold the
+///   largest item the node declares. Such an item can NEVER be admitted: it
+///   parks the head of its partition for ever and never reaches a DLQ, because
+///   a lease that expires charges no retry. This is the one that refused every
+///   real v1 document, because a daily ceiling divided into seconds admits far
+///   fewer than one hundred calls a second while `cost.max: 100` is what a v1
+///   caller wrote.
+///
+/// Then it is shrunk to a DIVISOR of the window in seconds. `subdivide` floors
+/// the sub-window to whole seconds, so an `N` that does not divide the period
+/// evenly turns `200000 per 3600s` into `100 per 1800ms` and enforces it as
+/// `100 per 1000s`— a ceiling almost twice what was declared. A divisor keeps
+/// the arithmetic exact and the enforced rate at or below the declared one.
+fn rolling_sub_windows(time_ms: i64, count: i64, cost_max: i64) -> u32 {
+    let seconds = (time_ms / 1000).max(1);
+    let per_item = (count / cost_max.max(1)).max(1);
+    let ceiling = count.clamp(1, 3600).min(per_item).min(seconds);
+    let mut n = seconds.min(ceiling).max(1);
+    while n > 1 && seconds % n != 0 {
+        n -= 1;
+    }
+    n.clamp(1, u32::MAX as i64) as u32
+}
+
+fn budget(b: &v1::Budget, cost_max: i64, out: &mut Vec<Problem>, node: &str) -> Budget {
     let time_ms = b.period_seconds.max(1) * 1000;
     let count = (b.cap.floor() as i64).max(1);
 
@@ -71,14 +107,18 @@ fn budget(b: &v1::Budget, out: &mut Vec<Problem>, node: &str) -> Budget {
         // Subdivision is the same trade in a form the primitive can keep — it
         // bounds the boundary exposure to 2 x count/N instead of 2 x count.
         v1::Alignment::Rolling => {
-            let n = (time_ms / 1000).clamp(1, count.max(1)) as u32;
+            let n = rolling_sub_windows(time_ms, count, cost_max);
             out.push(w(
                 "alignment",
                 format!(
                     "budget `{}` of node `{node}`: `alignment` is gone — kv owns a fixed window, \
-                     and smoothing is expressed as subWindows. `rolling` mapped to subWindows {n}, \
-                     which bounds the boundary exposure to {} rather than {}.",
+                     and smoothing is expressed as subWindows. `rolling` mapped to subWindows {n} \
+                     of {} second(s) each, which bounds the boundary exposure to {} rather than \
+                     {}. Fewer than one per second where a sub-window would otherwise be too \
+                     small to hold this node's largest item ({cost_max}), which can never be \
+                     admitted.",
                     b.id,
+                    (time_ms / n.max(1) as i64) / 1000,
                     2 * (count / n.max(1) as i64).max(1),
                     2 * count
                 ),
@@ -316,11 +356,15 @@ pub fn from_v1_target(spec: &v1::TargetSpec) -> Result<Migrated, Refused> {
         .map(|b| b.cap / b.period_seconds.max(1) as f64)
         .fold(f64::INFINITY, f64::min);
 
+    // The largest an item may cost, which is what decides how finely a budget
+    // can be subdivided: a sub-window that cannot hold one item admits nothing,
+    // for ever.
+    let cost_ceiling = spec.cost.max.ceil().max(1.0) as i64;
     let mut node = Node {
         budgets: spec
             .budgets
             .iter()
-            .map(|b| budget(b, &mut out, &node_name))
+            .map(|b| budget(b, cost_ceiling, &mut out, &node_name))
             .collect(),
         cost: cost(&spec.cost, &node_name, &mut out),
         ingress: Some(Ingress::Named(IngressSpec {
@@ -399,11 +443,12 @@ pub fn from_v1_graph(spec: &v1::GraphSpec) -> Result<Migrated, Refused> {
         };
         let lane0 = default_lane_name(&lanes);
 
+        let cost_ceiling = n.cost.max.ceil().max(1.0) as i64;
         let mut node = Node {
             budgets: n
                 .budgets
                 .iter()
-                .map(|b| budget(b, &mut out, name))
+                .map(|b| budget(b, cost_ceiling, &mut out, name))
                 .collect(),
             cost: cost(&n.cost, name, &mut out),
             ingress: n.entry.then(|| {

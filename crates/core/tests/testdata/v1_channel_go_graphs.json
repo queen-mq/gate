@@ -1,0 +1,519 @@
+{
+  "airbnb": {
+    "application": "channel-go",
+    "breach": [
+      {
+        "maxAttempts": 3,
+        "retryTo": "origin-entry",
+        "when": {
+          "status": 429
+        }
+      }
+    ],
+    "consume": [
+      "ip"
+    ],
+    "edges": [
+      {
+        "from": "prices",
+        "to": "ip"
+      },
+      {
+        "from": "messages",
+        "priority": 1,
+        "to": "ip"
+      },
+      {
+        "from": "content",
+        "priority": 1,
+        "to": "ip"
+      }
+    ],
+    "name": "airbnb",
+    "nodes": {
+      "content": {
+        "admitted": {
+          "partitionBy": "connection",
+          "partitions": 64
+        },
+        "budgets": [
+          {
+            "alignment": "rolling",
+            "asOf": "2026-05-19",
+            "cap": 1000,
+            "confidence": "documented",
+            "id": "listings-put",
+            "match": {
+              "op": [
+                "listing.update"
+              ]
+            },
+            "periodSeconds": 60,
+            "source": "developer.withairbnb.com/homes/docs/rate-limits"
+          }
+        ],
+        "cost": {
+          "default": 1,
+          "field": "httpCost",
+          "max": 100
+        },
+        "entry": true,
+        "lanes": [
+          {
+            "cap": "ceiling",
+            "concurrency": 8,
+            "default": true,
+            "name": "in"
+          }
+        ],
+        "pacing": {
+          "batch": 200,
+          "leaseSeconds": 1
+        }
+      },
+      "ip": {
+        "admitted": {
+          "partitionBy": "connection",
+          "partitions": 64
+        },
+        "budgets": [
+          {
+            "alignment": "rolling",
+            "asOf": "2026-05-19",
+            "cap": 2000,
+            "confidence": "documented",
+            "id": "ip-10s",
+            "periodSeconds": 10,
+            "source": "developer.withairbnb.com/homes/docs/rate-limits"
+          },
+          {
+            "alignment": "rolling",
+            "asOf": "2026-05-19",
+            "cap": 20000,
+            "confidence": "documented",
+            "id": "ip-5m",
+            "periodSeconds": 300,
+            "source": "developer.withairbnb.com/homes/docs/rate-limits"
+          },
+          {
+            "alignment": "rolling",
+            "asOf": "2026-05-19",
+            "cap": 200000,
+            "confidence": "documented",
+            "id": "ip-1h",
+            "periodSeconds": 3600,
+            "source": "developer.withairbnb.com/homes/docs/rate-limits"
+          },
+          {
+            "alignment": "rolling",
+            "asOf": "2026-05-19",
+            "cap": 4500000,
+            "confidence": "documented",
+            "id": "ip-1d",
+            "periodSeconds": 86400,
+            "source": "developer.withairbnb.com/homes/docs/rate-limits"
+          }
+        ],
+        "cost": {
+          "default": 1,
+          "field": "httpCost",
+          "max": 100
+        },
+        "lanes": [
+          {
+            "cap": "ceiling",
+            "concurrency": 8,
+            "default": true,
+            "name": "out"
+          }
+        ],
+        "pacing": {
+          "batch": 200,
+          "leaseSeconds": 1
+        }
+      },
+      "messages": {
+        "admitted": {
+          "partitionBy": "connection",
+          "partitions": 64
+        },
+        "budgets": [
+          {
+            "alignment": "rolling",
+            "asOf": "2026-05-19",
+            "cap": 100,
+            "confidence": "documented",
+            "id": "messaging-post",
+            "match": {
+              "op": [
+                "messaging.send"
+              ]
+            },
+            "periodSeconds": 60,
+            "source": "developer.withairbnb.com/homes/docs/rate-limits"
+          },
+          {
+            "alignment": "rolling",
+            "asOf": "2026-05-19",
+            "cap": 400,
+            "confidence": "documented",
+            "id": "messaging-get",
+            "match": {
+              "op": [
+                "messaging.pull"
+              ]
+            },
+            "periodSeconds": 60,
+            "source": "developer.withairbnb.com/homes/docs/rate-limits"
+          }
+        ],
+        "cost": {
+          "default": 1,
+          "field": "httpCost",
+          "max": 100
+        },
+        "entry": true,
+        "lanes": [
+          {
+            "cap": "ceiling",
+            "concurrency": 8,
+            "default": true,
+            "name": "in"
+          }
+        ],
+        "pacing": {
+          "batch": 200,
+          "leaseSeconds": 1
+        }
+      },
+      "prices": {
+        "admitted": {
+          "partitionBy": "connection",
+          "partitions": 64
+        },
+        "cost": {
+          "default": 1,
+          "field": "httpCost",
+          "max": 100
+        },
+        "entry": true,
+        "lanes": [
+          {
+            "cap": "ceiling",
+            "concurrency": 8,
+            "default": true,
+            "name": "in"
+          }
+        ],
+        "pacing": {
+          "batch": 200,
+          "leaseSeconds": 1
+        }
+      }
+    },
+    "version": 1
+  },
+  "google": {
+    "application": "channel-go",
+    "breach": [
+      {
+        "maxAttempts": 3,
+        "retryTo": "origin-entry",
+        "when": {
+          "status": 429
+        }
+      }
+    ],
+    "consume": [
+      "account"
+    ],
+    "edges": [
+      {
+        "from": "hotel",
+        "to": "account"
+      },
+      {
+        "from": "vr",
+        "to": "account"
+      }
+    ],
+    "name": "google",
+    "nodes": {
+      "account": {
+        "admitted": {
+          "partitionBy": "connection",
+          "partitions": 64
+        },
+        "budgets": [
+          {
+            "alignment": "rolling",
+            "asOf": "2026-08-12",
+            "cap": 400,
+            "confidence": "documented",
+            "id": "account-1s",
+            "periodSeconds": 1,
+            "source": "developers.google.com/hotels/hotel-prices/dev-guide/api-limits"
+          },
+          {
+            "alignment": "rolling",
+            "asOf": "2026-08-12",
+            "cap": 4000,
+            "confidence": "documented",
+            "id": "account-10s",
+            "periodSeconds": 10,
+            "source": "developers.google.com/hotels/hotel-prices/dev-guide/api-limits"
+          }
+        ],
+        "cost": {
+          "default": 1,
+          "field": "httpCost",
+          "max": 100
+        },
+        "lanes": [
+          {
+            "cap": "ceiling",
+            "concurrency": 8,
+            "default": true,
+            "name": "out"
+          }
+        ],
+        "pacing": {
+          "batch": 400,
+          "leaseSeconds": 1
+        }
+      },
+      "hotel": {
+        "admitted": {
+          "partitionBy": "connection",
+          "partitions": 64
+        },
+        "cost": {
+          "default": 1,
+          "field": "httpCost",
+          "max": 100
+        },
+        "entry": true,
+        "lanes": [
+          {
+            "cap": "ceiling",
+            "concurrency": 8,
+            "default": true,
+            "name": "in"
+          }
+        ],
+        "pacing": {
+          "batch": 400,
+          "leaseSeconds": 1
+        }
+      },
+      "vr": {
+        "admitted": {
+          "partitionBy": "connection",
+          "partitions": 64
+        },
+        "cost": {
+          "default": 1,
+          "field": "httpCost",
+          "max": 100
+        },
+        "entry": true,
+        "lanes": [
+          {
+            "cap": "ceiling",
+            "concurrency": 8,
+            "default": true,
+            "name": "in"
+          }
+        ],
+        "pacing": {
+          "batch": 400,
+          "leaseSeconds": 1
+        }
+      }
+    },
+    "version": 1
+  },
+  "vrbo": {
+    "application": "channel-go",
+    "breach": [
+      {
+        "maxAttempts": 3,
+        "retryTo": "origin-entry",
+        "when": {
+          "status": 429
+        }
+      }
+    ],
+    "consume": [
+      "partner"
+    ],
+    "edges": [
+      {
+        "from": "push",
+        "to": "partner"
+      },
+      {
+        "from": "promotions",
+        "priority": 1,
+        "to": "partner"
+      },
+      {
+        "from": "content",
+        "priority": 1,
+        "to": "partner"
+      }
+    ],
+    "name": "vrbo",
+    "nodes": {
+      "content": {
+        "admitted": {
+          "partitionBy": "connection",
+          "partitions": 64
+        },
+        "budgets": [
+          {
+            "alignment": "rolling",
+            "asOf": "2026-08-12",
+            "cap": 1800,
+            "confidence": "documented",
+            "id": "content-30",
+            "periodSeconds": 60,
+            "source": "developer.expediagroup.com/supply/lodging/docs \u2014 rate limits"
+          }
+        ],
+        "cost": {
+          "default": 1,
+          "field": "httpCost",
+          "max": 100
+        },
+        "entry": true,
+        "lanes": [
+          {
+            "cap": "ceiling",
+            "concurrency": 8,
+            "default": true,
+            "name": "in"
+          }
+        ],
+        "pacing": {
+          "batch": 200,
+          "leaseSeconds": 1
+        }
+      },
+      "partner": {
+        "admitted": {
+          "partitionBy": "connection",
+          "partitions": 64
+        },
+        "budgets": [
+          {
+            "alignment": "rolling",
+            "asOf": "2026-08-12",
+            "cap": 500,
+            "confidence": "documented",
+            "id": "partner-10s",
+            "periodSeconds": 10,
+            "source": "developer.expediagroup.com/supply/lodging/docs \u2014 rate limits"
+          },
+          {
+            "alignment": "rolling",
+            "asOf": "2026-08-12",
+            "cap": 3000,
+            "confidence": "documented",
+            "id": "partner-60s",
+            "periodSeconds": 60,
+            "source": "developer.expediagroup.com/supply/lodging/docs \u2014 rate limits"
+          }
+        ],
+        "cost": {
+          "default": 1,
+          "field": "httpCost",
+          "max": 100
+        },
+        "lanes": [
+          {
+            "cap": "ceiling",
+            "concurrency": 8,
+            "default": true,
+            "name": "out"
+          }
+        ],
+        "pacing": {
+          "batch": 200,
+          "leaseSeconds": 1
+        }
+      },
+      "promotions": {
+        "admitted": {
+          "partitionBy": "connection",
+          "partitions": 64
+        },
+        "budgets": [
+          {
+            "alignment": "rolling",
+            "asOf": "2026-08-12",
+            "cap": 1200,
+            "confidence": "documented",
+            "id": "promotions-v2",
+            "periodSeconds": 60,
+            "source": "developer.expediagroup.com/supply/lodging/docs \u2014 rate limits"
+          }
+        ],
+        "cost": {
+          "default": 1,
+          "field": "httpCost",
+          "max": 100
+        },
+        "entry": true,
+        "lanes": [
+          {
+            "cap": "ceiling",
+            "concurrency": 8,
+            "default": true,
+            "name": "in"
+          }
+        ],
+        "pacing": {
+          "batch": 200,
+          "leaseSeconds": 1
+        }
+      },
+      "push": {
+        "admitted": {
+          "partitionBy": "connection",
+          "partitions": 64
+        },
+        "budgets": [
+          {
+            "alignment": "rolling",
+            "asOf": "2026-08-12",
+            "cap": 900,
+            "confidence": "inferred",
+            "id": "push-xml",
+            "periodSeconds": 30,
+            "source": "developer.expediagroup.com/supply/lodging/docs \u2014 rate limits"
+          }
+        ],
+        "cost": {
+          "default": 1,
+          "field": "httpCost",
+          "max": 100
+        },
+        "entry": true,
+        "lanes": [
+          {
+            "cap": "ceiling",
+            "concurrency": 8,
+            "default": true,
+            "name": "in"
+          }
+        ],
+        "pacing": {
+          "batch": 200,
+          "leaseSeconds": 1
+        }
+      }
+    },
+    "version": 1
+  }
+}
