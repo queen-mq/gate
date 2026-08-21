@@ -97,13 +97,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "budgets": [ { "id": "entry-bulk", "count": 1000000, "timeMs": 1000 } ]
             },
             // The one node that holds the ceiling, and the one counter both paths
-            // spend. `subWindows` at the declared width so the window arithmetic
-            // below reads the same number the limiter enforces.
+            // spend.
+            //
+            // Subdivided into one-second windows, and that is not decoration: a
+            // ten-second window enforced whole admits its entire allowance in
+            // the first burst and then nothing for nine seconds — the ceiling
+            // holds (measured: 479 against a cap of 500) and the per-second
+            // rate is a row of zeroes with one spike in it. Smoothing IS
+            // subdivision, and the throughput gate below is a per-second one.
             "ip": {
                 "batch": batch,
                 "budgets": [
                     { "id": "binding", "count": count, "timeMs": window_s * 1000,
-                      "subWindows": 1,
+                      "subWindows": window_s,
                       "confidence": "documented", "source": "e2e", "asOf": "2026-08-21" }
                 ],
                 "egress": egress
@@ -262,8 +268,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut drained_samples: Vec<u64> = Vec::new();
     let mut adm_samples: Vec<u64> = Vec::new();
-    // Seconds in which the counter sat between half and full — the window in
-    // which the reserve is the only thing that can explain who got through.
+    // Seconds in which the LOW-share path was actually refused. Read off its
+    // own counter rather than off the shared row: with a one-second sub-window
+    // the row is at zero or at its ceiling by the time a once-a-second sampler
+    // looks at it, and "the counter sat between the two ceilings" is a fact
+    // about the sampler's luck. "bulk was refused" is a fact about the limiter.
     let mut contended = 0u32;
     let mut reserve_held = 0u32;
 
@@ -283,12 +292,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let bulk_refused = bulk.deferred.saturating_sub(last_bulk.deferred);
         adm_samples.push(d_fast + d_bulk);
 
-        // The reserve, measured: while the shared counter is above the 0.5-share
-        // path's ceiling and below the 1.0-share path's, the low path must be
-        // refusing and the high one must still be getting through.
-        if ceiling > 0 && value * 2 > ceiling && value < ceiling {
+        // The reserve, measured: in any second where the 0.5-share path was
+        // refused, the 1.0-share path must still have got through. That is the
+        // whole property — the headroom above bulk's ceiling belongs to fast and
+        // to nobody else — and it does not depend on catching the shared row
+        // mid-window.
+        let _ = (value, ceiling);
+        if bulk_refused > 0 {
             contended += 1;
-            if bulk_refused > 0 && d_fast > 0 {
+            if d_fast > 0 {
                 reserve_held += 1;
             }
         }
@@ -326,7 +338,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   drained by the driver p50 {p50}/s  peak {peak}/s  total {drained}");
     println!("   mean drained          {mean:.1}/s over {elapsed:.1}s");
     println!("   admitted samples      {adm_steady:?}");
-    println!("   contended seconds     {contended}, reserve held in {reserve_held}");
+    println!("   seconds bulk refused  {contended}, of which fast still admitted {reserve_held}");
 
     let window_total: u64 = adm_steady
         .windows(window_s.max(1) as usize)
@@ -336,9 +348,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let window_cap = count as f64;
     let ok_peak = (window_total as f64) <= window_cap * 1.25;
     let ok_mean = (adm_p50 as f64) >= per_sec * 0.6;
-    // Contention has to HAPPEN for the third gate to mean anything. If the
-    // counter never sat between the two ceilings there was nothing to reserve,
-    // and reporting a pass would be reporting that a test nobody ran succeeded.
+    // Contention has to HAPPEN for the third gate to mean anything. If the low
+    // path was never refused there was nothing to reserve, and reporting a pass
+    // would be reporting that a test nobody ran succeeded.
     let ok_reserve = contended == 0 || reserve_held * 2 >= contended;
 
     println!("   worst {window_s}s window     {window_total} against a cap of {window_cap:.0}");
@@ -353,7 +365,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "   reserve held (low path refuses, high admits)  {}",
         match (contended, ok_reserve) {
-            (0, _) => "NOT EXERCISED (the counter never sat between the two ceilings)",
+            (0, _) => "NOT EXERCISED (the low-share path was never refused)",
             (_, true) => "PASS",
             _ => "FAIL",
         }
