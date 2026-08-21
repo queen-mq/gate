@@ -22,11 +22,25 @@ FROM rust:1-bookworm AS server-builder
 
 WORKDIR /usr/build
 
-# Manifests first, so a source-only change does not re-resolve the graph.
+# Manifests first, then `cargo fetch`, so a source-only change re-uses the
+# downloaded registry instead of resolving the graph again.
+#
+# The pre-copy used to sit here with no fetch between it and `COPY crates`,
+# which bought nothing at all — the next layer replaced every manifest it had
+# just copied. It also missed `crates/bench`, so the copy could not have been
+# complete even if it had been useful. Both fixed: every member is listed, and
+# the fetch is what makes listing them worth doing.
 COPY Cargo.toml Cargo.lock ./
 COPY crates/core/Cargo.toml ./crates/core/
 COPY crates/server/Cargo.toml ./crates/server/
 COPY crates/e2e/Cargo.toml ./crates/e2e/
+COPY crates/bench/Cargo.toml ./crates/bench/
+RUN mkdir -p crates/core/src crates/server/src crates/e2e/src crates/bench/src \
+    && echo "" > crates/core/src/lib.rs \
+    && echo "fn main() {}" > crates/server/src/main.rs \
+    && echo "fn main() {}" > crates/e2e/src/main.rs \
+    && echo "fn main() {}" > crates/bench/src/main.rs
+RUN --mount=type=cache,target=/usr/local/cargo/registry cargo fetch --locked
 
 COPY crates ./crates
 
@@ -43,9 +57,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # ---------------------------------------------------------------- the runtime
 FROM debian:bookworm-slim
 
-# Quello che la CI passa come --label. Ripetuto qui perché il primo push è a
-# mano: senza, il pacchetto su GHCR resta orfano — nessun link al repository,
-# nessuna eredità della sua visibilità — finché non lo ripubblica la pipeline.
+# What CI passes as --label, repeated here because the first push is by hand:
+# without it the package on GHCR is an orphan — no link to the repository and
+# none of its visibility — until the pipeline republishes it.
 LABEL org.opencontainers.image.source="https://github.com/queen-mq/gate" \
       org.opencontainers.image.description="Gate — egress rate limiter on QueenMQ" \
       org.opencontainers.image.licenses="Apache-2.0"
