@@ -21,7 +21,12 @@ use queen_mq::{Expiry, Queen, Result};
 
 use gate_core::{v1, GraphDoc};
 
-const NS: &str = "gate";
+/// The same namespace the counters live in, and read from the same place: one
+/// namespace per deployment is one thing to look at in the console, and two
+/// spellings of it is a store nobody can find.
+fn ns() -> String {
+    crate::budget::namespace()
+}
 
 /// v2 documents. Also where v1 `GraphSpec`s were kept, which is why the read
 /// below tries both.
@@ -45,7 +50,7 @@ pub async fn save(queen: &Queen, doc: &GraphDoc) -> Result<()> {
     queen
         .kv()
         .put(
-            NS,
+            &ns(),
             &graph_key(&doc.application, &doc.graph),
             value,
             Expiry::forever(),
@@ -56,13 +61,17 @@ pub async fn save(queen: &Queen, doc: &GraphDoc) -> Result<()> {
 }
 
 pub async fn forget(queen: &Queen, app: &str, name: &str) -> Result<()> {
-    queen.kv().delete(NS, &graph_key(app, name)).send().await?;
+    queen
+        .kv()
+        .delete(&ns(), &graph_key(app, name))
+        .send()
+        .await?;
     // A graph that came across from a v1 standalone target keeps its old row
     // until it is deleted too, or the next boot restores it and the delete looks
     // like it did not take.
     queen
         .kv()
-        .delete(NS, &v1_target_key(app, name))
+        .delete(&ns(), &v1_target_key(app, name))
         .send()
         .await
         .ok();
@@ -112,7 +121,7 @@ pub async fn try_load_all(queen: &Queen) -> Result<Stored> {
 
     let res = queen
         .kv()
-        .get_prefix(NS, GRAPH_PREFIX)
+        .get_prefix(&ns(), GRAPH_PREFIX)
         .limit(1000)
         .send()
         .await?;
@@ -154,7 +163,7 @@ pub async fn try_load_all(queen: &Queen) -> Result<Stored> {
     // v1 standalone targets. Each becomes a one-node graph named for itself.
     let res = queen
         .kv()
-        .get_prefix(NS, V1_TARGET_PREFIX)
+        .get_prefix(&ns(), V1_TARGET_PREFIX)
         .limit(1000)
         .send()
         .await?;
