@@ -446,3 +446,43 @@ fn removing_a_path_strands_an_interior_queue() {
     new.nodes.remove("audit");
     assert!(gate_core::needs_version_bump(&old, &new));
 }
+
+// ------------------------------------------------------- the assumed discount
+
+/// The `assumed` discount is **wired and not switched on**, and that is a
+/// deliberate holding position rather than an oversight.
+///
+/// v1 defined `ASSUMED_FACTOR = 0.7`, unit-tested it, documented it in the
+/// README — *"an assumed cap is enforced at 70% of what it claims"* — and never
+/// applied it: `effective_cap` had no caller. Shipping a third release that
+/// documents a discount it does not apply is the option that is not available,
+/// so the arithmetic is here and one field turns it on. Turning it on changes
+/// what every existing `assumed` budget admits, which is a product decision
+/// (design §16.3) and not one to make on the way past.
+#[test]
+fn an_assumed_budget_is_enforced_at_its_declared_count_until_somebody_says_otherwise() {
+    let mut doc = airbnb();
+    doc.nodes.get_mut("audit").unwrap().budgets[0].confidence = gate_core::Confidence::Assumed;
+
+    let plain = compile(&doc);
+    assert_eq!(
+        plain.node("audit").unwrap().budgets[0].count_sub,
+        2000,
+        "the default build enforces exactly what the declaration says"
+    );
+
+    let discounted = gate_core::compile_with(
+        &doc,
+        &plan::PlanOpts {
+            assumed_factor: gate_core::ASSUMED_FACTOR,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        discounted.node("audit").unwrap().budgets[0].count_sub,
+        1400,
+        "and the discount is one field away, not one rewrite away"
+    );
+    // A documented budget is never discounted, whatever the factor says.
+    assert_eq!(discounted.node("prices").unwrap().budgets[0].count_sub, 100);
+}
