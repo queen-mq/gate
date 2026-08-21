@@ -148,6 +148,52 @@ impl Gate {
         out
     }
 
+    /// Fill a queue directly, with the application's own SDK, in batched
+    /// pushes.
+    ///
+    /// The point of pre-filling BEFORE the graph is declared: with the stage
+    /// already running, a flood is drained as fast as it arrives and the only
+    /// thing measured afterwards is the tail. The relay's own rate is what a
+    /// backlog is drained at, so the backlog has to exist first.
+    pub async fn prefill_queue(&self, queue: &str, n: u64, partitions: u64) -> u64 {
+        let mut sent = 0u64;
+        let mut i = 0u64;
+        while i < n {
+            let take = 500.min(n - i);
+            let items: Vec<queen_mq::PushItem> = (0..take)
+                .map(|k| queen_mq::PushItem {
+                    queue: queue.to_string(),
+                    partition: Some(format!("c{}", (i + k) % partitions)),
+                    payload: json!({ "at": now_us(), "n": i + k }),
+                    transaction_id: None,
+                })
+                .collect();
+            match self.queen.queue(queue).push_items(items).await {
+                Ok(r) => sent += r.len() as u64,
+                Err(e) => {
+                    println!("  prefill failed after {sent}: {e}");
+                    break;
+                }
+            }
+            i += take;
+        }
+        sent
+    }
+
+    /// How many parked long-polls a graph is running: the sum of its stages'
+    /// worker counts. It is the numerator of the idle cost.
+    pub async fn workers(&self, graph: &str) -> u64 {
+        let url = format!("{}/v1/apps/{}/graphs/{graph}", self.base, self.app);
+        let v: Value = match self.http.get(&url).send().await {
+            Ok(r) => r.json().await.unwrap_or(Value::Null),
+            Err(_) => return 0,
+        };
+        v["stages"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|s| s["concurrency"].as_u64()).sum())
+            .unwrap_or(0)
+    }
+
     /// The broker's own lifetime HTTP request counter.
     ///
     /// This is how `idle` is measured: with nothing else pointed at the broker,

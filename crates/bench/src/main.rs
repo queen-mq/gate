@@ -330,51 +330,43 @@ async fn drain(g: &Arc<Gate>, cfg: &Cfg) -> Result<(), String> {
 /// batch 200 that is one of each per two hundred items, which is why 10k
 /// items/s is a target and not a hope.
 async fn throughput(g: &Arc<Gate>, cfg: &Cfg) -> Result<(), String> {
-    println!("\n\n== throughput — items/s end to end, swept over the batch");
+    println!("\n\n== throughput — items/s out of a backlog, swept over the batch");
     println!(
         "   floor 2.8k items/s (the old counter-funnel relay's ceiling on a 32-core VM, with\n   \
          tuple lock waits at 96-100%); target 10k at batch 200."
     );
     println!(
-        "\n  {:<12} {:>12} {:>12} {:>14} {:>16}",
-        "batch", "pushed/s", "admitted/s", "items/commit", "verdict"
+        "   The backlog is filled BEFORE the graph is declared, with the application's own SDK.\n   \
+         With the stage already running a flood is drained as fast as it arrives, and what is\n   \
+         measured afterwards is the tail rather than the relay."
     );
     println!(
-        "  {:-<12} {:->12} {:->12} {:->14} {:->16}",
-        "", "", "", "", ""
+        "\n  {:<12} {:>10} {:>12} {:>12} {:>14} {:>16}",
+        "batch", "backlog", "fill/s", "admitted/s", "items/commit", "verdict"
+    );
+    println!(
+        "  {:-<12} {:->10} {:->12} {:->12} {:->14} {:->16}",
+        "", "", "", "", "", ""
     );
 
     for batch in cfg.batches.clone() {
         let name = format!("{}-b{batch}", g.graph_name("thr"));
         let out = format!("{}.b{batch}", g.egress("thr"));
+        // The queue the stage will read, named exactly as the compiler will
+        // name it. If this ever drifts the fill goes somewhere nothing drains,
+        // and the row reads zero rather than lying.
+        let ingress = format!("gate.{}.{name}.n.ingress", g.app);
+
+        let t_fill = Instant::now();
+        let filled = g.prefill_queue(&ingress, cfg.backlog, 16).await;
+        let fill_secs = t_fill.elapsed().as_secs_f64();
+        if filled == 0 {
+            return Err(format!("could not fill `{ingress}`"));
+        }
+
+        // Now let it drain.
         g.declare(&name, wide_doc(&out, WIDE_PER_SEC, batch))
             .await?;
-
-        // Flood first, then measure what came out. A closed-loop push and a
-        // closed-loop drain competing for the same cores would measure the
-        // driver, so the two halves are separated in time.
-        let pushed = burst("flood", 64, cfg.backlog, {
-            let (gg, n) = (g.clone(), name.clone());
-            move |w, i| {
-                let (g, n) = (gg.clone(), n.clone());
-                async move {
-                    g.push(
-                        &n,
-                        "n",
-                        &json!({ "op": "bench.call",
-                                 "partition": format!("c{}", (w as u64 + i) % 16),
-                                 "payload": { "at": now_us() } }),
-                    )
-                    .await
-                }
-            }
-        })
-        .await;
-
-        let (a0, f0, c0) = g.stages(&name).await;
-        let t0 = Instant::now();
-        // Drain while the stage works, so the egress queue does not become the
-        // thing that is full.
         let stop = Arc::new(AtomicU64::new(0));
         let mut drains = Vec::new();
         for i in 0..8 {
@@ -386,36 +378,53 @@ async fn throughput(g: &Arc<Gate>, cfg: &Cfg) -> Result<(), String> {
                 }
             }));
         }
-        tokio::time::sleep(dur(cfg)).await;
+
+        let t0 = Instant::now();
+        let mut last = 0u64;
+        let mut still = 0u32;
+        // Until the backlog is gone, or until it stops moving.
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let (admitted, _, _) = g.stages(&name).await;
+            if admitted >= filled || t0.elapsed() > Duration::from_secs(cfg.secs * 12) {
+                break;
+            }
+            still = if admitted == last { still + 1 } else { 0 };
+            last = admitted;
+            if still > 20 {
+                break;
+            }
+        }
+        let elapsed = t0.elapsed().as_secs_f64();
+        let (admitted, forwarded, commits) = g.stages(&name).await;
+
         stop.store(1, Ordering::Relaxed);
         for d in drains {
             let _ = tokio::time::timeout(Duration::from_secs(3), d).await;
         }
 
-        let (a1, f1, c1) = g.stages(&name).await;
-        let elapsed = t0.elapsed().as_secs_f64();
-        let admitted = (a1 - a0) as f64 / elapsed;
-        let per_commit = if c1 > c0 {
-            (f1 - f0) as f64 / (c1 - c0) as f64
+        let rate = admitted as f64 / elapsed;
+        let per_commit = if commits > 0 {
+            forwarded as f64 / commits as f64
         } else {
             0.0
         };
         // `forwarded / commits` within 10% of the batch is the direct evidence
-        // the batching is real. It is not asserted where the budget is not the
-        // constraint and the queue simply runs dry — a stage that finds three
-        // items commits three.
-        let verdict = if admitted >= 10_000.0 {
+        // the batching is real. It is not asserted where the queue simply runs
+        // dry — a stage that finds three items commits three.
+        let verdict = if rate >= 10_000.0 {
             "TARGET"
-        } else if admitted >= 2_800.0 {
+        } else if rate >= 2_800.0 {
             "above floor"
         } else {
             "BELOW FLOOR"
         };
         println!(
-            "  {:<12} {:>12.0} {:>12.0} {:>14.1} {:>16}",
+            "  {:<12} {:>10} {:>12.0} {:>12.0} {:>14.1} {:>16}",
             batch,
-            pushed.rps(),
-            admitted,
+            filled,
+            filled as f64 / fill_secs,
+            rate,
             per_commit,
             verdict
         );
@@ -434,6 +443,11 @@ async fn throughput(g: &Arc<Gate>, cfg: &Cfg) -> Result<(), String> {
 async fn contention(g: &Arc<Gate>, cfg: &Cfg) -> Result<(), String> {
     println!("\n\n== contention — N stages charging ONE shared kv counter");
     println!(
+        "   Backlogs filled before the graph is declared, for the reason `throughput` gives.\n   \
+         This table should be FLAT: `kv.incr` on one key was measured at 33k/s and the budget is\n   \
+         charged once per BATCH, so at batch 200 the row sees one call per two hundred items."
+    );
+    println!(
         "\n  {:<12} {:>12} {:>14} {:>12}",
         "stages", "admitted/s", "per stage/s", "incr/s"
     );
@@ -442,33 +456,19 @@ async fn contention(g: &Arc<Gate>, cfg: &Cfg) -> Result<(), String> {
     for stages in [1usize, 2, 4, 8] {
         let name = format!("{}-s{stages}", g.graph_name("cont"));
         let out = format!("{}.s{stages}", g.egress("cont"));
-        g.declare(&name, shared_doc(&out, stages, WIDE_PER_SEC, 200))
-            .await?;
-
         let per_node = cfg.backlog / stages as u64;
+
+        let mut filled = 0u64;
         for i in 0..stages {
-            let node = format!("n{i}");
-            let _ = burst("flood", 32, per_node, {
-                let (gg, n, node) = (g.clone(), name.clone(), node.clone());
-                move |w, j| {
-                    let (g, n, node) = (gg.clone(), n.clone(), node.clone());
-                    async move {
-                        g.push(
-                            &n,
-                            &node,
-                            &json!({ "op": "bench.call",
-                                     "partition": format!("c{}", (w as u64 + j) % 8),
-                                     "payload": { "at": now_us() } }),
-                        )
-                        .await
-                    }
-                }
-            })
-            .await;
+            let ingress = format!("gate.{}.{name}.n{i}.ingress", g.app);
+            filled += g.prefill_queue(&ingress, per_node, 8).await;
+        }
+        if filled == 0 {
+            return Err("could not fill the contended backlogs".into());
         }
 
-        let (a0, _, c0) = g.stages(&name).await;
-        let t0 = Instant::now();
+        g.declare(&name, shared_doc(&out, stages, WIDE_PER_SEC, 200))
+            .await?;
         let stop = Arc::new(AtomicU64::new(0));
         let mut drains = Vec::new();
         for i in 0..8 {
@@ -480,23 +480,37 @@ async fn contention(g: &Arc<Gate>, cfg: &Cfg) -> Result<(), String> {
                 }
             }));
         }
-        tokio::time::sleep(dur(cfg)).await;
+
+        let t0 = Instant::now();
+        let mut last = 0u64;
+        let mut still = 0u32;
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let (admitted, _, _) = g.stages(&name).await;
+            if admitted >= filled || t0.elapsed() > Duration::from_secs(cfg.secs * 12) {
+                break;
+            }
+            still = if admitted == last { still + 1 } else { 0 };
+            last = admitted;
+            if still > 20 {
+                break;
+            }
+        }
+        let elapsed = t0.elapsed().as_secs_f64();
+        let (admitted, _, commits) = g.stages(&name).await;
         stop.store(1, Ordering::Relaxed);
         for d in drains {
             let _ = tokio::time::timeout(Duration::from_secs(3), d).await;
         }
 
-        let (a1, _, c1) = g.stages(&name).await;
-        let elapsed = t0.elapsed().as_secs_f64();
-        let admitted = (a1 - a0) as f64 / elapsed;
+        let rate = admitted as f64 / elapsed;
         // One charge per commit, so commits/s IS the rate the shared row sees.
-        let incrs = (c1 - c0) as f64 / elapsed;
         println!(
             "  {:<12} {:>12.0} {:>14.0} {:>12.0}",
             stages,
-            admitted,
-            admitted / stages as f64,
-            incrs
+            rate,
+            rate / stages as f64,
+            commits as f64 / elapsed
         );
         g.drop_graph(&name).await;
     }
@@ -648,16 +662,25 @@ async fn idle(g: &Arc<Gate>, cfg: &Cfg) -> Result<(), String> {
     );
     println!("  {:<34} {:>12.0}", "extrapolated per hour", per_hour);
     println!("  {:<34} {:>12}", "v1, measured in prod, per hour", 275_000);
+    let workers = g.workers(&name).await;
     println!(
-        "\n   Caveat: this counts every client of the broker, not only Gate. Run it against a\n   \
-         broker nothing else is using, or read pg_stat_statements instead."
+        "  {:<34} {:>12}",
+        "parked long-polls (the numerator)", workers
     );
     println!(
-        "   Expected shape: one re-park per WORKER per poll timeout, so\n     \
-         stages x concurrency / poll_timeout pops a second — {:.0} an hour for seven stages of\n     \
-         sixteen workers on a 30s window — plus one reconcile pass every\n     \
-         GATE_RECONCILE_SECONDS. Nothing else: no depth probe, no state read, no meter tick.",
-        7.0 * 16.0 * 3600.0 / 30.0
+        "  {:<34} {:>12.0}",
+        "expected per hour at a 30s window",
+        workers as f64 * 3600.0 / 30.0
+    );
+    println!(
+        "\n   One re-park per WORKER per poll timeout, and nothing else: no depth probe, no state\n   \
+         read, no meter tick. Both knobs move it — GATE_POLL_TIMEOUT_SECONDS is paid in shutdown\n   \
+         latency, GATE_STAGE_CONCURRENCY in how many partitions a stage drains at once."
+    );
+    println!(
+        "   Caveat: the counter is the BROKER's and counts every client and every graph this gate\n   \
+         is running. Run it against a broker and a gate with nothing else on them, or read\n   \
+         pg_stat_statements around the window instead."
     );
 
     g.drop_graph(&name).await;

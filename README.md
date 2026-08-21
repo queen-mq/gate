@@ -35,19 +35,25 @@ no rotation cursor, no meter loop, no state document.
 * **Prod, one hour.** The previous design made ~275,000 "is there work?" calls to
   move messages **963** times — 285 polls per relay. Nothing was broken; that is
   what a polling data plane costs while idle, and idle is most of the time. An
-  idle graph here costs `stages × concurrency ÷ poll_timeout` pops a second and
-  nothing else — no depth probe, no state read, no meter tick — which for a
-  seven-stage graph of sixteen workers on a thirty-second window is about
-  **13,400 an hour**. Twenty times less, and both knobs move it further:
-  `GATE_POLL_TIMEOUT_SECONDS` is paid in shutdown latency,
-  `GATE_STAGE_CONCURRENCY` in how many partitions a stage drains at once.
+  idle graph here costs `workers ÷ poll_timeout` pops a second and nothing else —
+  no depth probe, no state read, no meter tick. Measured on a seven-stage graph
+  with fifty-six parked polls: **112 broker requests in sixty seconds, or 6,720
+  an hour** — exactly what the formula predicts, and **forty-one times less**
+  than v1. Both knobs move it further: `GATE_POLL_TIMEOUT_SECONDS` is paid in
+  shutdown latency, `GATE_STAGE_CONCURRENCY` in how many partitions a stage
+  drains at once.
 * **Bench, 32-core VM.** The old counter-funnel relay topped out at **2.8k items/s**
   with tuple lock waits at 96–100%, because every admission was a write transaction
   on one partition row. A `txnload` with **disjoint lanes** — the shape this design
-  adopts — did **23–34k items/s** on the same machine.
+  adopts — did **23–34k items/s** on the same machine. Draining a pre-filled backlog
+  through this one, on a laptop sharing its cores with the broker and the driver:
+  102 items/s at batch 1, 3,041 at batch 25, **13,070 at batch 200** and 39,798 at
+  batch 500, with `forwarded / commits` tracking the batch to within 11%.
 * **`kv.incr` on one key does 33k/s**, and the budget is charged once per **batch**.
   At batch 200 and 34k items/s the counter sees 170 incr/s. That is the sentence
-  that makes one shared key acceptable where one shared partition was not.
+  that makes one shared key acceptable where one shared partition was not — and
+  eight stages sharing one counter were measured moving 19–39k items/s while that
+  counter saw 103–253 incr/s, which is the same sentence with the numbers in it.
 
 ---
 
