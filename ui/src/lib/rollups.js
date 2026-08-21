@@ -24,7 +24,8 @@ async function series(key, minutes) {
 /*
   Always the scoped key: two teams may both own an `airbnb` and their minutes
   must never be added together. The table keys on the pair, so there is one
-  series to ask for and no reconciling to do.
+  series to ask for and no reconciling to do — and the `target` half is
+  `{graph}.{node}`, because a node is what a target was.
 */
 export async function fetchRollups(application, target, minutes = 120) {
   const rows = await series(`${application}/${target}`, minutes)
@@ -54,9 +55,12 @@ export function windowMs(row) {
   There is also no first window to drop any more. Every row is a minute that
   stands on its own.
 */
-export function perMinute(rows, lane = null) {
+export function perMinute(rows, path = null) {
   if (!rows) return null
-  const bucket = (row) => (lane ? row?.lanes?.[lane] : row?.total) ?? {}
+  // The table's `lane` column is the PATH; the DDL did not change, because a
+  // node IS what a target was and ninety days of history are worth more than a
+  // tidy column name.
+  const bucket = (row) => (path ? row?.lanes?.[path] : row?.total) ?? {}
   return rows.map((row) => {
     const b = bucket(row)
     return {
@@ -86,8 +90,11 @@ export function perMinute(rows, lane = null) {
 */
 export function budgetSeries(minutes, budget) {
   if (!minutes) return null
-  const p = budget?.periodSeconds ?? 60
-  const cap = budget?.cap ?? 0
+  // The SUB-window and its count, because that is what is enforced: a budget
+  // declared over ten seconds and subdivided into ten is a one-second window of
+  // a tenth, and drawing the declared pair would draw a ceiling nothing meets.
+  const p = budget?.windowSubSeconds ?? 60
+  const cap = budget?.countSub ?? budget?.count ?? 0
   const span = Math.max(1, Math.ceil(p / 60))
   const allowance = p > 0 ? cap * ((span * 60) / p) : 0
   const out = minutes.map((w, i) => {

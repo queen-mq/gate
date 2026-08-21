@@ -12,9 +12,10 @@ const mobileNav = ref(false)
 
 /*
   Navigation grouped by intent: "Monitor" is what an operator opens when a
-  portal starts refusing, "Configure" what they touch when a vendor changes a
-  number. The primary object is the TARGET — one thing that limits us, with its
-  budgets and its lanes.
+  portal starts refusing. The primary object is the GRAPH — one document, its
+  nodes, its budgets and the paths that cross them. "Targets" is the same list
+  in the older vocabulary, because a target is a one-node graph and a link in a
+  runbook does not stop existing when a model changes.
 */
 const groups = [
   {
@@ -65,7 +66,7 @@ const warnings = computed(() => {
     w.push(`${assumed} budget${assumed === 1 ? ' is' : 's are'} an assumption, not a published number.`)
   const stale = overview.value?.budgets_stale ?? 0
   if (stale)
-    w.push(`${stale} budget${stale === 1 ? '' : 's'} cite a source older than a year.`)
+    w.push(`${stale} budget${stale === 1 ? '' : 's'} cite a source older than ninety days.`)
   return w
 })
 </script>

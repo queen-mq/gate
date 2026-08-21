@@ -1,13 +1,13 @@
 <script setup>
 /*
-  One row per graph. A graph is a target that grew a topology, so the row answers
-  the same question a target row does — how close is it, and to what — with the
-  one thing a single target cannot have: where the work is on its way through.
+  One row per graph. A graph is the only object: a one-node graph is what a
+  target was, and a several-node one composes limits that would otherwise have to
+  be checked at one instant or not at all.
 */
 import { ref, computed } from 'vue'
 import PageHeader from '../components/PageHeader.vue'
 import Icon from '../components/Icon.vue'
-import { api, num, DEFAULT_APP } from '../lib/api.js'
+import { api, num, isAdmin, graphPath as pathOf, DEFAULT_APP } from '../lib/api.js'
 import { usePoll } from '../lib/poll.js'
 
 const graphs = ref(null)
@@ -24,7 +24,7 @@ async function load() {
 usePoll(load)
 
 function graphPath(g) {
-  return `/apps/${encodeURIComponent(g.application || DEFAULT_APP)}/graphs/${encodeURIComponent(g.name)}`
+  return pathOf(g.application || DEFAULT_APP, g.name)
 }
 
 /* Nodes in the order work moves through them, not in the order a map iterated:
@@ -68,10 +68,16 @@ const rows = computed(() =>
   <div>
     <PageHeader
       title="Graphs"
-      sub="A graph is a declared path: work enters at an entry node, is re-checked against every node it
-           traverses, and is consumed at a terminal. The severe limit lives at the end, where it is enforced
-           last and exactly."
-    />
+      sub="A graph is a set of declared paths: work enters at an ingress node, is charged against every
+           node it traverses, and leaves on an egress queue your own consumers pop. The severe limit lives
+           at the end, where it is enforced last and exactly."
+    >
+      <template #actions>
+        <RouterLink v-if="isAdmin" to="/graphs/new" class="btn btn-primary">
+          <Icon name="plus" :size="14" /> New graph
+        </RouterLink>
+      </template>
+    </PageHeader>
 
     <p v-if="error" class="mb-4 text-[13px] text-bad">{{ error }}</p>
 

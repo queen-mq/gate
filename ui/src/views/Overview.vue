@@ -42,7 +42,7 @@ async function load() {
 }
 usePoll(load)
 
-const lanes = computed(() => (targets.value ?? []).reduce((a, t) => a + (t.lanes?.length || 0), 0))
+const paths = computed(() => (targets.value ?? []).reduce((a, t) => a + ((t.paths ?? t.lanes)?.length || 0), 0))
 const backlog = computed(() => (targets.value ?? []).reduce((a, t) => a + (t.backlog || 0), 0))
 const assumed = computed(() => (targets.value ?? []).reduce((a, t) => a + (t.assumed_budgets || 0), 0))
 
@@ -138,7 +138,7 @@ const status = computed(() => {
              denials are the work the ceiling held back, not the work we lost. -->
         <div class="grid grid-cols-2 sm:grid-cols-4 gap-7 md:gap-9 md:pl-8 md:border-l border-line shrink-0">
           <Metric label="Targets" :value="num(targets.length)" />
-          <Metric label="Lanes" :value="num(lanes)" />
+          <Metric label="Paths" :value="num(paths)" />
           <Metric label="Admitted" :value="rate(overview.admitted_per_sec)" unit="/s" />
           <Metric label="Denied" :value="num(overview.denied_total)" />
         </div>

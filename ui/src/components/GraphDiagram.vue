@@ -10,17 +10,17 @@
   What the picture has to say, in order of importance:
     * which node is the bottleneck — the fill of its worst budget;
     * where the work is waiting — the number on the node, and the lag on the edge;
-    * which way it flows, and in what order — the arrow, and the priority on it;
-    * where a throttle sends work back to — the dashed retro edge, which is the
-      one arrow that goes backwards and the reason the picture is a graph and not
-      a list.
+    * which way it flows, and in what order — the arrow, and the priority on it.
+
+  The dashed retro edge is gone with the feature it drew: a throttle is reported
+  to `POST .../backoff` now, which spends the node's window rather than sending
+  an item back to the door it came in at.
 */
 import { computed } from 'vue'
 
 const props = defineProps({
   nodes: { type: Array, default: () => [] },   // /api/.../graphs/:name → nodes[]
   edges: { type: Array, default: () => [] },
-  breach: { type: Array, default: () => [] },
 })
 
 const W = 210
@@ -84,9 +84,7 @@ function worst(node) {
   return top
 }
 
-/* Bezier from the right edge of the source to the left edge of the destination.
-   Retro edges bow underneath instead, because they run against the flow and an
-   arrow that crosses the forward ones at the same height reads as a cycle. */
+/* Bezier from the right edge of the source to the left edge of the destination. */
 const links = computed(() =>
   props.edges
     .map((e) => {
@@ -107,36 +105,6 @@ const links = computed(() =>
     })
     .filter(Boolean),
 )
-
-const retros = computed(() => {
-  const bottom = layout.value.height - 20
-  return props.breach
-    .map((r) => {
-      // `origin-entry` is not a node: it is wherever the item came in, so the
-      // arrow is drawn from the terminals back to every entry.
-      const froms = props.nodes.filter((n) => n.consume)
-      const tos =
-        r.retryTo === 'origin-entry'
-          ? props.nodes.filter((n) => n.entry)
-          : props.nodes.filter((n) => n.name === r.retryTo)
-      const pairs = []
-      for (const f of froms) {
-        for (const t of tos) {
-          const a = layout.value.placed.get(f.name)
-          const b = layout.value.placed.get(t.name)
-          if (!a || !b) continue
-          pairs.push({
-            rule: r,
-            d: `M${a.x + W / 2},${a.y + H} C${a.x + W / 2},${bottom} ${b.x + W / 2},${bottom} ${b.x + W / 2},${b.y + H}`,
-            lx: (a.x + b.x + W) / 2,
-            ly: bottom - 4,
-          })
-        }
-      }
-      return pairs
-    })
-    .flat()
-})
 
 function fill(u) {
   if (u === null || u === undefined) return 'var(--color-line-2)'
@@ -160,22 +128,7 @@ function fill(u) {
                 markerHeight="7" orient="auto-start-reverse">
           <path d="M0,1 L9,5 L0,9 z" fill="var(--color-line-2)" />
         </marker>
-        <marker id="gd-arrow-retro" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6"
-                markerHeight="6" orient="auto-start-reverse">
-          <path d="M0,1 L9,5 L0,9 z" fill="var(--color-bad)" />
-        </marker>
       </defs>
-
-      <!-- Retro first, so a forward edge is never drawn under a dashed one. -->
-      <g v-for="(r, i) in retros" :key="`r${i}`">
-        <path :d="r.d" fill="none" stroke="var(--color-bad)" stroke-width="1.2"
-              stroke-dasharray="4 4" opacity="0.75" marker-end="url(#gd-arrow-retro)" />
-      </g>
-      <text v-if="retros.length" :x="layout.width / 2" :y="layout.height - 6"
-            text-anchor="middle" font-size="10.5" fill="var(--color-bad)"
-            font-family="var(--font-mono)">
-        {{ breach.map((b) => `${b.when?.status ?? b.when?.outcome} → ${b.retryTo} ×${b.maxAttempts}`).join('   ') }}
-      </text>
 
       <g v-for="l in links" :key="`${l.from}-${l.to}`">
         <path :d="l.d" fill="none" stroke="var(--color-line-2)" stroke-width="1.4"
@@ -196,7 +149,8 @@ function fill(u) {
         <text :x="b.x + W - 14" :y="b.y + 24" text-anchor="end" font-size="10"
               fill="var(--color-fg-3)" font-family="var(--font-mono)">
           {{ [b.node.entry ? 'entry' : null, b.node.consume ? 'terminal' : null,
-              (b.node.shards ?? 1) > 1 ? `×${b.node.shards}` : null].filter(Boolean).join(' · ') }}
+              (b.node.paths ?? []).length > 1 ? `${b.node.paths.length} paths` : null]
+              .filter(Boolean).join(' · ') }}
         </text>
 
 
@@ -218,7 +172,7 @@ function fill(u) {
                 height="5" rx="2.5" :fill="fill(worst(b.node).utilisation)" />
         </template>
         <text v-else :x="b.x + 14" :y="b.y + 48" font-size="10.5" fill="var(--color-fg-3)"
-              font-family="var(--font-mono)">no budget · isolation and priority</text>
+              font-family="var(--font-mono)">no budget declared</text>
 
         <text :x="b.x + 14" :y="b.y + H - 14" font-size="10.5" fill="var(--color-fg-3)"
               font-family="var(--font-mono)">

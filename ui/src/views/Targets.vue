@@ -15,7 +15,7 @@ import PageHeader from '../components/PageHeader.vue'
 import StatusDot from '../components/StatusDot.vue'
 import BudgetBar from '../components/BudgetBar.vue'
 import Icon from '../components/Icon.vue'
-import { api, num, pct, period, isAdmin, targetPath, DEFAULT_APP, READ_ONLY_NOTE } from '../lib/api.js'
+import { api, num, pct, isAdmin, graphPath, DEFAULT_APP, READ_ONLY_NOTE } from '../lib/api.js'
 import { usePoll } from '../lib/poll.js'
 
 const targets = ref(null)
@@ -82,7 +82,7 @@ const groups = computed(() => {
   <div>
     <PageHeader
       title="Targets"
-      sub="One target is one thing that limits us: a portal, an API, an account. Its budgets are what it publishes, its lanes are how we choose to spend them. It belongs to an application, and applications never share a ceiling."
+      sub="One target is one thing that limits us: a portal, an API, an account. It is a graph — a one-node graph where there is one limit, several where they compose — and it belongs to an application. Applications never share a ceiling."
     >
       <template #actions>
         <select v-model="app" class="input w-[190px]" aria-label="Filter by application">
@@ -94,8 +94,8 @@ const groups = computed(() => {
                 class="absolute left-3 top-1/2 -translate-y-1/2 text-fg-3 pointer-events-none" />
           <input v-model="q" class="input w-[200px] pl-9" placeholder="Filter targets" />
         </div>
-        <RouterLink v-if="isAdmin" to="/targets/new" class="btn btn-primary">
-          <Icon name="plus" :size="14" /> New target
+        <RouterLink v-if="isAdmin" to="/graphs/new" class="btn btn-primary">
+          <Icon name="plus" :size="14" /> New graph
         </RouterLink>
       </template>
     </PageHeader>
@@ -115,10 +115,10 @@ const groups = computed(() => {
       </p>
       <p v-if="!q && !app" class="text-[12.5px] text-fg-3 mt-1">
         Declare one here, or from a caller with
-        <span class="kbd">PUT /v1/apps/{application}/targets/{name}</span>.
+        <span class="kbd">PUT /v1/apps/{application}/graphs/{name}</span>.
       </p>
-      <RouterLink v-if="!q && !app && isAdmin" to="/targets/new" class="btn btn-primary mt-5">
-        <Icon name="plus" :size="14" /> New target
+      <RouterLink v-if="!q && !app && isAdmin" to="/graphs/new" class="btn btn-primary mt-5">
+        <Icon name="plus" :size="14" /> New graph
       </RouterLink>
       <p v-else-if="!q && !app" class="text-[12px] text-fg-3 mt-4">{{ READ_ONLY_NOTE }}</p>
     </div>
@@ -138,7 +138,7 @@ const groups = computed(() => {
         <div class="card divide-y divide-line">
           <RouterLink
             v-for="t in g.rows" :key="`${t.application}/${t.name}`"
-            :to="targetPath(t.application, t.name)"
+            :to="graphPath(t.application, t.name)"
             class="flex items-center gap-5 px-5 py-4 hover:bg-surface-2 transition-colors group"
           >
             <div class="min-w-0 flex-[2]">
@@ -148,16 +148,17 @@ const groups = computed(() => {
                 <StatusDot :state="t.assumed_budgets ? 'blind' : t.state" />
               </div>
               <div class="text-[12.5px] text-fg-2 mt-0.5 truncate">
-                {{ (t.lanes ?? []).map((l) => l.name).join(' · ') }}
+                {{ (t.paths ?? t.lanes ?? []).map((l) => l.name).join(' · ') }}
                 <span class="text-fg-3">— {{ t.budgets_total }} budget{{ t.budgets_total === 1 ? '' : 's' }}</span>
               </div>
             </div>
 
-            <!-- The tightest window, named, because "87%" of what is the question. -->
+            <!-- The counter closest to refusing, named, because "87%" of what is
+                 the question. -->
             <div class="hidden md:block flex-1 min-w-0">
               <div class="flex items-baseline gap-2 mb-1.5">
                 <span class="font-mono text-[11.5px] text-fg-2 truncate">{{ t.worst_budget_id }}</span>
-                <span class="chip shrink-0">{{ period(t.worst_period_seconds) }}</span>
+                <span class="chip shrink-0 tabular-nums">{{ num(t.worst_used) }} / {{ num(t.worst_cap) }}</span>
               </div>
               <BudgetBar :used="t.worst_used" :cap="t.worst_cap" :assumed="t.worst_assumed" />
             </div>

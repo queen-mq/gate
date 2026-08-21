@@ -213,7 +213,7 @@ function toneOf(u) {
             <span class="font-mono text-[12.5px] truncate">{{ r.application }}</span>
             <RouterLink
               v-if="r.point.target"
-              :to="targetPath(r.application, r.point.target)"
+              :to="targetPath(r.application, String(r.point.target).split('.')[0])"
               class="chip text-fg-3 hover:text-fg transition-colors truncate max-w-[140px]"
             >{{ r.point.target }}</RouterLink>
             <!-- A minute this application did not appear in has no ceiling to

@@ -1,8 +1,5 @@
 import { ref, computed } from 'vue'
 
-const TOKEN_KEY = 'gate-admin-token'
-
-export const adminToken = ref(localStorage.getItem(TOKEN_KEY) || '')
 /*
   Auth state machine for the console:
   - 'unknown'  boot, /api/me in flight
@@ -27,16 +24,13 @@ export const READ_ONLY_NOTE = 'read-only: your account is not in GATE_ADMIN_EMAI
    the console showing a stale identity. */
 export const LOGOUT_URL = '/api/auth/logout'
 
-export function setAdminToken(t) {
-  adminToken.value = t
-  if (t) localStorage.setItem(TOKEN_KEY, t)
-  else localStorage.removeItem(TOKEN_KEY)
-}
-
 async function request(path, { method = 'GET', body } = {}) {
   const headers = {}
   if (body !== undefined) headers['content-type'] = 'application/json'
-  if (adminToken.value) headers.authorization = `Bearer ${adminToken.value}`
+  /* No `Authorization` header. The console used to send a bearer token out of
+     localStorage and the server has never read one: the internal listener has
+     no authentication at all and the public one takes a session cookie. A
+     header nothing reads is a credential somebody will one day believe in. */
 
   const res = await fetch(path, {
     method,
@@ -96,18 +90,25 @@ export async function fetchMe() {
 export const DEFAULT_APP = 'default'
 
 /*
-  A target's identity is the PAIR, never the name alone: two teams may both own
+  A graph's identity is the PAIR, never the name alone: two teams may both own
   something they call `airbnb` and they are not the same thing. Every link in
   the console is built here so no view can invent a different shape.
+
+  A graph is the only object now — a "target" is a one-node graph — so there is
+  one path builder rather than two, and the target routes redirect here.
 */
-export function targetPath(application, name, suffix = '') {
+export function graphPath(application, name, suffix = '') {
   const app = encodeURIComponent(application || DEFAULT_APP)
-  return `/apps/${app}/targets/${encodeURIComponent(name)}${suffix}`
+  return `/apps/${app}/graphs/${encodeURIComponent(name)}${suffix}`
 }
 
-export function targetApi(application, name) {
-  return `/api/apps/${encodeURIComponent(application || DEFAULT_APP)}/targets/${encodeURIComponent(name)}`
+export function graphApi(application, name) {
+  return `/api/apps/${encodeURIComponent(application || DEFAULT_APP)}/graphs/${encodeURIComponent(name)}`
 }
+
+/* Kept under its old name because a dozen call sites say "target" and a node IS
+   what a target was. */
+export const targetPath = graphPath
 
 /*
   The meter keys its series and its traces on `application/name`, so a trace row
@@ -138,9 +139,12 @@ export function traceRef(t) {
   return splitTargetKey(t?.target)
 }
 
+/* A trace names its node as `{graph}.{node}`; the page it links to is the
+   graph. */
 export function traceRefPath(t) {
   const k = traceRef(t)
-  return k.scoped ? targetPath(k.application, k.name) : `/targets/${encodeURIComponent(k.name)}`
+  const graph = String(k.name).split('.')[0]
+  return k.scoped ? graphPath(k.application, graph) : `/targets/${encodeURIComponent(graph)}`
 }
 
 /* Where a row that names its target as one string should link. An unscoped one
@@ -148,7 +152,8 @@ export function traceRefPath(t) {
    asserting one. */
 export function targetKeyPath(key) {
   const k = splitTargetKey(key)
-  return k.scoped ? targetPath(k.application, k.name) : `/targets/${encodeURIComponent(k.name)}`
+  const graph = String(k.name).split('.')[0]
+  return k.scoped ? graphPath(k.application, graph) : `/targets/${encodeURIComponent(graph)}`
 }
 
 /* An unscoped key matches on the name alone, because that is all it claims. */
@@ -180,21 +185,46 @@ export function pct(x) {
 
 /*
   A budget carries both numbers: `utilisation` is the 0..1 fraction of the
-  window that has been spent, `used` the absolute figure behind it. They agree,
-  but only the fraction survives a cap that is zero or missing, so it is the
-  one every gauge in the console is fed.
+  ceiling that has been spent, `value` the absolute figure behind it.
+
+  `null` is a real answer and not a zero: a per-key budget has no single counter
+  to report, because the number that matters is the WORST live key and finding
+  it means enumerating a namespace. Every gauge is fed the fraction, and the
+  ones that can render "we cannot say" do.
 */
 export function utilisation(b) {
   if (!b) return 0
   if (b.utilisation !== null && b.utilisation !== undefined) return b.utilisation
-  return b.cap > 0 ? (b.used ?? 0) / b.cap : 0
+  const ceiling = ceilingOf(b)
+  return ceiling > 0 ? (b.value ?? b.used ?? 0) / ceiling : 0
 }
 
-/* A period comes off the wire as seconds because that is what the target spec
+/* The widest path's ceiling on this budget, which is what the bar is drawn
+   against: the counter is shared and the ceilings overlap, so the bar is the
+   counter and the ceilings are marks on it. */
+export function ceilingOf(b) {
+  if (!b) return 0
+  const marks = Object.values(b.ceilings ?? {})
+  if (marks.length) return Math.max(...marks)
+  return b.countSub ?? b.count ?? b.cap ?? 0
+}
+
+/* A window comes off the wire in MILLISECONDS because that is what a budget
    declares. Rendering it back as `10s` / `5m` / `7d` keeps the console and the
-   spec speaking the same words. */
+   document speaking the same words. */
+export function window(ms) {
+  const s = Math.round((ms ?? 0) / 1000)
+  if (s === 0) return `${ms ?? 0}ms`
+  if (s % 86400 === 0) return `${s / 86400}d`
+  if (s % 3600 === 0) return `${s / 3600}h`
+  if (s % 60 === 0) return `${s / 60}m`
+  return `${s}s`
+}
+
+/* Seconds, for the sub-window a budget is actually enforced in. */
 export function period(seconds) {
   const s = seconds ?? 0
+  if (s === 0) return '0s'
   if (s % 86400 === 0) return `${s / 86400}d`
   if (s % 3600 === 0) return `${s / 3600}h`
   if (s % 60 === 0) return `${s / 60}m`

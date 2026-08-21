@@ -15,14 +15,21 @@ import PageHeader from '../components/PageHeader.vue'
 import BudgetBar from '../components/BudgetBar.vue'
 import Metric from '../components/Metric.vue'
 import Icon from '../components/Icon.vue'
-import { api, num, pct, period, datetime, utilisation, targetPath, targetApi, DEFAULT_APP } from '../lib/api.js'
+import {
+  api, num, pct, period, window as windowOf, datetime, utilisation, ceilingOf,
+  graphPath, graphApi, DEFAULT_APP,
+} from '../lib/api.js'
 import { fetchRollups, perMinute, budgetSeries } from '../lib/rollups.js'
 import { usePoll } from '../lib/poll.js'
 
-const props = defineProps({ app: String, name: String, budget: String })
+const props = defineProps({ app: String, name: String, node: String, budget: String })
 const application = computed(() => props.app || DEFAULT_APP)
 
+/* The roll-up table keys a node as `{graph}.{node}`, which is what a target
+   name was — so ninety days of history survive the rewrite under the same
+   key. */
 const target = ref(null)
+const rollupKey = computed(() => `${props.name}.${props.node}`)
 const rows = ref(undefined) // undefined = not asked yet, null = nothing to read
 const error = ref('')
 
@@ -36,8 +43,8 @@ const range = ref(RANGES[1])
 async function load() {
   try {
     const [d, r] = await Promise.all([
-      api.get(targetApi(application.value, props.name)),
-      fetchRollups(application.value, props.name, range.value.minutes),
+      api.get(graphApi(application.value, props.name)),
+      fetchRollups(application.value, rollupKey.value, range.value.minutes),
     ])
     target.value = d
     rows.value = r === null ? null : perMinute(r)
@@ -49,9 +56,10 @@ async function load() {
 // Slower than the gauges: the series is one point per minute, and it does not
 // change between two four-second polls.
 usePoll(load, 15000)
-watch([() => props.app, () => props.name, () => props.budget, range], load)
+watch([() => props.app, () => props.name, () => props.node, () => props.budget, range], load)
 
-const spec = computed(() => (target.value?.budgets ?? []).find((b) => b.id === props.budget) ?? null)
+const node = computed(() => (target.value?.nodes ?? []).find((n) => n.node === props.node) ?? null)
+const spec = computed(() => (node.value?.budgets ?? []).find((b) => b.id === props.budget) ?? null)
 
 const points = computed(() => (spec.value ? budgetSeries(rows.value, spec.value) ?? [] : []))
 const peak = computed(() => points.value.reduce((a, w) => Math.max(a, w.utilisation ?? 0), 0))
@@ -80,7 +88,7 @@ const drift = computed(() => {
 
 // A window shorter than a minute cannot be resolved by a per-minute roll-up,
 // and saying so is cheaper than an operator discovering it from a flat line.
-const smoothed = computed(() => (spec.value?.periodSeconds ?? 60) < 60)
+const smoothed = computed(() => (spec.value?.windowSubSeconds ?? 60) < 60)
 
 /* ------------------------------------------------------------ geometry */
 
@@ -162,11 +170,11 @@ const tone = computed(() => (peak.value > 1 ? 'text-bad' : peak.value >= 0.85 ? 
       <PageHeader
         :title="budget" mono
         :sub="spec
-          ? `${num(spec.cap)} per ${period(spec.periodSeconds)}, ${spec.alignment}, held in the ${spec.store}.`
-          : 'This budget is no longer declared on the target.'"
+          ? `${num(spec.count)} per ${windowOf(spec.timeMs)}, enforced as ${num(spec.countSub)} per ${period(spec.windowSubSeconds)}.`
+          : 'This budget is no longer declared on the node.'"
         :crumbs="[
-          { to: '/targets', label: 'Targets' },
-          { to: targetPath(application, name), label: `${application}/${name}` },
+          { to: '/graphs', label: 'Graphs' },
+          { to: graphPath(application, name), label: `${application}/${name}` },
         ]"
       >
         <template #actions>
@@ -193,7 +201,8 @@ const tone = computed(() => (peak.value > 1 ? 'text-bad' : peak.value >= 0.85 ? 
             {{ spec.confidence }} cap
           </span>
         </div>
-        <BudgetBar :used="spec.used" :cap="spec.cap" :assumed="spec.confidence === 'assumed'" :height="8" />
+        <BudgetBar :used="spec.value ?? 0" :cap="ceilingOf(spec)"
+                   :assumed="spec.confidence === 'assumed'" :height="8" />
       </section>
 
       <!-- --------------------------------------------------- history -->
