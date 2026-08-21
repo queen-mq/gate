@@ -469,9 +469,22 @@ async fn park_or_release(
         // consumes budget"), so this costs nothing and cannot dead-letter work
         // that is merely waiting.
         //
-        // Never a nack. An explicit `failed` ack is reserved for real poison,
-        // where engaging retry and the DLQ is the point — which is the line that
-        // gives Gate a working DLQ back.
+        // What it DOES cost is time, and more than the lease. An unsettled claim
+        // is re-offered at exactly its lease when the poller is not parked —
+        // measured at 10.3s for a 10s lease and 30.0s for a 30s one — but under
+        // this consumer's own settings, with its workers parked on a long poll,
+        // the same partition was observed taking about a MINUTE to come back
+        // while those workers polled it five times a second and the group's
+        // depth said it was owed. That is a broker behaviour this code cannot
+        // change; what it can do is take this path only when the wait is long
+        // enough for a minute not to matter, which is what `park_threshold`
+        // decides. Raise `GATE_PARK_THRESHOLD_MS` if a node's sub-window sits
+        // just above it and the stalls show.
+        //
+        // Never a nack. A nack IS re-offered at once — measured at 4ms — and it
+        // is still not available here: an explicit `failed` ack charges the
+        // retry budget, so pacing with one would dead-letter work that is
+        // merely waiting. That is the line that gives Gate a working DLQ back.
         st.counters.released.fetch_add(1, Ordering::Relaxed);
         if *parks >= k.max_parks {
             tracing::warn!(

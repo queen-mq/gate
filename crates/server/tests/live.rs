@@ -207,6 +207,16 @@ fn logs() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
+        // A shorter parked-poll window, unless the caller asked for one.
+        //
+        // Nothing here tests the poll window, and the supervisor waits
+        // `poll_timeout + 2s` for a stage to stop — so at the thirty-second
+        // default every teardown in this file costs thirty seconds and the suite
+        // takes twenty minutes to say what it could say in six. Set the knob
+        // yourself to exercise the real one.
+        if std::env::var("GATE_POLL_TIMEOUT_SECONDS").is_err() {
+            std::env::set_var("GATE_POLL_TIMEOUT_SECONDS", "3");
+        }
         let _ = tracing_subscriber::fmt()
             .with_env_filter(
                 tracing_subscriber::EnvFilter::try_from_default_env()
@@ -1005,8 +1015,17 @@ async fn a_failed_transaction_after_a_successful_charge_refunds() {
     );
 
     // And once the broker recovers, the work still goes out.
+    //
+    // A generous deadline, and the reason is measured. An unsettled claim comes
+    // back at exactly its lease when the poller is not parked — 10.3s for a 10s
+    // lease, 30.0s for a 30s one. Under the relay's own settings (sixteen
+    // workers parked on a long poll) the same partition was observed taking
+    // about a MINUTE to be offered again, while those workers polled it five
+    // times a second and the group's own depth said four were owed. So the
+    // assertion is that the work is not lost; the deadline is a liveness bound
+    // around a broker behaviour this code cannot change.
     faulty.allow();
-    let got = h.drain(&out, 4, Duration::from_secs(40)).await;
+    let got = h.drain(&out, 4, Duration::from_secs(150)).await;
     assert_eq!(got.len(), 4, "the batch was lost rather than redelivered");
 
     h.cleanup("g").await;
@@ -1044,13 +1063,20 @@ async fn a_kv_route_that_refuses_loses_nothing() {
         assert_eq!(status, 200);
     }
     tokio::time::sleep(Duration::from_secs(4)).await;
-    assert!(
-        h.drain_for(&out, Duration::from_secs(2)).await.is_empty(),
-        "nothing may be admitted while the limiter cannot be consulted"
+    // The stage's own counter, not a drain window: a machine busy with a build
+    // can make a two-second drain prove nothing, and "forwarded" is exact.
+    let (_, view) = h.get_graph("g").await;
+    assert_eq!(
+        view["stages"][0]["counters"]["forwarded"],
+        json!(0),
+        "nothing may be admitted while the limiter cannot be consulted: {view}"
     );
 
+    // Generous, for the reason `a_failed_transaction_after_a_successful_charge_refunds`
+    // spells out: an unsettled claim is re-offered at its lease when the poller
+    // is not parked, and about a minute later when it is.
     faulty.allow();
-    let got = h.drain(&out, 5, Duration::from_secs(40)).await;
+    let got = h.drain(&out, 5, Duration::from_secs(150)).await;
     assert_eq!(got.len(), 5, "the work must survive the outage");
 
     h.cleanup("g").await;
