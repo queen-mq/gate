@@ -376,27 +376,37 @@ pub async fn view(st: &Shared, rt: &Arc<GraphRuntime>) -> Value {
         }));
     }
 
-    let stages: Vec<Value> = rt
-        .stages
-        .iter()
-        .map(|s| {
-            let last = s.last_refusal.read().clone();
-            json!({
-                "path": s.stage.path,
-                "node": s.stage.node,
-                "hop": s.stage.hop,
-                "share": s.stage.share,
-                "source": s.stage.source,
-                "group": s.stage.group,
-                "batch": s.stage.batch,
-                "concurrency": s.stage.concurrency,
-                "destinations": s.stage.destinations.iter()
-                    .map(|d| d.queue.clone()).collect::<Vec<_>>(),
-                "counters": s.counters.view(),
-                "lastRefusal": last.map(|(id, at)| json!({ "budget": id, "at": at })),
-            })
-        })
-        .collect();
+    // Per-stage `lag`: §13.10's successor to v1's `edges[].lag`, and one
+    // group-scoped depth read per stage. The stage's OWN group, never the
+    // queue: a queue-level number is the worst cursor across every reader, so
+    // on a shared interior queue it would report another path's backlog as this
+    // one's. A broker that will not answer gives `null` rather than zero — the
+    // relay needs the truth or nothing, and so does a console.
+    let mut stages: Vec<Value> = Vec::with_capacity(rt.stages.len());
+    for s in &rt.stages {
+        let last = s.last_refusal.read().clone();
+        let lag: u64 = st
+            .depths
+            .pending_of_group(&st.queen, &s.stage.source, &s.stage.group)
+            .await
+            .values()
+            .sum();
+        stages.push(json!({
+            "path": s.stage.path,
+            "node": s.stage.node,
+            "hop": s.stage.hop,
+            "share": s.stage.share,
+            "source": s.stage.source,
+            "group": s.stage.group,
+            "batch": s.stage.batch,
+            "concurrency": s.stage.concurrency,
+            "lag": lag,
+            "destinations": s.stage.destinations.iter()
+                .map(|d| d.queue.clone()).collect::<Vec<_>>(),
+            "counters": s.counters.view(),
+            "lastRefusal": last.map(|(id, at)| json!({ "budget": id, "at": at })),
+        }));
+    }
 
     json!({
         "application": rt.doc.application,

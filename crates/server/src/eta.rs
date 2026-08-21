@@ -140,6 +140,10 @@ pub async fn view(app: &Shared, rt: &Arc<GraphRuntime>, node: &str, path: &str) 
     // ---- weight. Items are what a queue holds; cost units are what a budget
     // spends.
     let measured = measured_cost(app, rt, node, path, now).await;
+    // A breaker holding the node is the one caveat that explains the whole
+    // answer rather than qualifying it: the window is spent on purpose and the
+    // long `etaSeconds` below is a vendor's `Retry-After`, not a backlog.
+    let held = crate::breaker::held(&app.budgets, np).await;
     let cost_per_item = measured.unwrap_or(np.cost.default_value() as f64);
     let want = waiting_for_budget as f64 * cost_per_item;
 
@@ -198,7 +202,7 @@ pub async fn view(app: &Shared, rt: &Arc<GraphRuntime>, node: &str, path: &str) 
         "windowResetsAt": resets_at,
         "waitingForBudget": waiting_for_budget,
         "waitingForWorkers": waiting_for_workers,
-        "assumes": assumes(rt, np, stage, measured, cost_per_item, worker_group_known),
+        "assumes": assumes(rt, np, stage, measured, cost_per_item, worker_group_known, held.as_ref()),
     }))
 }
 
@@ -232,6 +236,7 @@ fn assumes(
     measured: Option<f64>,
     cost_per_item: f64,
     worker_group_known: bool,
+    held: Option<&crate::breaker::Record>,
 ) -> String {
     let mut parts = vec![
         "no earlier than: the backlog that is there right now, at the refill schedule the spec \
@@ -271,6 +276,23 @@ fn assumes(
             "budget {} is one counter per key and this number does not resolve which key your item \
              will meet",
             scoped.join(", ")
+        ));
+    }
+
+    // §9 closes the caveat list with this one, and it is the one that changes
+    // how the number should be read: a node whose window a breaker has just
+    // spent answers a long `etaSeconds` because a vendor said 429, not because
+    // anything is queued in front of the caller.
+    if let Some(r) = held {
+        parts.push(format!(
+            "a breaker is holding this node until {} ({}s from {}{}), so the window is spent on              purpose and this number is that deadline rather than a backlog",
+            r.at + r.retry_after_seconds * 1000,
+            r.retry_after_seconds,
+            r.at,
+            match &r.by {
+                Some(by) => format!(", reported by {by}"),
+                None => String::new(),
+            }
         ));
     }
 

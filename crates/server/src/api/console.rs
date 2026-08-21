@@ -166,7 +166,7 @@ pub async fn list_targets(State(app): State<Shared>) -> ApiResult {
 
         // The worst counter across every unscoped budget of every node: a graph
         // is as close to refusing as the counter closest to its ceiling.
-        let mut worst = (String::new(), 0.0f64, 0i64, 0i64, false);
+        let mut worst = (String::new(), 0.0f64, 0i64, 0i64, false, 0i64);
         for np in g.plan.nodes.values() {
             let keys: Vec<String> = np.unscoped().map(|b| b.key.clone()).collect();
             let states = app.budgets.read(&keys).await.unwrap_or_default();
@@ -193,7 +193,11 @@ pub async fn list_targets(State(app): State<Shared>) -> ApiResult {
                             })
                         })
                         .unwrap_or(false);
-                    worst = (b.id.clone(), u, v, ceiling, assumed);
+                    // The period is the SUB-window, because that is what the
+                    // ceiling beside it is: `worst_cap` is `count_sub * share`,
+                    // so pairing it with the declared `timeMs` would report a
+                    // rate ten times too low for a budget with ten sub-windows.
+                    worst = (b.id.clone(), u, v, ceiling, assumed, b.window_sub_seconds);
                 }
             }
         }
@@ -219,7 +223,7 @@ pub async fn list_targets(State(app): State<Shared>) -> ApiResult {
             "worst_budget_id": worst.0,
             "worst_used": worst.2,
             "worst_cap": worst.3,
-            "worst_period_seconds": 0,
+            "worst_period_seconds": worst.5,
             // Computed, where v1 hardcoded `false`.
             "worst_assumed": worst.4,
             "admitted": adm,
