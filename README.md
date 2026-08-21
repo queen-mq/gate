@@ -362,11 +362,17 @@ POST /v1/apps/{app}/graphs/{graph}/nodes/{node}/push
 ```
 
 `partition` is **yours**, and it is passed through unchanged at every hop: it is what
-keeps a connection's items in order end to end. `txn` is the coalescing lever — two
-pushes with the same one inside the dedup window collapse to one, so lag compresses
-the backlog instead of growing it. The door refuses a cost above `cost.max` (422), a
-missing `scopeBy` value (422), and answers **429 with a Retry-After** when the node is
-already at its ceiling.
+keeps a connection's items in order end to end. A push that names none is spread
+across the ingress queue's declared width, because nothing about it has an order to
+keep. `txn` is the coalescing lever — two pushes with the same one inside the dedup
+window collapse to one, so lag compresses the backlog instead of growing it. The door
+refuses a cost above `cost.max` (422), a missing `scopeBy` value (422), and answers
+**429 with a Retry-After** when the node is already at its ceiling.
+
+v1's body put the cost at the top level (`"cost": 3`) rather than in the payload. It
+is still read there, and written to the node's own `cost.path` on the way through: the
+field decides what an item spends, and dropping it would charge every v1 caller's item
+the declared default instead of what they asked for.
 
 ### Consume
 
@@ -392,9 +398,25 @@ refusal path — no new code path, no flag for the hot loop to check, nothing to
 to clear — and every parked consumer's wait **is** your deadline. `DELETE` the same
 path lifts it early.
 
-Per-item bounded retry (the old `breach` rules) is **not** in this build: it hung off
-the Gate-mediated ack, which is gone. Re-push a throttled item to the ingress queue
-with your own idempotency key, or use the node-wide backoff above.
+### And the one item
+
+```http
+POST /v1/apps/{app}/graphs/{graph}/reenter
+{ "payload": { ... }, "txn": "the id it arrived with", "partition": "conn-42" }
+```
+
+The backoff above is the AGGREGATE half of what the old `breach` rules did; this is
+the per-item half. The item goes back to the ingress queue of the **first node of its
+own path** — the door it came in at — so it re-pays every budget on that path rather
+than skipping the ones upstream of where it failed. The attempt rides in the
+transaction id (`derive(txn, "r{n}")`), so reporting one item twice collapses on the
+broker's dedup instead of re-entering twice, and nothing here keeps a table of what
+has been retried. It is refused past the graph's `maxAttempts` (default 3), counted in
+`_gate.attempt`, which every hop carries forward.
+
+What did not survive is the TRIGGER. v1 watched the Gate-mediated ack and re-entered
+by itself; your consumers pop the egress queue with their own SDK now and Gate never
+sees the outcome, so re-entry is something you ask for.
 
 ### When
 
@@ -426,7 +448,7 @@ The endpoint shapes do not move. A v1 document is accepted, mapped, and answered
 | `edges[]` | `paths` |
 | `consume[]` | `egress`, keeping the queue name your workers already pop |
 | `pacing`, `admitted.partitionBy` | no-ops |
-| `breach[]` | **refused**, with a pointer to `/backoff` |
+| `breach[]` | `maxAttempts`, with a warning: the bound survives, the trigger moved to `POST .../reenter` |
 
 Terminal queue names are stable across the migration by construction. For a change
 that re-founds a counter or strands a queue, the documented procedure is unchanged:
