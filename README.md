@@ -6,24 +6,44 @@ An egress rate limiter built on [QueenMQ](https://queenmq.com). You declare what
 vendor lets you do; Gate decides what leaves and when, and holds the work that does
 not fit until it does.
 
-It is not a library. Callers speak HTTP and never learn there is a queue.
-
 A limit is rarely one number. A portal gives you a per-endpoint rate, a per-account
 rate, a per-listing rate, and a ceiling on the egress IP that counts all of them at
 once. The interesting question is not how to count, it is how those limits
 **compose**. That is what a graph is for, and most of this document is about it.
 
 <a href="assets/dashboard.png"><img src="assets/dashboard.png" width="600"
-  alt="The Gate console drawing a declared graph: three entry nodes (content, messages
-  and prices) relaying into one terminal called ip, each edge labelled with its
-  priority, and dashed retro edges running back from the terminal to the entries."></a>
-
-*The console drawing what is running: three traffic classes, each isolated in its own
-node, merging into the one node that holds the egress-IP ceiling, plus the dashed
-edges a throttled call takes back to the door it came in at.*
+  alt="The Gate console drawing a declared graph: three entry nodes relaying into one
+  terminal called ip."></a>
 
 ---
 
+## What it is made of
+
+Three queen primitives, used directly. There is nothing else in the data plane.
+
+| | |
+|---|---|
+| **The limiter** | `kv.incr(key, delta, { max, ttl })`. The call that would break the ceiling **does not apply and returns the current value**, so `applied` **is** the admission decision — one round trip, no CAS loop, no read-then-write race. The TTL is create-only, so the window rotates by itself. |
+| **The relay** | One queen transaction: `ack(the source messages) + push(the next stage's queues)`, atomic. One source partition per claim, and every push goes to the **same-named partition** on the destination. |
+| **The scheduler** | The broker's wildcard long-poll. It picks candidate partitions in randomised order under `FOR UPDATE SKIP LOCKED`, so N workers spread across partitions with no coordination — and an idle stage is a parked poll holding no database connection. |
+
+What runs is one consumer per hop of one path. No pinned runners, no depth probes,
+no rotation cursor, no meter loop, no state document.
+
+**Why it is shaped this way**, in three measurements:
+
+* **Prod, one hour.** The previous design made ~275,000 "is there work?" calls to
+  move messages **963** times — 285 polls per relay. Nothing was broken; that is
+  what a polling data plane costs while idle, and idle is most of the time.
+* **Bench, 32-core VM.** The old counter-funnel relay topped out at **2.8k items/s**
+  with tuple lock waits at 96–100%, because every admission was a write transaction
+  on one partition row. A `txnload` with **disjoint lanes** — the shape this design
+  adopts — did **23–34k items/s** on the same machine.
+* **`kv.incr` on one key does 33k/s**, and the budget is charged once per **batch**.
+  At batch 200 and 34k items/s the counter sees 170 incr/s. That is the sentence
+  that makes one shared key acceptable where one shared partition was not.
+
+---
 
 ## Run it locally
 
@@ -36,8 +56,8 @@ docker run -d --name queen --link queen-pg \
   -p 6632:6632 ghcr.io/queen-mq/queen:latest
 ```
 
-`QUEEN_KV_ENABLED` is not optional: every declared spec and every cross-target
-ceiling lives in `queen.kv`.
+`QUEEN_KV_ENABLED` is not optional: every declaration and **every counter** lives in
+`queen.kv`.
 
 Then Gate itself:
 
@@ -61,751 +81,432 @@ authentication: the assumption is that only your network can reach it.
 expose the first one.
 
 `GATE_DEV_EMAIL` is the local bypass: it skips sign-in and treats every request as
-that identity. Gate refuses to boot with it set on an `https` public URL. In a real
-deployment you set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`,
-`GOOGLE_ALLOWED_DOMAINS`, `GATE_SESSION_SECRET` and `GATE_PUBLIC_URL` instead. See
-[helm/gate/README.md](helm/gate/README.md).
+that identity. Gate refuses to boot with it set on an `https` public URL.
 
 Without `PG_HOST` Gate still limits exactly as well; it just cannot answer anything
-about yesterday, and with several replicas each would remember a different past. It
-creates schema `gate` and its tables itself at boot.
+about yesterday. It creates schema `gate` and its tables itself at boot.
 
 ---
 
 ## Concepts
 
-**Target** is one thing that limits you: a vendor, an API, an account. It owns queues,
-budgets and lanes, and its identity is the pair `application/name`.
+**Graph** is the only object. A node is a place a limit applies; a path is the
+sequence of nodes a message visits. A standalone target is a one-node graph, declared
+through the same `/v1/apps/{app}/targets/{name}` route it always was.
 
-**Application** is who owns the target. Applications never share a ceiling and never
-see each other's targets. Two teams calling the same vendor with their own credentials
-are two applications; two callers sharing one credential are two lanes of one target.
+**Application** is who owns the graph. Applications never share a ceiling and never
+see each other's queues. Identity is the pair `application/graph`, so two teams may
+both have something they call `airbnb`.
 
-**Budget** is a ceiling: `cap` per `periodSeconds`. All of a target's budgets must
-admit, so they compose without ordering. `alignment` has no default, because guessing
-wrong is a factor-of-two overshoot: `calendar` resets on the wall clock, `rolling`
-slides. `confidence` records whether the number is `documented`, `inferred` or
-`assumed`; an assumed cap is enforced at 70% of what it claims, and the console never
-draws it as if it were known.
+**Node** holds budgets. Its counter is one Postgres row per budget, in `queen.kv`.
 
-**Lane** is how the ceiling is divided. Each lane is its own queue and its own gate, so
-an urgent push does not queue behind a photo upload. `cap: ceiling` takes what the
-others leave; `share: 0.3` reserves a fixed slice; `ceiling-minus-measured` takes the
-residual and may only *shrink* when its neighbours are busy. Lanes **divide** a
-ceiling and never replicate it: two lanes both told "you may use the ceiling" spend
-it twice, which a load run demonstrated at 93/s against a declared 50/s.
+**Path** is a sequence of nodes, and it names the consumer groups. Two paths crossing
+one node is **pub-sub**: each path's group receives every message, which is intended
+and composes with fan-out.
 
-**Cost** exists because not every call is one call. `cost.field` names where the
-caller stamps the weight, `cost.max` is a validation gate: a cost above it is refused
-at declare time rather than blocking a lane forever at run time.
+**Budget** is `count` per `timeMs`, subdivided for smoothing. It is enforced as a
+kv counter with a create-only TTL.
 
-**Pacing**: `leaseSeconds` is both the pacing quantum and the failover window; a
-denial parks the lane for one lease at zero billing cost, because the work is never
-popped. `batch` must fit a lease's worth of budget or the batch becomes the limiter.
+**Ingress** is how work enters a node. It is either a queue Gate creates and owns, or
+**a queue your application already owns** — in which case your producers push with
+their normal SDK and Gate can be down without blocking your ingest.
 
-**Shared budget** is a ceiling that crosses targets (an egress IP, a shared account).
-No gate can see past its own partition, so these live in `queen.kv`: declare a budget
-with `store: kv` and the same `id` on every target that draws on it, inside one
-application. The key is what makes it shared. A shared budget cannot be scoped or
-selected on, because the pool keys on `(application, id)` alone, and a spec that tries
-is refused rather than silently flattened.
-
-**Graph** is targets as nodes of a declared DAG, which is the rest of this document.
-
-**Shard**: `shardBy` splits a node's queue into `shards` partitions, one gate and one
-state document each. It is how a per-key limit survives high cardinality.
+**Egress** is the queue your workers pop, with their own SDK. Gate does not mediate
+the pop, does not hand out leases and never sees the outcome.
 
 ---
 
 ## The shape of a limit
 
-Everything about the graph follows from one property of the engine, so it is worth
-stating before the syntax.
-
-A gate runs as a streaming operator pinned to one partition of one queue. The broker's
-exclusive partition lease makes it the **single writer** of that partition's counters,
-which is why nested windows can be evaluated in memory, with no distributed transaction
-anywhere, and why the answer is exact. Everything else is a consequence of
-what that single writer can and cannot see.
-
-**Budgets in one node are exact, and share a queue.** Every budget a node declares is
-evaluated against the same instant and charged in a second pass only if all of them
-admit. Nothing can slip between two of them. The price is the shared queue: a denial
-stops the batch, and everything behind that item waits a lease, whatever it was.
-
-**An edge between two nodes is isolated, and smeared.** Give the second limit its own
-node and its own queue and a denial there parks nothing upstream: each class waits in
-its own line. The price is that the two checks no longer happen at the same instant:
-the item was admitted upstream at T and reaches the downstream gate at T + queueing,
-so the upstream certificate has aged. Whichever limit is enforced **last** is the
-exact one; the ones before it are approximations, and they get worse the deeper the
-downstream queue is.
-
-**Exact *and* isolated at once is not expressible.** Two counters in two partitions
-cannot be charged atomically without a distributed transaction, and this system does
-not have one. For each pair of limits you choose: same node, or a path.
-
-In practice that choice has an obvious answer. The severe limit goes in the
-**terminal** node, where it is enforced last and therefore exactly: the egress IP,
-where a breach blocks the whole fleet. The mild ones go **upstream**, where isolation
-is worth more than the last decimal: a per-endpoint rate whose breach is a 429 on one
-call.
-And paths stay short, because the smear composes at every hop and the latency floor is
-one lease per hop.
-
----
-
-## A graph, end to end
-
-This is the Airbnb graph the design was argued from: per-endpoint limits nested inside
-per-egress-IP limits, a per-listing weekly limit at a cardinality no single counter
-document could hold, and price pushes that must overtake a calendar flood.
-
-```
-   push                                                                  pop
-                 ┌──────────────┐
-  price.push ──► │    prices    │──── priority 0 ───┐
-                 │  no budget   │                   │
-                 │  cost ≤ 100  │                   │
-                 └──────────────┘                   ▼
-                 ┌──────────────┐            ┌──────────────┐
-  message.post ► │   messages   │─ prio 1 ──►│      ip      │──► consumer ──► vendor
-                 │  100 / 60s   │            │  1500 / 10s  │
-                 └──────────────┘            │ 15000 / 5m   │
-                 ┌──────────────┐            │  150k / 1h   │
-  photo.delete ► │    photos    │─ prio 1 ──►│ 3.375M / 1d  │
-                 │  ×64 shards  │            │  cost ≤ 100  │
-                 │ 100/listing  │            └──────────────┘
-                 │   / week     │                   │
-                 └──────────────┘                   │
-                        ▲                           │
-                        └─── 429: back to the entry it came in at,
-                             where it waits for budget again (×3)
-```
-
-Read it as three statements:
-
-* **the IP ceiling is declared once, in the terminal.** It counts every call the
-  egress makes, so it must be one counter. Declared in two nodes it would be two, and
-  the vendor would see the sum. Being last, it is also the exact one.
-* **the mild limits are upstream, one per class.** A message backlog cannot delay a
-  price, because they are different queues. `prices` declares no budget at all: it
-  exists to isolate a class and to carry a priority, and the limit it is checked
-  against is downstream.
-* **the severe path is short.** One hop. The certificate `messages` issues is at most
-  one queue old by the time `ip` re-checks it.
-
-### The life of one push
-
-```http
-POST /v1/apps/channel-manager/graphs/airbnb/nodes/prices/push
-{ "op": "price.push", "cost": 3, "txn": "listing-42:price",
-  "payload": { "connection": "conn-7", "entity": "listing-42" } }
-```
-
-1. Gate stamps the item (`op`, the weight under `cost.field`, and a `_gate` envelope
-   recording the graph, the entry and the attempt count) and appends it to
-   `gate.channel-manager.airbnb.prices.push`. The call returns as soon as the work is
-   durable. `txn` is the coalescing lever: two pushes with the same value inside the
-   dedup window collapse to one, so lag compresses the backlog instead of growing it.
-
-2. The `prices` gate wakes once per lease, claims a batch and asks the engine. This
-   node has no budget of its own, so everything is admitted and appended to
-   `…prices.admitted.p{n}`, partitioned by connection so one connection's work stays
-   ordered.
-
-3. The **relay** into `ip` moves it: one queen transaction carrying `ack(admitted
-   message)` and `push(ip.push)` together. Never two calls: ack-then-push loses the
-   item, push-then-ack duplicates it. The downstream push reuses the upstream message's
-   transaction id, so a redelivered relay is refused as a duplicate rather than
-   doubling the work. The runner that moves it is the one pinned to `p{n}` — the relay
-   runs one per partition of `prices.admitted`, forwarding at the same time, and this
-   item's connection belongs to exactly one of them.
-
-4. The `ip` gate evaluates all four IP budgets against one instant and charges them
-   only if every one admits, then appends the item to `…ip.admitted.p{n}`. If any
-   budget refuses, nothing is charged, the batch stops, the lease is kept, and the lane
-   tries again next lease. That silence is the pacing signal: there is no "you are
-   throttled" response for a caller to interpret or back off from.
-
-5. The consumer long-polls `GET …/graphs/airbnb/nodes/ip/next`, makes the vendor call
-   and acks. The ack advances the cursor and pushes the measurement event in **one
-   transaction**: split in two, an ack that lands without its event leaves the meter
-   under-reading, the derived cap rising, and the limiter believing it has budget it
-   does not.
-
-6. If the vendor refused with a 429, the caller acks `outcome: throttled` and the
-   breach rule sends the item back to `prices`, in that same transaction, where it
-   queues for budget like anything else. The pacing **is** the backoff.
-
----
-
-## What a graph is made of
-
-### Nodes
-
-A node is a target named `{graph}.{node}`, and it behaves exactly like one: the same
-queues, the same gate runners, the same lease, the same admission engine. Nothing in
-the data plane knows what a graph is.
-
-What a node adds is a role. `entry: true` means callers may push to it; being listed
-in `consume` means callers may pop it. Everything else is interior and belongs to the
-relays.
-
-A node with no budgets is legal **only** if it has an out-edge: that is a class node,
-checked downstream. One with no budget and nowhere to send its work would be a queue
-with extra steps.
-
-### Edges
-
-An edge is a relay: a task that moves work from one node's admitted queue to the next
-node's push queue, under its own consumer group
-(`gate.edge.{app}.{graph}.{from}.{to}`).
-
-**One transaction per batch.** `{ack, push}` commit together or not at all, and the
-transaction carries the messages' leases as a precondition, so a lease that expired
-while the relay was working rolls the whole thing back instead of forwarding work
-somebody else has already re-claimed.
-
-**One relay per destination, not per edge.** Priority is only real where the streams
-meet: two independent relays into one queue would each forward as fast as they could,
-and the destination's FIFO would then order by arrival, which is exactly what a
-priority is meant to override. So the tasks feeding a node are one relay, draining its
-upstreams in strict `priority` order: a leg is drained until it runs dry or the window
-closes, before the next one is looked at.
-
-**One runner per source partition, inside a leg.** One relay per destination is not one
-task: a leg is drained by one runner per partition of its source's admitted queue,
-several at a time, each popping only its own partition. It is the argument the admission
-gates already make — the partition is what makes a claimer the only claimer, so
-parallelism is expressed as more partitions rather than as more runners on one. A
-connection's items live in a single source partition, so a single runner holds them and
-per-connection ordering survives untouched. The count is derived and has no knob: it is
-the source's `admitted.partitions`, one each, and a source with one partition is warned
-about (`relay-parallelism`) rather than silently slow.
-
-**A cycle polls the partitions that hold something, sixteen at a time.** Sixteen,
-because past a handful the extra concurrency only queues on the destination's row
-lock. Only the ones holding something, because the cycle starts by asking the broker
-— one watermark read per queue — which partitions this relay's group still owes work
-in. That is not only economy: the window can be smaller than the ring (a node at 5/s
-allows ten items against sixty-four partitions), and a runner that reaches an
-exhausted window never polls at all, so a blind sweep reached a waiting partition
-about once in sixty cycles. A queue the broker will not answer for is polled anyway —
-silence is not emptiness.
-
-Measured on one laptop against a 1.0.5 broker, draining the same 300,000-item backlog
-with nothing else running: 2,064 items/s for the loop this replaced, 2,269 for a
-single-partition source (the control — one partition is still one runner), 2,516 for
-sixteen, and no further gain past four. That is 1.25x on the mean and 1.7x on a fresh
-broker's first ten seconds — the same sweep against 1.0.4, whose transaction wire
-re-scanned a partition's ack history once per ack group, put it at 2.8x. Most of what
-the old shape cost was that scan; what is left is a relay that no longer serialises
-against itself and runs at the broker's ceiling for the shape it has.
-
-Priority stays across legs and parallelism stays inside one, which is the same rule
-stated twice: two legs draining at once would order the merge by arrival, so the runners
-of a leg all finish before the next leg's start. A leg hands the window on only when it
-is **dry**, and dry means an empty read — a pop that errored is unknown, not empty, and
-a leg that treats unknown as empty gives away a window it was owed the moment the broker
-gets slow. The hold is bounded: a leg that has not drained for several cycles is broken
-rather than busy, and the window goes on down the legs with a line in the log.
-
-**A relay transaction is one source partition wide.** A queen transaction takes one row
-lock per partition it touches, so a batch popped across sixteen partitions and acked in
-one transaction serialises against every other transaction on that queue — measured at
-33 transactions a second with the machine 95% idle, against 603 for the same workers on
-disjoint partitions. The pin gives narrowness on the ack side for free, and the
-downstream pushes are grouped by destination partition with one transaction each: a
-batch that fans out becomes several narrow transactions, never one wide one.
-
-**Where the ceiling is now.** Not the relay: the destination's push queue is one
-partition per lane, because that partition *is* the node's counter and its gate runner,
-so every runner's transaction queues on that one row lock. Measured on one machine
-against 1.0.5: sixteen relay-shaped workers move 12,346 items/s into sixteen destination
-partitions and 2,953/s into one, with the transaction's own p50 going from 100ms to
-1,017ms. Gate's relay measures 2,516-2,579/s in that second shape — 85% of what a loader
-with no other job gets — because that is the shape a destination node has. Raising it
-means more destination nodes, not more runners.
-
-**A window keeps the bottleneck shallow.** The relay forwards only while the
-destination's push queue holds fewer than `2 × rate × leaseSeconds` items, where the
-rate is that node's most generous unscoped budget. Two lease-windows so the gate never
-runs dry; no more, because a deep bottleneck queue is a priority nobody can act on:
-a price push cannot overtake what has already been forwarded.
-
-**Fan-out is refused.** Each edge is its own consumer group, and a consumer group
-receives every message, so two out-edges from one node would copy the stream rather
-than split it, and one push would become one vendor call per branch.
-
-### Entries and terminals
-
-Pushing into an interior node, or popping one, is a `409`. This is not tidiness:
-
-* an interior node's push queue is fed by its in-edges. A caller pushing there injects
-  work that has paid none of the upstream budgets, which is the whole point of the
-  path it skipped.
-* an interior node's admitted queue is a relay's source. A caller popping it takes
-  work the graph is routing: the item is executed by that caller *and* forwarded to
-  the node that was supposed to pace it.
-
-Node targets are reachable by name (`airbnb.ip` is a target), and the target routes
-refuse to serve them for the same reason: the entry and terminal rules live on the
-graph routes, and going round them is how an item gets executed twice.
-
-### Retro edges
-
-A vendor throttle is the one event that proves the numbers are wrong, and retrying it
-blind is how a rate limiter becomes a rate amplifier.
-
-A `breach` rule turns an ack into a re-entry. When the ack's `outcome`/`status`
-matches, Gate pushes the item back to the entry it came in at, inside the ack's own
-transaction, using the payloads the lease already carries, so it costs no round trip
-and no state. The item then waits for budget like anything else.
-
-* it re-enters at **`origin-entry`**, the door stamped on it at its first push. That
-  makes it re-pay every budget on its path, which is correct rather than harsh: the
-  vendor counted the call that failed, so the retry is a new call and owes the whole
-  path.
-* `maxAttempts` is not optional. Past it the item is settled and the breach recorded.
-  A retro edge without a bound is a livelock with a vendor's rate limit as its only
-  brake.
-* the re-entry's transaction id is `{txn}:r{attempt}`, so a replayed ack cannot make
-  two of them.
-
-### Shards
-
-`shardBy: entity, shards: 64` splits a node's push queue into 64 partitions, each with
-its own gate runner, its own partition lease and its own state document. It exists
-because that document is re-read in full on every cycle: 200,000 listings in one
-document is 200,000 counters re-read every cycle, and 3,125 per document is not.
-
-The single-writer argument survives because a key hashes to exactly one shard, never
-two. Which is also why **every budget in a sharded node must carry the shard dimension
-in its `scope`**: an unscoped budget would get one counter per shard, and its cap would
-be enforced 64 times over.
-
-A sharded node takes its work from a push, not from an edge. A relay cannot choose a
-shard for an item that does not carry the dimension, and choosing one anyway would put
-one key in two counters.
-
----
-
-## What a declare refuses
-
-Every rule below converts a silent runtime failure into a rejected `PUT`. None of them
-is a style check.
-
-| Rule | What it prevents |
-|---|---|
-| `acyclic` | an item traversing for ever, re-paying every budget on the way round |
-| `reachable`, `drains` | work that can never enter, or that enters and is never popped |
-| `cost-monotonic` | an item admitted upstream that the next node can never admit, parking that lane's head for ever with no DLQ to fall into |
-| `budget-once` | one ceiling declared in two nodes: two counters, and the vendor sees the sum |
-| `edge-fanout` | a broadcast dressed as a split: one push, one call per branch |
-| `edge-unique`, `edge-self` | two relays on one queue pair; a node relaying into itself |
-| `consume-terminal` | a caller popping a queue a relay is also draining |
-| `path-length` | more than three hops, where the smear and the per-hop lease floor stop being worth it |
-| `retry-entry`, `retry-cost` | a re-entry that skips upstream budgets, or that lands where it could never be admitted |
-| `breach-attempts`, `breach-when` | an unbounded retry loop; a rule that matches nothing |
-| `relay-lane` | a second lane on a relayed node: a relay has nobody to ask which lane, so the other lane's share is capacity nothing can reach |
-| `cost-field` | two nodes reading the weight under different names; the downstream one silently charges its default |
-| `shard-scope`, `shard-entry`, `shard-count` | a cap enforced once per shard; a shard a relay cannot choose; an unbounded number of runners |
-| `admitted-partitions` | a ring with no buckets, or one so wide the relay runners it buys outnumber anything the broker should be asked for |
-| `store-fits`, `max-keys` | a state document re-read at a size nobody sized it for |
-| `lane-shares`, `lane-floor`, `default-lane` | a ceiling divided into more than one ceiling |
-| `cost-fits`, `batch-fits` | an item no budget can admit; a batch smaller than a lease's worth of budget, which makes the batch the limiter |
-| `kv-scope`, `kv-match`, `kv-chunk` | a shared budget pretending to be per-key, per-op, or large enough to lease |
-| `provenance` | a cap claiming to be `documented` with no source and no date |
-
-Three things are warned about rather than refused, because they are trade-offs and not
-mistakes: `lease-beats-window` (a lease as long as the tightest window costs about a
-quarter of the ceiling), `kv-rolling` (a shared budget is a fixed window whatever it
-declares, so a rolling one accepts up to twice its cap at the boundary), and
-`relay-parallelism` (a node with an out-edge and one admitted partition is drained by one
-relay runner, which is the right answer only if that node needs a single global order).
-
-A change that re-founds a counter or a claim (a period, an alignment, a scope, a store,
-a re-shard, a rewiring, or the width of a node's admitted ring — a relay names the
-partitions it runs on, so a narrower ring leaves what is in the old ones unclaimed)
-needs `version` bumped, or the declare is a `409` naming what it would have re-founded.
-
----
-
-## The target API
-
-Everything below is on the internal port. `:app` and `:name` are the target's
-identity; the unscoped `/v1/targets/{name}` forms default the application.
-
-### Declare
-
-```http
-PUT /v1/apps/{app}/targets/{name}
-```
-
-```json
+```jsonc
 {
-  "application": "channel-manager",
-  "name": "airbnb",
-  "version": 1,
-  "budgets": [
-    { "id": "api", "cap": 3000, "periodSeconds": 60, "alignment": "calendar",
-      "confidence": "documented", "source": "portal docs", "asOf": "2026-08-18" }
-  ],
-  "lanes": [
-    { "name": "urgent", "cap": "ceiling", "concurrency": 8 },
-    { "name": "bulk", "cap": "ceiling-minus-measured", "concurrency": 16,
-      "floor": 0.5, "default": true }
-  ],
-  "cost": { "field": "httpCost", "default": 1, "max": 5 },
-  "pacing": { "leaseSeconds": 5, "batch": 250 },
-  "admitted": { "partitionBy": "connection", "partitions": 8 }
+  "application": "channel",
+  "graph": "airbnb",
+  "version": 3,
+
+  "nodes": {
+    "prices": {
+      "ingress": true,                              // a queue Gate owns
+      "cost": { "path": "payload.rooms", "default": 1, "max": 50 },
+      "budgets": [
+        { "id": "prices-1s", "count": 100, "timeMs": 1000,
+          "confidence": "documented", "source": "https://…", "asOf": "2026-08-01" }
+      ]
+    },
+    "messages": {
+      "ingress": { "queue": "channel.airbnb.messages.in", "http": false },  // yours
+      "cost": { "path": "payload.rooms", "default": 1, "max": 10 },
+      "budgets": [ { "id": "messages-1m", "count": 600, "timeMs": 60000,
+                     "subWindows": 60 } ]
+    },
+    "photos": {
+      "ingress": true,
+      "cost": { "path": "payload.rooms", "default": 1, "max": 5 },
+      "budgets": [
+        { "id": "photos-1m",   "count": 300, "timeMs": 60000, "subWindows": 60 },
+        { "id": "per-listing", "count": 100, "timeMs": 604800000, "subWindows": 1,
+          "scopeBy": "payload.listingId", "whenOp": ["photo.delete"] }
+      ]
+    },
+    "ip": {
+      "cost": { "path": "payload.rooms", "default": 1, "max": 50 },
+      "budgets": [
+        { "id": "ip-10s", "count": 1500, "timeMs": 10000, "subWindows": 10,
+          "sharedKey": "egress-ip" }
+      ],
+      "egress": { "queue": "channel.airbnb.out", "group": "channel-workers" }
+    },
+    "audit": {
+      "budgets": [ { "id": "audit-1s", "count": 2000, "timeMs": 1000 } ],
+      "egress": "channel.airbnb.audit"
+    }
+  },
+
+  "paths": [
+    { "name": "prices",   "priority": 0, "share": 1.0,  "nodes": ["prices",   "ip"] },
+    { "name": "messages", "priority": 1, "share": 0.75, "nodes": ["messages", "ip"] },
+    { "name": "photos",   "priority": 2, "share": 0.5,  "nodes": ["photos", ["ip","audit"]] }
+  ]
 }
 ```
 
-The whole document, every time. A `200` means validated, provisioned **and** stored: a
-store that will not take it answers `502` saying the target is running the new spec, is
-not durable, and will be put back by the next reconcile pass.
+Read it back:
 
-`PUT /v1/apps/{app}/targets` declares a whole SET and reaps what is missing, scoped to
-that application, so one team cannot delete another's targets. Graph nodes are exempt:
-they are owned by a graph document, and reaping one would tear down half a topology.
+* `prices` may drive the shared `ip` counter to its ceiling. `photos` refuses itself
+  at half of it. **The top half is a reserve only `prices` can reach**, held by the
+  same row lock that does the counting.
+* `ip-10s` is subdivided into ten one-second windows of 150, so a burst cannot take
+  the whole ten-second allowance in the first 200ms.
+* `per-listing` is 100 photo deletions per listing per week — 200,000 Postgres rows
+  with a seven-day TTL, and no Gate machinery at all.
+* `photos` fans out to `ip` **and** `audit`: one transaction, two pushes, two derived
+  transaction ids. The declare says so, loudly.
 
-`GET` and `DELETE` read and remove one target. A delete is about the stored
-declaration: it forgets that first, then stops the runners. So a spec whose provisioning
-keeps failing can still be removed, and a delete that cannot reach the store is refused
-rather than undone by the next reconcile.
-
-### Push
-
-```http
-POST /v1/apps/{app}/targets/{name}/lanes/{lane}/push
-{ "op": "calendar.push", "cost": 1, "txn": "listing-42:availability",
-  "payload": { "connection": "conn-7" } }
-```
-
-### Consume
-
-```http
-GET /v1/apps/{app}/targets/{name}/lanes/{lane}/next?batch=100&wait_ms=1000
-→ { "items": [...], "lease": [...], "target": "airbnb", "lane": "bulk" }
-```
-
-You get work only when the budget allows it. The answer names the `target` and `lane`
-to settle it as, which matters for a graph: you popped the node `messages` and the
-target is `airbnb.messages`.
-
-```http
-POST /v1/leases/ack
-{ "lease": [...], "up_to": 100, "calls": 100, "outcome": "ok",
-  "application": "channel-manager", "target": "airbnb", "lane": "bulk",
-  "op": "calendar.push" }
-```
-
-The ack is the feedback loop, not bookkeeping: `calls` is what the work really cost,
-and `outcome: "throttled"` is the vendor telling you the cap you enforce is higher than
-the real one. Settlement is by prefix (`up_to`), never an arbitrary subset. An ack that
-names a target Gate does not know still settles the work and says in `refused` what it
-could not do with it: no calls event, no breach rule.
-
-`POST /v1/leases/nack` returns work for redelivery and refunds it, because the vendor
-never saw the call; `POST /v1/leases/renew` extends a lease for slow work.
-
-### Watch
-
-```http
-GET /v1/apps/{app}/metrics
-```
-
-Per lane: what is waiting for budget, what is waiting for workers, the admitted rate
-and a drain ETA. Enough for another product to render limit status on its own
-frontend. The two backlogs are kept apart because they have different owners: one is
-Gate holding work back on purpose, the other is your consumers not keeping up.
-
-### When
-
-```http
-GET /v1/apps/{app}/targets/{name}/eta?lane=bulk
-GET /v1/apps/{app}/graphs/{graph}/nodes/{node}/eta
-
-→ { "state": "waiting-budget", "aheadCost": 250.0, "etaSeconds": 99,
-    "boundBy": "ip-per-minute", "windowResetsAt": 1787222700000,
-    "waitingForBudget": 250, "waitingForWorkers": 150,
-    "assumes": "no earlier than: the backlog that is there right now, …" }
-```
-
-One lane, one question: *how long until my work leaves, and what is holding it.*
-`?lane=` is optional and means the default lane.
-
-`state` says which backlog the answer is about, and the two halves are computed from
-different things on purpose.
-
-**`waiting-budget`** is paced by a schedule you DECLARED, so that is what the answer
-reads: `cap`, `periodSeconds`, `alignment`, and where the window currently stands. Not
-the measured rate — a lane whose window is spent is measuring zero per second, and zero
-per second answers "never" at exactly the moment somebody is asking. What is true is
-"nothing until :00, and 150/s from there", which the declaration knows and no
-measurement can see. `boundBy` names the budget that admits your backlog last and
-`windowResetsAt` is when its window next rotates.
-
-**`waiting-workers`** is the opposite: nothing declares how fast your own consumers
-drain what Gate already admitted, so there the measured rate is the only honest input.
-`boundBy` is `null` — no budget is between you and your answer — and `etaSeconds` is
-`null` where the workers have stopped, because that really does mean "we cannot say".
-
-It is a bound and not a promise, and `assumes` spells out which caveats apply to the
-target you asked about: a higher-priority leg can arrive in front of your work at a
-merge, a `store: kv` budget is spent by other targets you cannot see here, a breached
-call re-enters at its entry to be paced again, and a sharded target is answered against
-its worst shard. Nothing here touches a counter or a decision — it is all read-side.
-
----
-
-## The graph API
-
-A graph is declared whole: nodes, edges, terminals and breach rules are validated
-together and provisioned atomically, because half a graph accepts work at its entry and
-drops it at the hole.
-
-```http
-PUT /v1/apps/{app}/graphs/{name}
-```
+The smallest useful declaration is one node:
 
 ```json
 {
   "version": 1,
   "nodes": {
-    "prices":   { "entry": true, "budgets": [],
-                  "cost": { "field": "httpCost", "default": 1, "max": 100 } },
-    "messages": { "entry": true,
-                  "budgets": [ { "id": "msg-post", "cap": 100, "periodSeconds": 60,
-                                 "alignment": "rolling", "confidence": "documented",
-                                 "source": "portal docs", "asOf": "2026-05-19" } ],
-                  "cost": { "field": "httpCost", "default": 1, "max": 1 } },
-    "photos":   { "entry": true, "shardBy": "entity", "shards": 64,
-                  "budgets": [ { "id": "photo-del-weekly", "cap": 100,
-                                 "periodSeconds": 604800, "alignment": "rolling",
-                                 "scope": ["entity"], "maxKeys": 200000,
-                                 "confidence": "documented", "source": "portal docs",
-                                 "asOf": "2026-05-19" } ],
-                  "cost": { "field": "httpCost", "default": 1, "max": 1 } },
-    "ip":       { "budgets": [ { "id": "ip-10s", "cap": 1500, "periodSeconds": 10,
-                                 "alignment": "rolling", "confidence": "documented",
-                                 "source": "portal docs", "asOf": "2026-05-19" } ],
-                  "cost": { "field": "httpCost", "default": 1, "max": 100 },
-                  "admitted": { "partitionBy": "connection", "partitions": 64 } }
+    "providerx": {
+      "ingress": { "queue": "rrl.ingress.price-airbnb" },
+      "budgets": [ { "id": "providerx", "count": 100, "timeMs": 1000 } ],
+      "egress": "rrl.egress.price-airbnb"
+    }
   },
-  "edges":   [ { "from": "prices", "to": "ip", "priority": 0 },
-               { "from": "messages", "to": "ip", "priority": 1 },
-               { "from": "photos", "to": "ip", "priority": 1 } ],
-  "consume": [ "ip" ],
-  "breach":  [ { "when": { "status": 429 }, "retryTo": "origin-entry",
-                 "maxAttempts": 3 } ]
+  "paths": [ { "name": "main", "nodes": ["providerx"] } ]
 }
 ```
 
-```http
-POST /v1/apps/{app}/graphs/{graph}/nodes/{node}/push   # entry nodes only
-GET  /v1/apps/{app}/graphs/{graph}/nodes/{node}/next   # terminal nodes only
-GET  /v1/apps/{app}/graphs/{name}                      # the graph, live
-DELETE /v1/apps/{app}/graphs/{name}
+### Budgets
+
+`count` per `timeMs`, and nothing else. There is no alignment: **kv owns a fixed
+window and nothing else.**
+
+**Smoothing is subdivision.** A window longer than a second is enforced as `count/N`
+per `timeMs/N`, so a burst cannot take a ten-second allowance in the first 200ms.
+`subWindows` is the knob; it defaults to aiming at a one-second sub-window.
+
+**The boundary.** This is a fixed window whose start is the first admitted request
+after the previous one expired. A sliding observer can see up to **2 × count_sub**
+across one boundary — with `subWindows: 10` that is 2/10 of the declared count, not
+twice it. The declare response says the number for your budget.
+
+**A sub-second window cannot be expressed.** A kv TTL is whole seconds, so `timeMs`
+below 1000 is enforced as `count` per **second** — tighter than declared, never
+looser, but slower. The declare warns and names both numbers.
+
+`scopeBy` is one counter per distinct value of a payload path. `sharedKey` is one
+counter across every node and graph of the application that names it. `whenOp`
+charges only for a matching `payload.op`.
+
+### Cost
+
+```jsonc
+"cost": 1
+"cost": { "path": "payload.msgCount", "default": 1, "max": 100 }
 ```
 
-The declare answers with the resolved topology: which node is pushable, which is
-poppable, the queues each one owns, the window every relay is holding its destination
-to, and how many runners each relay leg is drained by.
+**Costs are integers**, because `kv.incr`'s delta is an `i64` on this wire. A
+fractional weight is expressed by counting tenths and multiplying the budget by ten.
+An item declaring more than `max` is refused at the door and dead-lettered if it
+arrives on a queue Gate does not own — an item that cannot fit a window can never be
+admitted, and it would otherwise park the head of its partition for ever without
+reaching a DLQ.
 
-### Acking a breach
+### Priority is capacity, not queue position
 
-`outcome` is one field for a whole lease, so a consumer that runs a batch and acks once
-has to say **which** items the vendor refused:
+A path's `share` is a **ceiling on the node's one counter**:
 
-```http
-POST /v1/leases/ack
-{ "lease": [...], "outcome": "throttled", "status": 429,
-  "breached": ["<message id>"], "target": "airbnb.ip", "lane": "default", … }
+```
+path P's incr at node N uses  max = round(count_sub(N) × share(P))
 ```
 
-Without `breached` the outcome is taken to be about every item the ack settles: right
-for a one-item ack, and forty-nine duplicate calls for a batch of fifty. The answer
-says what happened: `retried`, `exhausted`, `unroutable`, and `refused` when the graph
-declares nothing that could have been done. An impossible retry never fails the ack:
-the work has already been made, and refusing to settle it would have it made again.
+so the headroom above every lower ceiling is an exact, atomic reserve — with no
+scheduler, no barrier, no depth probe and no leg ordering anywhere in the codebase.
+The shares do not have to sum to 1 and normally will not; they overlap on purpose,
+and the total is still bounded because there is one counter.
+
+Where a node is crossed by exactly one path there is nothing to share, so that path
+gets the whole ceiling whatever it declared. The declare response echoes the
+resolved ceilings per node, per path.
+
+**What this gives up:** strict priority. A low-priority message already sitting in an
+interior queue is still ahead of a high-priority one in that partition. What it buys
+is that the reserve is always there — which is the property the feature was for, and
+which the previous design could not deliver: its lanes each held their own copy of
+the counter, and two lanes both told "you may use the ceiling" genuinely spent it
+twice (measured at 93/s against a declared 50/s).
+
+---
+
+## The life of one push
+
+```
+your producer  ──►  ingress queue        (your SDK, or Gate's HTTP front door)
+                        │
+              stage: wildcard long-poll, batch 200, one source partition
+                        │
+                    kv.incr(budget key, batch cost, {max: your share, ttl: sub-window})
+                        │
+             applied ───┴─── refused ──► admit the PREFIX that fits, or
+                │                        park (short wait) / release (long wait)
+                ▼
+        ONE transaction: ack(the batch) + push(next hop, same partition)
+                        │
+                        ▼
+                  egress queue           ──►  your workers, your SDK, your ack
+```
+
+**A denial charges nothing.** The whole batch is charged in one call; if any counter
+refuses, what applied is refunded and the prefix that fits is charged instead.
+Prefix, not subset: order inside a partition is the guarantee the whole design rests
+on.
+
+**Waiting is not failing.** When nothing fits, a short wait parks in-handler holding
+the lease and a long one returns without acking — and queen charges **no retry budget
+on lease expiry**, so paced work is never dead-lettered for waiting. An explicit
+failed ack is reserved for real poison, which is why Gate has a working DLQ again.
+
+---
+
+## What a declare refuses
+
+Every rule turns a silent runtime failure into a rejected `PUT`, and each names the
+number, the consequence and the fix. The rule names are API.
+
+**Shape** — `application`, `graph-name`, `node-name`, `path-name`, `nodes`, `paths`,
+`path-node`, `path-length`, `acyclic`, `path-entry`, `path-terminal`, `node-orphan`,
+`fanout-branch`, `fanout-terminal`.
+
+**Budgets** — `node-budget`, `node-unscoped-budget`, `budget-count`, `budget-window`,
+`budget-unique`, `subwindow-fits`, `subwindow-range`, `cost-fits`, `cost-max`,
+`cost-integer`, `cost-path`, `scope-path`, `shared-conflict`, `whenop-empty`,
+`provenance`.
+
+**Shares** — `share-range`, `share-top`, `share-order`, `share-rounds-out`.
+
+**Ownership** — `ingress-owner`.
+
+And the warnings, which are trades rather than mistakes: `window-sub-second`,
+`subwindow-rounding`, `window-boundary`, `fanout-multiplies`, `ingress-queue`,
+`ingress-retention`, `egress-owner`, `single-partition`.
+
+---
+
+## The API
+
+### Declare
+
+```http
+PUT /v1/apps/{app}/graphs/{name}
+PUT /v1/apps/{app}/targets/{name}      # sugar: a one-node graph
+PUT /v1/apps/{app}/targets             # the whole set, and reap what is missing
+GET|DELETE the same paths
+```
+
+The whole document, every time. A `200` means validated, provisioned **and** stored:
+a store that will not take it answers `502` saying the graph is running the new
+document, is not durable, and will be put back by the next reconcile pass.
+
+The response carries the compiled plan — every queue, every consumer group, every kv
+key, and the per-path ceiling on every budget — so you never have to reconstruct it.
+
+### Push
+
+Optional. Where a node names a queue **you** own, your producers push to it with
+their own SDK and this route is off by default.
+
+```http
+POST /v1/apps/{app}/graphs/{graph}/nodes/{node}/push
+{ "op": "calendar.push", "partition": "conn-7", "txn": "listing-42:availability",
+  "payload": { "rooms": 3 } }
+```
+
+`partition` is **yours**, and it is passed through unchanged at every hop: it is what
+keeps a connection's items in order end to end. `txn` is the coalescing lever — two
+pushes with the same one inside the dedup window collapse to one, so lag compresses
+the backlog instead of growing it. The door refuses a cost above `cost.max` (422), a
+missing `scopeBy` value (422), and answers **429 with a Retry-After** when the node is
+already at its ceiling.
+
+### Consume
+
+Your own SDK, against the egress queue:
+
+```js
+await queen.queue('channel.airbnb.out').group('channel-workers')
+  .consume(async (msg) => { /* … */ })
+```
+
+`GET .../next` and `POST /v1/leases/*` answer **410 Gone**, naming the queue.
+
+### Back off
+
+```http
+POST /v1/apps/{app}/graphs/{graph}/nodes/{node}/backoff
+{ "retryAfterSeconds": 30, "refundCost": 1 }
+```
+
+The vendor said 429. Gate **spends the node's window**: the counter is written to its
+ceiling with a TTL of your `Retry-After`, so every path stops through the ordinary
+refusal path — no new code path, no flag for the hot loop to check, nothing to forget
+to clear — and every parked consumer's wait **is** your deadline. `DELETE` the same
+path lifts it early.
+
+Per-item bounded retry (the old `breach` rules) is **not** in this build: it hung off
+the Gate-mediated ack, which is gone. Re-push a throttled item to the ingress queue
+with your own idempotency key, or use the node-wide backoff above.
+
+### When
+
+```http
+GET /v1/apps/{app}/graphs/{graph}/nodes/{node}/eta?path=prices
+```
+
+Two backlogs, kept apart because they have different owners:
+`waitingForBudget` is Gate holding work back on purpose, and `waitingForWorkers` is
+your own consumers not keeping up. The answer is a **bound**, never a promise, and
+`assumes` names every caveat that actually applies.
+
+---
+
+## Migrating from v1
+
+The endpoint shapes do not move. A v1 document is accepted, mapped, and answered
+**200 with warnings naming every field that was mapped or ignored**.
+
+| v1 | v2 |
+|---|---|
+| `cap` / `periodSeconds` | `count` / `timeMs` |
+| `alignment: rolling` | `subWindows`, which bounds the boundary exposure to 2 × count/N |
+| `alignment: calendar` | `subWindows: 1` — no longer wall-clock aligned |
+| `scope: [dim]` | `scopeBy: "payload.{dim}"` |
+| `maxKeys`, `shardBy`, `shards` | no-ops: cardinality is rows with a TTL |
+| `store: kv` | `sharedKey` |
+| `lanes[]` | one **path** each — but read the warning: lanes DIVIDED a ceiling and were addressed by the push URL, and two paths on one ingress node each receive **every** message |
+| `edges[]` | `paths` |
+| `consume[]` | `egress`, keeping the queue name your workers already pop |
+| `pacing`, `admitted.partitionBy` | no-ops |
+| `breach[]` | **refused**, with a pointer to `/backoff` |
+
+Terminal queue names are stable across the migration by construction. For a change
+that re-founds a counter or strands a queue, the documented procedure is unchanged:
+stop pushing, wait for `waitingForBudget` to reach zero on every node, `PUT` with a
+higher `version`, resume.
 
 ---
 
 ## Operating it
 
-**Replicas.** Every replica runs every gate, and the broker's partition lease decides
-which one is admitting on a given partition at a given moment. Two replicas do not
-enforce two ceilings.
+| knob | default | what it is |
+|---|---|---|
+| `QUEEN_URL` | `http://localhost:6632` | the broker |
+| `GATE_BIND` | `0.0.0.0:8788` | the internal API |
+| `GATE_PUBLIC_BIND` | — | the console, sign-in required |
+| `GATE_KV_NAMESPACE` | `gate` | where the counters and documents live |
+| `GATE_STAGE_BATCH` | 200 | the per-claim batch; also the divisor on the counter's traffic |
+| `GATE_STAGE_CONCURRENCY` | `max(4, source partitions)` | workers per stage |
+| `GATE_LEASE_SECONDS` | 30 | a **work** lease, renewed while a handler runs |
+| `GATE_POLL_TIMEOUT_SECONDS` | 30 | the parked long-poll window |
+| `GATE_PARK_THRESHOLD_MS` | 1500 | park below it, release above it |
+| `GATE_MAX_PARKS` | 3 | in-handler parks before releasing |
+| `GATE_RECONCILE_SECONDS` | 15 | how often a replica re-reads the store |
+| `PG_HOST` … | — | optional history |
 
-**Reconcile.** A declare lands on ONE replica. A background pass every 15 seconds
-(`GATE_RECONCILE_SECONDS`) diffs the store against what this replica is running and
-re-provisions the difference: restarting a changed target, starting one it has never
-seen, removing one the store no longer holds, repairing a graph whose node is not
-running. Without it the fleet enforces whichever spec each pod happened to receive,
-indefinitely, and the **looser** one decides, because the tighter pod simply admits
-less of the same traffic.
+**Two replicas are safe.** Declarations live in `queen.kv` and every replica
+reconciles against them on a timer; counters are one row each, so N replicas spend
+one budget.
 
-The store is the authority. A pass that cannot read it changes nothing, and a pass that
-reads it incompletely (a clamped page, a document a newer build wrote) may add and
-change but never remove.
+### Attestation
 
-**What is fleet-wide, and what is one replica's.** With `PG_HOST` set, every replica
-writes the minute it saw into `gate.rollups` and the row is a sum, so the flow chart,
-the roll-ups, the rates, the traces and the breaches are the fleet's from any pod. The
-queue depths come from the broker, so they always were. What stays local: the lifetime
-`admitted`/`denied` counters on a target page, the "last throttled at" stamp, and the
-per-relay counters on a graph page. Each is what one process did since it booted.
-Without `PG_HOST` the history surfaces are one replica's memory too: twelve hours of
-it, lost on restart.
+There is no certificate mechanism and there never was: the word was a metaphor for
+the freshness of an admission decision as it crossed an edge. What must be said out
+loud, because v2 **names** the egress queue in the declaration where v1 relied on its
+queues being undiscoverable:
 
-**What a failed declare leaves behind.** Provisioning is stop-then-start, so a failure
-half way is the dangerous moment. If the new spec cannot start, the old one is
-restarted and the caller is told which version is serving; if even that fails the
-target is *unregistered*, so a push is refused, which is recoverable, rather than
-accepted into a queue nobody drains. The next reconcile pass brings it back from the
-store.
+> **Write access to an interior or egress queue is admission bypass — the same trust
+> model as any queen queue. Gate paces what flows through it; it does not defend a
+> queue from a writer who already has the credentials.**
 
----
+The `_gate` stamp Gate puts on a routed payload is unsigned and unverified. It is
+trusted because Gate writes it server-side, and a producer pushing to a queue you own
+can write one — Gate overwrites it on the first hop.
 
-## The console
+### Observability
 
-`/graphs` draws what is running: the nodes laid out in the order work moves through
-them, each with its worst budget and its two backlogs, the edges labelled with their
-priority and lag, and the retro edges drawn dashed back to the entries. It is the same
-diagram this design was argued from, rendered from `/api/apps/{app}/graphs/{name}`.
+The hot path writes **nothing**: one KV batch and one transaction, and that is the
+whole budget. Per stage there are counters (`popped`, `admitted`, `deferred`,
+`parked`, `released`, `forwarded`, `commits`, `duplicates`, `foreign`,
+`deadlettered`), and `forwarded / commits` is the number that explains a stage's
+throughput.
 
-The rest answers an operator's question, "are we still in control?", rather than a
-delivery console's. A lane sitting at its cap and refusing work is the system
-succeeding, so it is not painted red. The one thing painted red is a vendor throttle:
-the only proof that the caps we enforce are looser than the real ones.
+Denials are kept in a bounded in-process ring. **Admissions are counted, never
+traced** — which is a real reduction against v1, where a trace row rode in the same
+transaction as the ack. There is no ack now, so there is no atomicity to inherit and
+no measured-versus-estimated cost to compare.
+
+Rollups and charts are **opt-in per graph**:
+
+```json
+"counters": { "windowSeconds": 60 }
+```
+
+Off by default, on purpose: observability is a thing you switch on, not a thing that
+runs whether or not anyone is looking.
 
 ---
 
 ## Build
 
 ```bash
-cd ui && npm ci && npm run build && cd ..
-cargo build --release
+cd ui && npm ci && npm run build && cd ..   # the console is compiled into the binary
+cargo build --release --workspace
 ```
-
-The console is compiled into the binary, so `ui/dist` must exist before the Rust build.
-`docker build` does both.
 
 ## Test
 
 ```bash
-cargo test
+cargo test --workspace                       # units; the live suite reports as ignored
+GATE_TEST_QUEEN_URL=http://127.0.0.1:6632 \
+  cargo test --workspace -- --include-ignored
 ```
 
-The live suite is `#[ignore]`d, so that run reports it as ignored rather than as
-passed: those tests need a broker, and a suite that silently verifies nothing is worse
-than one that says it did not run. With a queen to point at:
+The live suite is ignored by default and that is the honest setting: it used to skip
+and **pass** with no broker configured, which is green lines that verified nothing.
+CI sets `GATE_TEST_REQUIRE_LIVE=1`, which turns a missing broker into a failure.
 
 ```bash
-GATE_TEST_QUEEN_URL=http://127.0.0.1:6632 cargo test -- --include-ignored
+cargo run --release -p gate-e2e -- load 50 3000 20      # did the ceiling hold?
+cargo run --release -p gate-bench -- all                # what does Gate itself cost?
 ```
 
-CI runs exactly that against a real broker
-([.github/workflows/test.yml](.github/workflows/test.yml)), with
-`GATE_TEST_REQUIRE_LIVE=1` so a missing broker fails the build instead of skipping the
-only tests that cover the relay, the reconcile and the retro path.
+`gate-e2e` asks whether a graph declared at 50/s admits 50/s, and whether the
+0.5-share path refuses itself while the 1.0-share path is still getting through.
+`gate-bench` asks the opposite question with the limiter deliberately out of the way.
 
 ---
 
-## What it costs
+## Licence
 
-`cargo test` says the limiter is correct. It does not say what it costs, and
-[crates/e2e](crates/e2e) does not either: that one floods a declared target and asserts
-the ceiling held, which a limiter that admits nothing also passes. `crates/bench`
-measures the other half — requests per second and latency, per use case.
-
-```bash
-cargo run --release -p gate-bench -- all
-cargo run --release -p gate-bench -- push,drain     # or one scenario at a time
-```
-
-It needs a running Gate and nothing else; every scenario declares its own targets under
-a run-stamped name and removes them afterwards. `GATE_URL`, `GATE_APP`, `BENCH_SECONDS`,
-`BENCH_WARMUP`, `BENCH_CONC`, `BENCH_BACKLOG` and `BENCH_THREADS` are the knobs.
-
-**Gate has two latencies and quoting one for the other makes both meaningless.**
-
-* **API latency** is `push`, `next` and `ack` on the wire. A push is one queen append; an
-  ack is one queen transaction. It is flat whether the target is empty or a hundred
-  thousand items deep, because a push does not consult the gate.
-* **Admission latency** is push to poppable. That is not performance, it is the declared
-  ceiling doing its job: an item that arrives 900 deep behind 50/s waits eighteen
-  seconds because it was told to.
-
-A rate limiter reported as slow is usually the second number wearing the first one's
-name.
-
-### What it measures
-
-| Scenario | The question |
-|---|---|
-| `health` | the floor: axum and the kernel, no broker. Every other row minus this one is queen |
-| `push` | ingest — the only call an application waits on |
-| `drain` | `next` + `ack`, swept over batch and over consumer count against the partition count |
-| `cycle` | push to pop with the ceiling out of the way: the machinery's own latency |
-| `throttled` | a real ceiling and a backlog: the API stays flat while the wait becomes arithmetic |
-| `pacing` | the same ceiling under three lease lengths, against the `lease-beats-window` rule |
-| `lanes` | isolation, and its price: a trickle in `urgent` under a flood in `bulk` |
-| `graph` | the same work over two hops, which is what the three-hop cap is pricing |
-
-### Two drivers, on purpose
-
-A **closed loop** holds *n* requests in flight and starts the next when the last
-returns. It finds the saturation point, and its latency is a lie: when the server slows
-the driver sends less, the queue never builds, and the percentiles stay flat. So the
-throughput rows are closed-loop and the latency rows are **open loop** — sent on a
-schedule fixed in advance, with each request measured from when it was *due* rather than
-from when the driver got to it. A run whose driver falls behind its own schedule says so
-in the row.
-
-### What one machine did
-
-An Apple M4, ten cores, with the driver, Gate and the broker all on it and a Postgres
-behind the broker. Everything below is a **floor**: the driver was competing with the
-server it was measuring, and a real deployment puts them on different hardware.
-
-| | throughput | p50 | p99 |
-|---|---|---|---|
-| `GET /health` — no broker | 41 500/s at c=1, 105 000/s at c=32 | 0.0 ms | 0.6 ms |
-| `POST …/push` — one append | 380/s at c=1, 1 534/s at c=8, **6 735/s at c=128** | 2.5–9.0 ms | 6.8 ms at c=1 |
-| `push` at a fixed 3 367/s | held | 7.4 ms | 34.0 ms |
-| `next`+`ack`, batch 1 | 189 items/s | 19.6 ms | 43.7 ms |
-| `next`+`ack`, batch 25 | **3 012 items/s** | 32.0 ms | 60.6 ms |
-| push → pop, one hop, no ceiling | 500/s offered | **43 ms** | 279 ms |
-| push → pop, two hops | 500/s offered | **79 ms** | 443 ms |
-
-Three things worth taking from it.
-
-**Push is cheap and the ceiling does not make it expensive.** Pushing 1 500 items into a
-target limited to 50/s cost p50 2.8 ms and p99 10 ms — the same as pushing into an empty
-one, because the push is an append and never consults the gate. What grows is the wait,
-and the wait is `depth / ceiling` by construction.
-
-**Batching is the whole consumer story.** One `next` and one `ack` cost two round trips
-whether they carry one item or twenty-five, so moving from `batch=1` to `batch=25` took
-the same consumers from 189 to 3 012 items a second. Adding consumers past the admitted
-queue's partition count does not: 1 → 8 consumers roughly tripled it, 8 → 16 added
-almost nothing and doubled the latency.
-
-**Lanes isolate, measurably.** Under a 3 000-item flood in `bulk`, a trickle in `urgent`
-went push-to-pop at p50 16 ms and a worst case of 27 ms, while `bulk`'s own items were
-waiting p90 12.6 s — the same target, the same ceiling.
-
-**A freshly declared target takes a few seconds before its gate admits anything** — five
-to ten in these runs, spent creating queues and a consumer group and taking a partition
-lease. It is reported separately rather than averaged into the rate, because a declare
-followed immediately by a burst will see it.
-
-`pacing` is the one to run before choosing a `leaseSeconds`. Against a ten-second window
-the same 50/s ceiling held 95% at a one-second lease, 88% at three and 69% at six, which
-is the `lease-beats-window` rule of thumb — a lease no longer than a fifth of the
-tightest window — arrived at from the outside. The declare-time warning is the cheap
-version of that whole scenario: it fires before anything is running.
+Apache-2.0. See [LICENSE.md](LICENSE.md).

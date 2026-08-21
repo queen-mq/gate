@@ -156,70 +156,85 @@ struct Ctx {
 }
 
 // ------------------------------------------------------------------ the handler
+//
+// # One settle per claim, and why the whole handler is shaped around it
+//
+// Measured against the broker, not assumed: `queen.log_ack_v1` (and its
+// `log_ack_at_v1` twin) commit the cursor **positionally** and then
+//
+//     UPDATE queen.log_consumers SET committed = p_upto,
+//            worker_id = NULL, lease_expires_at = NULL, batch_end = NULL
+//
+// — **an ack RELEASES the claim.** Two consequences, and both are load-bearing:
+//
+// 1. A second transaction under the same lease answers `invalid or expired
+//    lease`. So the relay settles a claim in EXACTLY ONE transaction: the
+//    foreign acks, the poison nack and the admitted acks-and-pushes cannot be
+//    three calls, they have to be one.
+// 2. The commit is `committed = max(position acked)`. Acking a set with a gap
+//    in it therefore commits **past** the gap and silently drops whatever was in
+//    it. So what gets settled is a true PREFIX of the claimed batch in offset
+//    order, foreign messages included — never a subset.
+//
+// The bright side of (1): because the ack releases the lease, the tail of a
+// partly-admitted batch is immediately re-claimable. It does not wait out a
+// 30-second work lease; it comes back on the next poll, in order, and is charged
+// again when the window has rotated.
+
+/// What one claimed message is, decided once, in order.
+enum Kind {
+    /// Belongs to another path on a shared interior queue: settle it, never
+    /// charge it, never forward it.
+    Foreign,
+    /// Declares a cost above this node's ceiling. It can NEVER be admitted, and
+    /// left in place it parks the head of its partition for ever without ever
+    /// reaching a DLQ, because a lease that expires charges no retry budget.
+    Poison(String),
+    Work,
+}
 
 async fn handle(ctx: &Ctx, msgs: Vec<Message>) {
     let st = &ctx.st;
     st.counters
         .popped
         .fetch_add(msgs.len() as u64, Ordering::Relaxed);
-
-    // ---- §6.7: foreign-path messages on a shared interior queue.
-    //
-    // Three groups read `ip.in` in the flagship graph and each sees every
-    // message; only the one whose `_gate.path` matches forwards it. The others
-    // must SETTLE it or their cursor never advances — one bare ack per foreign
-    // message, batched, and never a charge.
-    let (mine, foreign): (Vec<Message>, Vec<Message>) = if st.stage.check_foreign {
-        msgs.into_iter()
-            .partition(|m| owns(&st.stage.path, &m.data))
-    } else {
-        (msgs, Vec::new())
-    };
-    if !foreign.is_empty() {
-        let n = foreign.len() as u64;
-        match ctx.queen.transaction().ack_all(&foreign).commit().await {
-            Ok(_) => {
-                st.counters.foreign.fetch_add(n, Ordering::Relaxed);
-            }
-            // Not settled: the lease lapses and they come back. Nothing was
-            // forwarded and nothing was charged, so a retry costs one lease.
-            Err(e) => tracing::warn!(
-                stage = %st.key(), error = %e,
-                "could not settle another path's messages; they will be redelivered"
-            ),
-        }
-    }
-    if mine.is_empty() {
+    if msgs.is_empty() {
         return;
     }
 
-    // ---- §3.2's `cost-fits`, at runtime.
-    //
-    // An item declaring a cost above the node's ceiling can NEVER be admitted.
-    // Left in place it parks the head of its partition for ever and never
-    // reaches a DLQ, because a lease that expires charges no retry budget. So it
-    // is nacked with the reason — in its own transaction, which touches only the
-    // source partition because it pushes nothing.
-    let mut work: Vec<Message> = Vec::with_capacity(mine.len());
-    let mut poison: Vec<(Message, String)> = Vec::new();
-    for m in mine {
-        match cost_of(&st.node.cost, &m.data) {
-            Ok(_) => work.push(m),
-            Err(e) => poison.push((m, format!("gate: node `{}`: {e}", st.node.name))),
-        }
-    }
-    if !poison.is_empty() {
-        let mut tx = ctx.queen.transaction();
-        for (m, reason) in &poison {
-            tx = tx.nack(m, reason.clone());
-        }
-        let n = poison.len() as u64;
-        match tx.commit().await {
+    let kinds: Vec<Kind> = msgs
+        .iter()
+        .map(|m| {
+            // §6.7. Three groups read `ip.in` in the flagship graph and each sees
+            // every message; only the one whose `_gate.path` matches forwards it.
+            // The others must SETTLE it or their cursor never advances.
+            if st.stage.check_foreign && !owns(&st.stage.path, &m.data) {
+                return Kind::Foreign;
+            }
+            match cost_of(&st.node.cost, &m.data) {
+                Ok(_) => Kind::Work,
+                Err(e) => Kind::Poison(format!("gate: node `{}`: {e}", st.node.name)),
+            }
+        })
+        .collect();
+
+    // A poison message at the HEAD is nacked on its own, because a nack and an
+    // ack in one transaction contradict each other: the nack releases the lease
+    // without moving the cursor, the ack moves it. One at a time, and the rest of
+    // the claim comes back.
+    if let Kind::Poison(reason) = &kinds[0] {
+        match ctx
+            .queen
+            .transaction()
+            .nack(&msgs[0], reason.clone())
+            .commit()
+            .await
+        {
             Ok(_) => {
-                st.counters.deadlettered.fetch_add(n, Ordering::Relaxed);
+                st.counters.deadlettered.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
-                    stage = %st.key(), count = n, reason = %poison[0].1,
-                    "dead-lettered items that can never be admitted"
+                    stage = %st.key(), reason = %reason,
+                    "dead-lettered an item that can never be admitted"
                 );
             }
             Err(e) => tracing::warn!(
@@ -227,26 +242,43 @@ async fn handle(ctx: &Ctx, msgs: Vec<Message>) {
                 "could not dead-letter an inadmissible item; it will be redelivered"
             ),
         }
-    }
-    if work.is_empty() {
         return;
     }
 
-    admit(ctx, work).await;
+    // Everything up to the first poison message. Whatever follows comes back on
+    // the next claim, with the poison at the head, where the arm above takes it.
+    let cut = kinds
+        .iter()
+        .position(|k| matches!(k, Kind::Poison(_)))
+        .unwrap_or(kinds.len());
+    admit(ctx, &msgs[..cut], &kinds[..cut]).await;
 }
 
-/// §6.1 – §6.5, in one loop. `work` is in offset order and all from one source
-/// partition.
-async fn admit(ctx: &Ctx, work: Vec<Message>) {
+/// §6.1 – §6.5. `window` is in offset order and all from one source partition.
+async fn admit(ctx: &Ctx, window: &[Message], kinds: &[Kind]) {
     let st = &ctx.st;
     let k = knobs();
+
+    let work: Vec<Message> = window
+        .iter()
+        .zip(kinds)
+        .filter(|(_, k)| matches!(k, Kind::Work))
+        .map(|(m, _)| m.clone())
+        .collect();
+
+    // Nothing of ours in this claim: settle the whole thing and move on.
+    if work.is_empty() {
+        settle(ctx, window, kinds, 0).await;
+        return;
+    }
+
     let grouped = group(st, &work);
 
     // A batch that touches no counter at all — every budget of this node has a
     // `whenOp` that takes none of these ops. Nothing to ask, so nothing to wait
     // for.
     if grouped.keys.is_empty() {
-        commit(ctx, &work, total_cost(st, &work)).await;
+        settle(ctx, window, kinds, work.len()).await;
         return;
     }
 
@@ -270,9 +302,7 @@ async fn admit(ctx: &Ctx, work: Vec<Message>) {
         };
 
         if attempt.all_applied() {
-            let cost: i64 = charges.iter().map(|c| c.delta).max().unwrap_or(0);
-            let _ = cost;
-            commit(ctx, &work, total_cost(st, &work)).await;
+            settle(ctx, window, kinds, work.len()).await;
             return;
         }
 
@@ -283,15 +313,7 @@ async fn admit(ctx: &Ctx, work: Vec<Message>) {
         // refused — `min: 0`, which is a guard and not a clamp, so a refund
         // arriving after the window rotated is refused rather than handing out
         // free budget.
-        let applied: Vec<Charge> = charges
-            .iter()
-            .zip(attempt.applied.iter())
-            .filter(|(_, ok)| **ok)
-            .map(|(c, _)| c.clone())
-            .collect();
-        if !applied.is_empty() {
-            ctx.budgets.refund(&applied).await;
-        }
+        refund_applied(ctx, &charges, &attempt.applied).await;
         note_refusal(ctx, &charges, &attempt);
 
         // ---- §6.3 step 2: the PREFIX that fits.
@@ -299,10 +321,17 @@ async fn admit(ctx: &Ctx, work: Vec<Message>) {
         // Prefix, not subset. A message that fits while an earlier one does not
         // is NOT admitted, even when they touch different scoped keys: order
         // inside a partition is the guarantee the whole passthrough design is
-        // built on. This is v1's deferral rule verbatim — a denial stops the
-        // batch, acks the prefix, keeps the lease.
+        // built on — and, since the cursor commits positionally, a subset would
+        // not merely reorder, it would DROP what it skipped.
         let n = grouped.prefix(&charges, &attempt);
         if n == 0 {
+            // Leading foreign messages can still be settled: they belong to
+            // another path and cost nothing to let go of, and settling them is
+            // progress the budget has no say in.
+            if settle_end(kinds, 0) > 0 {
+                settle(ctx, window, kinds, 0).await;
+                return;
+            }
             match park_or_release(ctx, &charges, &attempt, &mut parks).await {
                 Wait::Retry => continue,
                 Wait::Release => return,
@@ -310,33 +339,22 @@ async fn admit(ctx: &Ctx, work: Vec<Message>) {
         }
 
         st.counters.deferred.fetch_add(1, Ordering::Relaxed);
-        let head = &work[..n];
-        let mut settled = false;
         for attempt_no in 0..=k.max_prefix_retries {
             let prefix = grouped.charges(n);
             match ctx.budgets.charge(&prefix).await {
                 Ok(a) if a.all_applied() => {
-                    commit(ctx, head, total_cost(st, head)).await;
-                    settled = true;
-                    break;
+                    settle(ctx, window, kinds, n).await;
+                    return;
                 }
                 Ok(a) => {
                     // Another worker took the headroom between the two calls.
-                    let applied: Vec<Charge> = prefix
-                        .iter()
-                        .zip(a.applied.iter())
-                        .filter(|(_, ok)| **ok)
-                        .map(|(c, _)| c.clone())
-                        .collect();
-                    if !applied.is_empty() {
-                        ctx.budgets.refund(&applied).await;
-                    }
+                    refund_applied(ctx, &prefix, &a.applied).await;
                     if attempt_no == k.max_prefix_retries {
                         // Treat it as `n == 0`: an unbounded retry loop against
                         // a contended counter is how a limiter turns into a
                         // spin.
                         match park_or_release(ctx, &prefix, &a, &mut parks).await {
-                            Wait::Retry => {}
+                            Wait::Retry => break,
                             Wait::Release => return,
                         }
                     }
@@ -351,13 +369,42 @@ async fn admit(ctx: &Ctx, work: Vec<Message>) {
                 }
             }
         }
-        if settled {
-            // The tail is NOT acked. The lease keeps it, so it cannot be claimed
-            // by another worker and cannot overtake, and it comes back in its
-            // original order when the lease expires or this handler returns.
-            return;
-        }
     }
+}
+
+async fn refund_applied(ctx: &Ctx, charges: &[Charge], applied: &[bool]) {
+    let give_back: Vec<Charge> = charges
+        .iter()
+        .zip(applied.iter())
+        .filter(|(_, ok)| **ok)
+        .map(|(c, _)| c.clone())
+        .collect();
+    if !give_back.is_empty() {
+        ctx.budgets.refund(&give_back).await;
+    }
+}
+
+/// How much of the claim can be settled, given how many WORK items were
+/// admitted.
+///
+/// A true prefix: it stops at the first work item that was not admitted, and
+/// carries any foreign messages that sit before or between the admitted ones.
+/// The cursor commits to the highest position acked, so anything skipped inside
+/// this range would be dropped rather than redelivered — which is why this
+/// counts rather than filters.
+fn settle_end(kinds: &[Kind], admitted: usize) -> usize {
+    let mut seen = 0usize;
+    let mut end = 0usize;
+    for (i, k) in kinds.iter().enumerate() {
+        if matches!(k, Kind::Work) {
+            if seen == admitted {
+                break;
+            }
+            seen += 1;
+        }
+        end = i + 1;
+    }
+    end
 }
 
 enum Wait {
@@ -576,37 +623,55 @@ fn group(st: &StageRuntime, msgs: &[Message]) -> Grouped {
     Grouped { keys, per_msg }
 }
 
-fn total_cost(st: &StageRuntime, msgs: &[Message]) -> i64 {
-    msgs.iter()
-        .map(|m| cost_of(&st.node.cost, &m.data).unwrap_or(1))
-        .sum()
-}
-
 // ------------------------------------------------------------ the transaction
 
-/// §6.4. `ack + push` in one transaction, one source partition, same-named
-/// destination partition.
+/// §6.4. The whole claim, settled in ONE transaction: `ack` a prefix, `push` the
+/// admitted part of it, atomically.
 ///
 /// Ack-then-push loses the item; push-then-ack duplicates it. The transaction
 /// also carries the lease as a precondition, so a lease that lapsed while the
 /// relay worked rolls the whole thing back instead of forwarding work somebody
 /// else has re-claimed.
 ///
-/// The budget is charged BEFORE this, not inside it: `applied` is the decision,
+/// The budget is charged BEFORE this, not inside it: `applied` IS the decision,
 /// so it must be known before the transaction is built. (The wire would let the
 /// `incr` ride inside via `TransactionBuilder::kv`, and that is deliberately not
 /// done — the decision would then be known only after the pushes were already
 /// staged, which is the read-then-write shape `incr` exists to remove.) The
 /// residual hazard is real and bounded, and it is closed below: if the charge
 /// commits and the transaction then fails, the charge is refunded.
-async fn commit(ctx: &Ctx, admitted: &[Message], cost: i64) {
-    if admitted.is_empty() {
+async fn settle(ctx: &Ctx, window: &[Message], kinds: &[Kind], admitted: usize) {
+    let st = &ctx.st;
+    let end = settle_end(kinds, admitted);
+    if end == 0 {
         return;
     }
-    let st = &ctx.st;
+    let prefix = &window[..end];
+    let kinds = &kinds[..end];
+
     let mut tx = ctx.queen.transaction();
-    for m in admitted {
+    let mut foreign = 0u64;
+    let mut cost = 0i64;
+    // The work items this transaction stages, in order — exactly what the
+    // charge above paid for, and therefore exactly what a failure has to give
+    // back. The foreign ones were never charged and must not be refunded, or a
+    // rolled-back batch would hand out free budget.
+    let mut charged: Vec<Message> = Vec::with_capacity(admitted);
+
+    for (m, kind) in prefix.iter().zip(kinds) {
         tx = tx.ack(m);
+        if !matches!(kind, Kind::Work) {
+            foreign += 1;
+            continue;
+        }
+        if charged.len() >= admitted {
+            // Only inside `settle_end`'s prefix, and only the admitted ones.
+            // Unreachable by construction; kept because "unreachable" and
+            // "cannot happen" are different words.
+            continue;
+        }
+        charged.push(m.clone());
+        cost += cost_of(&st.node.cost, &m.data).unwrap_or(1);
         for dest in &st.stage.destinations {
             let item = TxnPushItem {
                 queue: dest.queue.clone(),
@@ -636,18 +701,21 @@ async fn commit(ctx: &Ctx, admitted: &[Message], cost: i64) {
                         stage = %st.key(), error = %e,
                         "could not stage a push; the batch will be redelivered"
                     );
-                    refund_all(ctx, admitted).await;
+                    refund_for(ctx, &charged).await;
                     return;
                 }
             }
         }
     }
 
-    let n = admitted.len() as u64;
+    let forwarded = charged.len() as u64;
     match tx.commit().await {
         Ok(_) => {
-            st.counters.forwarded.fetch_add(n, Ordering::Relaxed);
-            st.counters.admitted.fetch_add(n, Ordering::Relaxed);
+            st.counters
+                .forwarded
+                .fetch_add(forwarded, Ordering::Relaxed);
+            st.counters.admitted.fetch_add(forwarded, Ordering::Relaxed);
+            st.counters.foreign.fetch_add(foreign, Ordering::Relaxed);
             st.counters.commits.fetch_add(1, Ordering::Relaxed);
             st.counters
                 .cost
@@ -661,10 +729,16 @@ async fn commit(ctx: &Ctx, admitted: &[Message], cost: i64) {
         Err(e) if e.to_string().contains("QDUP") => {
             st.counters.duplicates.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
-                stage = %st.key(), partition = %admitted[0].partition,
-                "an item was already forwarded; settling the batch one at a time"
+                stage = %st.key(), partition = %prefix[0].partition,
+                "an item was already forwarded; settling the head of the claim on its own"
             );
-            settle_one_by_one(ctx, admitted).await;
+            // The head keeps its charge and everything behind it gives one
+            // back: the head is about to be settled on its own, and if it
+            // forwards it is arriving at the destination for the first time and
+            // must spend a window for that.
+            let keep = usize::from(matches!(kinds[0], Kind::Work));
+            refund_for(ctx, &charged[keep.min(charged.len())..]).await;
+            settle_head(ctx, &prefix[0], &kinds[0]).await;
         }
         // Nothing was settled and nothing was pushed, but the budget WAS spent.
         // Give it back before returning, or a broker that refuses transactions
@@ -674,70 +748,85 @@ async fn commit(ctx: &Ctx, admitted: &[Message], cost: i64) {
                 stage = %st.key(), error = %e,
                 "the relay transaction did not commit; refunding and letting the lease lapse"
             );
-            refund_all(ctx, admitted).await;
+            refund_for(ctx, &charged).await;
             st.counters.released.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
 
-/// The recovery path: one transaction per item, so the one that is already
-/// downstream can be acked on its own instead of taking its batch down with it.
-async fn settle_one_by_one(ctx: &Ctx, admitted: &[Message]) {
+/// The QDUP recovery: settle exactly the HEAD of the claim, on its own.
+///
+/// One item and not the batch, because an ack releases the claim (see the
+/// handler's module note): the second transaction under this lease would answer
+/// `invalid or expired lease` whatever it carried. So the recovery makes one
+/// item of progress per claim — the cursor moves past it and the rest come back
+/// immediately — which is slow and is correct, and QDUP is a lost-response
+/// artefact rather than a steady state.
+///
+/// The head's charge has already been given back by the caller, so an item that
+/// forwards here is charged again: it is arriving at the destination for the
+/// first time, and it must spend a window for that.
+async fn settle_head(ctx: &Ctx, m: &Message, kind: &Kind) {
     let st = &ctx.st;
-    for m in admitted {
-        let mut tx = Some(ctx.queen.transaction().ack(m));
-        for dest in &st.stage.destinations {
-            let item = TxnPushItem {
-                queue: dest.queue.clone(),
-                partition: Some(m.partition.clone()),
-                payload: stamp(&m.data, st, dest.node.as_str()),
-                transaction_id: Some(if dest.derive_id {
-                    gate_core::derive(&m.transaction_id, &dest.label)
-                } else {
-                    m.transaction_id.clone()
-                }),
-                trace_id: None,
-            };
-            let Some(builder) = tx.take() else { break };
-            match builder.push_item(item) {
-                Ok(next) => tx = Some(next),
-                Err(_) => break,
-            }
-        }
-        let Some(tx) = tx else {
-            // Nack with the reason so it reaches the DLQ, never dropped.
-            let _ = ctx
-                .queen
-                .transaction()
-                .nack(m, "gate: this item cannot be staged for its destination")
-                .commit()
-                .await;
-            st.counters.deadlettered.fetch_add(1, Ordering::Relaxed);
-            continue;
+    if !matches!(kind, Kind::Work) {
+        let _ = ctx.queen.transaction().ack(m).commit().await;
+        st.counters.foreign.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+
+    let mut tx = Some(ctx.queen.transaction().ack(m));
+    for dest in &st.stage.destinations {
+        let item = TxnPushItem {
+            queue: dest.queue.clone(),
+            partition: Some(m.partition.clone()),
+            payload: stamp(&m.data, st, dest.node.as_str()),
+            transaction_id: Some(if dest.derive_id {
+                gate_core::derive(&m.transaction_id, &dest.label)
+            } else {
+                m.transaction_id.clone()
+            }),
+            trace_id: None,
         };
-        match tx.commit().await {
-            Ok(_) => {
-                st.counters.forwarded.fetch_add(1, Ordering::Relaxed);
-                st.counters.admitted.fetch_add(1, Ordering::Relaxed);
-                st.counters.commits.fetch_add(1, Ordering::Relaxed);
-            }
-            // Already downstream: settle it and move on. It does NOT count as
-            // forwarded — it is not arriving at the destination a second time,
-            // so it spends no window, and the charge it made on the way here was
-            // already spent the first time.
-            Err(e) if e.to_string().contains("QDUP") => {
-                let _ = ctx.queen.transaction().ack(m).commit().await;
-            }
-            // Leave it alone: its lease lapses and it comes back.
-            Err(_) => {}
+        let Some(builder) = tx.take() else { break };
+        match builder.push_item(item) {
+            Ok(next) => tx = Some(next),
+            Err(_) => break,
         }
+    }
+    let Some(tx) = tx else {
+        // Nack with the reason so it reaches the DLQ, never dropped.
+        let _ = ctx
+            .queen
+            .transaction()
+            .nack(m, "gate: this item cannot be staged for its destination")
+            .commit()
+            .await;
+        st.counters.deadlettered.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    match tx.commit().await {
+        Ok(_) => {
+            st.counters.forwarded.fetch_add(1, Ordering::Relaxed);
+            st.counters.admitted.fetch_add(1, Ordering::Relaxed);
+            st.counters.commits.fetch_add(1, Ordering::Relaxed);
+        }
+        // Already downstream: settle it and move on. It does NOT count as
+        // forwarded — it is not arriving at the destination a second time, so it
+        // spends no window.
+        Err(e) if e.to_string().contains("QDUP") => {
+            let _ = ctx.queen.transaction().ack(m).commit().await;
+        }
+        // Leave it alone: its lease lapses and it comes back.
+        Err(_) => {}
     }
 }
 
-/// Give back the whole batch's charge after a transaction that did not commit.
-async fn refund_all(ctx: &Ctx, admitted: &[Message]) {
-    let grouped = group(&ctx.st, admitted);
-    let charges = grouped.charges(admitted.len());
+/// Give back what these messages were charged, after a transaction that did not
+/// commit.
+async fn refund_for(ctx: &Ctx, msgs: &[Message]) {
+    let work: Vec<Message> = msgs.to_vec();
+    let grouped = group(&ctx.st, &work);
+    let charges = grouped.charges(work.len());
     if !charges.is_empty() {
         ctx.budgets.refund(&charges).await;
     }
@@ -876,6 +965,7 @@ mod tests {
                 ingress_queue: None,
                 ingress_owned: false,
                 ingress_http: false,
+                ingress_shed: false,
                 interior_queue: "n.in".into(),
                 egress_queue: None,
                 egress_group: None,
@@ -1045,7 +1135,7 @@ mod tests {
         for wait in [0i64, 100, 1000, 100_000] {
             for _ in 0..64 {
                 let j = jitter_ms(wait);
-                assert!(j >= 0 && j <= 200, "wait {wait} gave {j}");
+                assert!((0..=200).contains(&j), "wait {wait} gave {j}");
             }
         }
     }

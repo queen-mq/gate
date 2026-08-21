@@ -343,6 +343,7 @@ fn two_nodes_may_not_name_one_ingress_queue() {
             queue: Some("channel.airbnb.messages.in".into()),
             partitions: None,
             http: None,
+            shed: None,
         }))
     });
     assert!(got.contains(&"ingress-owner"), "{got:?}");

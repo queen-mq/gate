@@ -1,217 +1,186 @@
-//! Server-side units that need no broker: the arithmetic and the naming that the
-//! live tests would only exercise incidentally.
+//! Server-side units that need no broker: the naming and the arithmetic the live
+//! tests would only exercise incidentally.
+//!
+//! What went, and why:
+//!
+//! * `the_relay_window_is_the_nodes_own_rate_and_never_a_per_key_one` and
+//!   `a_shared_ceiling_paces_a_node_like_any_other` — there is no relay window.
+//!   It existed to keep the destination's push queue shallow so that ARRIVAL
+//!   ORDER at a merge would honour priority. With no merge and no arrival-order
+//!   priority there is nothing to keep shallow: the destination's own budget is
+//!   the pacing, and backlog on an interior queue is exactly where held work
+//!   belongs.
+//! * `a_relay_group_is_named_for_the_edge_it_serves` — one group per (path,
+//!   node) now, not one per edge. Replaced below.
+//! * `the_gates_group_is_the_one_the_stream_runtime_derives` — there is no
+//!   stream runtime and no derived group name to get wrong. The property it
+//!   protected (a group with no cursor owes its whole retained range, so a
+//!   misspelling reports every message ever pushed as waiting) is protected by
+//!   minting every name in one function, which `gate-core`'s `tests/plan.rs`
+//!   pins.
+//! * the five `eta::admits` tests — ported, with their fixtures and their fixed
+//!   instant, into `gate_server::eta`'s own `#[cfg(test)]` module, because the
+//!   function moved with them.
 
-use gate_core::TargetSpec;
-use gate_server::edge;
+use gate_core::plan::{self, PlanOpts};
+use gate_core::GraphDoc;
 use serde_json::json;
 
-fn spec(v: serde_json::Value) -> TargetSpec {
+fn doc(v: serde_json::Value) -> GraphDoc {
     serde_json::from_value(v).expect("parse")
 }
 
-/// The window is what keeps the bottleneck queue shallow, and it is sized from what
-/// the node can admit inside ONE lease — so it has to be read off a rate that is
-/// actually the node's, not one that is per key.
+/// A stage's group carries the path AND the node, because two paths sharing a
+/// node is pub-sub: each group gets every message, and one group per node would
+/// make them split the stream instead.
 #[test]
-fn the_relay_window_is_the_nodes_own_rate_and_never_a_per_key_one() {
-    // The plan's `ip` node: the most generous budget is 1500 per 10s = 150/s, and two
-    // lease-windows of it is 300. Not the tightest (the daily average, 39/s): what
-    // binds inside one lease is whichever budget has room, and sizing on the average
-    // would starve the gate and make the relay the limiter.
-    let ip = spec(json!({
-        "name": "airbnb.ip", "version": 1,
-        "budgets": [
-            { "id": "ip-10s", "cap": 1500, "periodSeconds": 10, "alignment": "rolling",
-              "confidence": "inferred" },
-            { "id": "ip-1d", "cap": 3375000, "periodSeconds": 86400, "alignment": "rolling",
-              "confidence": "inferred" }
-        ],
-        "lanes": [{ "name": "default", "cap": "ceiling", "concurrency": 8, "default": true }],
-        "cost": { "field": "httpCost", "default": 1, "max": 100 },
-        "pacing": { "leaseSeconds": 1, "batch": 200 }
-    }));
-    assert_eq!(edge::window_for(&ip), 300);
-
-    // A node limited only PER KEY has no rate of its own: 100 photo deletions per
-    // listing per week is not one item per six thousand seconds of node throughput.
-    // Sizing on it collapsed the window to a single item, and because the depth it is
-    // compared against is the whole node's, one item waiting anywhere stopped
-    // everything.
-    let photos = spec(json!({
-        "name": "airbnb.photos", "version": 1,
-        "shardBy": "entity", "shards": 8,
-        "budgets": [
-            { "id": "photo-del-weekly", "cap": 100, "periodSeconds": 604800,
-              "alignment": "rolling", "scope": ["entity"], "maxKeys": 20000,
-              "confidence": "inferred" }
-        ],
-        "lanes": [{ "name": "default", "cap": "ceiling", "concurrency": 8, "default": true }],
-        "cost": { "field": "httpCost", "default": 1, "max": 1 },
-        "pacing": { "leaseSeconds": 1, "batch": 200 }
-    }));
+fn a_stage_group_is_named_for_the_path_and_the_node() {
     assert_eq!(
-        edge::window_for(&photos),
-        200 * 8,
-        "a per-key-limited node is paced by its shards, not by the relay"
-    );
-
-    // A class node with no budget at all is the same argument: it paces nothing.
-    let class = spec(json!({
-        "name": "airbnb.prices", "version": 1,
-        "budgets": [],
-        "lanes": [{ "name": "default", "cap": "ceiling", "concurrency": 8, "default": true }],
-        "cost": { "field": "httpCost", "default": 1, "max": 100 },
-        "pacing": { "leaseSeconds": 1, "batch": 50 }
-    }));
-    assert_eq!(edge::window_for(&class), 50);
-}
-
-/// One group per EDGE, not per node: two edges out of one node would otherwise share
-/// a cursor and split the stream between them, and each edge is supposed to carry the
-/// whole of it to its own destination.
-#[test]
-fn a_relay_group_is_named_for_the_edge_it_serves() {
-    assert_eq!(
-        edge::group_of("channel-manager", "airbnb", "messages", "ip"),
-        "gate.edge.channel-manager.airbnb.messages.ip"
+        plan::stage_group("channel", "airbnb", "messages", "ip"),
+        "gate.channel.airbnb.messages.ip"
     );
     assert_ne!(
-        edge::group_of("a", "g", "x", "z"),
-        edge::group_of("a", "g", "y", "z")
+        plan::stage_group("a", "g", "x", "z"),
+        plan::stage_group("a", "g", "y", "z"),
     );
 }
 
-/// A `store: kv` ceiling paces the node exactly as a gate-held one does — it is merely
-/// enforced from a local lease instead of from the state document. Excluding it sent a node
-/// whose only total-rate bound is a shared ceiling down the "nothing paces this" path, and
-/// its queue was then allowed to run deep: the shallow-window property that makes priority
-/// real, quietly lost.
+/// The per-stage worker count defaults from the SOURCE's partition width, which
+/// is a fact Gate reads from the broker rather than one it chooses. More workers
+/// than partitions is harmless — the extras find nothing and park; fewer is a
+/// throughput ceiling.
 #[test]
-fn a_shared_ceiling_paces_a_node_like_any_other() {
-    let shared = spec(json!({
-        "name": "airbnb.ip", "version": 1,
-        "budgets": [
-            { "id": "egress", "cap": 1000, "periodSeconds": 10, "alignment": "calendar",
-              "store": "kv", "confidence": "inferred" }
-        ],
-        "lanes": [{ "name": "default", "cap": "ceiling", "concurrency": 8, "default": true }],
-        "cost": { "field": "httpCost", "default": 1, "max": 1 },
-        "pacing": { "leaseSeconds": 1, "batch": 200 }
+fn concurrency_defaults_from_the_sources_partition_width() {
+    let d = doc(json!({
+      "application": "a", "graph": "g", "version": 1,
+      "nodes": { "n": { "ingress": { "queue": "theirs.in" },
+                        "budgets": [{ "id": "b", "count": 100, "timeMs": 1000 }],
+                        "egress": "theirs.out" } },
+      "paths": [{ "name": "main", "nodes": ["n"] }]
     }));
-    // 1000 per 10s = 100/s, two lease-windows of it.
-    assert_eq!(edge::window_for(&shared), 200);
-}
 
-// ---------------------------------------------------------------------- eta
+    // Nothing observed: the declared default.
+    let bare = gate_core::compile(&d);
+    assert_eq!(bare.stages[0].concurrency, plan::DEFAULT_INGRESS_PARTITIONS);
 
-use gate_core::Alignment;
-use gate_server::{eta, gate};
-
-/// A round instant with a window boundary that is not on it: 20s into the
-/// minute, so a minute-long calendar window has 40s left to run.
-const T: i64 = 1_700_000_000_000;
-
-/// The whole reason the refill half of an ETA reads the DECLARATION and not the
-/// meter.
-///
-/// A window with nothing left in it is measuring zero admissions per second, and
-/// zero per second answers "never" — at exactly the moment somebody is asking,
-/// because a window is only exhausted while work is piling up behind it. What is
-/// true is that the counter zeroes at the edge and the whole cap is available the
-/// instant it does, which the spec knows and no measurement can see.
-#[test]
-fn an_exhausted_window_answers_with_its_edge_and_not_with_infinity() {
-    let s = eta::admits(Alignment::Calendar, 100.0, 60, 100.0, 50.0, T);
-    assert_eq!(s.seconds, Some(40.0), "40s of this minute are left to run");
-    assert_eq!(s.resets_at, T + 40_000);
-
-    // And the same window with room in it admits the backlog now.
-    let s = eta::admits(Alignment::Calendar, 100.0, 60, 20.0, 50.0, T);
-    assert_eq!(s.seconds, Some(0.0));
-    assert_eq!(
-        s.resets_at,
-        T + 40_000,
-        "the edge is a fact about the window"
+    // Observed at the broker: that, floored at four.
+    let mut partitions = std::collections::BTreeMap::new();
+    partitions.insert("theirs.in".to_string(), 2u32);
+    let narrow = gate_core::compile_with(
+        &d,
+        &PlanOpts {
+            partitions,
+            ..Default::default()
+        },
     );
-}
+    assert_eq!(narrow.stages[0].concurrency, 4, "floored, never zero");
 
-/// A backlog bigger than the cap does not fit in one window, and the answer is
-/// the edge plus a whole window for every further cap-worth — not the edge, and
-/// not the backlog divided by an average rate.
-#[test]
-fn a_backlog_deeper_than_the_cap_waits_out_whole_windows() {
-    // 100 free at the edge, 100 in the window after it, and the last 50 in the
-    // one after that: two edges away.
-    let s = eta::admits(Alignment::Calendar, 100.0, 60, 100.0, 250.0, T);
-    assert_eq!(s.seconds, Some(40.0 + 120.0));
-
-    // Exactly a cap-worth still lands in the first window: ceil() must not buy
-    // an extra one.
-    let s = eta::admits(Alignment::Calendar, 100.0, 60, 100.0, 100.0, T);
-    assert_eq!(s.seconds, Some(40.0));
-}
-
-/// A rolling window has no edge to wait for: its carried tail decays
-/// continuously, so room comes back continuously and the rate to divide by is
-/// the declared one.
-#[test]
-fn a_rolling_window_refills_at_the_rate_it_declares() {
-    // 100 per 10s is 10/s; 50 units short of room is five seconds of it.
-    let s = eta::admits(Alignment::Rolling, 100.0, 10, 100.0, 50.0, T);
-    assert_eq!(s.seconds, Some(5.0));
-
-    // Room now is room now, in either alignment.
-    assert_eq!(
-        eta::admits(Alignment::Rolling, 100.0, 10, 0.0, 50.0, T).seconds,
-        Some(0.0)
+    let mut partitions = std::collections::BTreeMap::new();
+    partitions.insert("theirs.in".to_string(), 32u32);
+    let wide = gate_core::compile_with(
+        &d,
+        &PlanOpts {
+            partitions,
+            ..Default::default()
+        },
     );
+    assert_eq!(wide.stages[0].concurrency, 32);
 }
 
-/// Lanes DIVIDE a ceiling rather than replicate it, so an ETA that answered off
-/// the whole cap would promise capacity the asking lane's own gate is going to
-/// refuse. The share is applied to the cap, and halving it doubles the wait.
+/// A node may declare its own batch and its own worker count, and they win over
+/// the fleet defaults.
 #[test]
-fn a_lane_is_paced_by_its_share_and_not_by_the_ceiling() {
-    let whole = eta::admits(Alignment::Rolling, 100.0, 10, 100.0, 100.0, T);
-    let half = eta::admits(Alignment::Rolling, 50.0, 10, 50.0, 100.0, T);
-    assert_eq!(whole.seconds, Some(10.0));
-    assert_eq!(half.seconds, Some(20.0));
-}
-
-/// A cap of nothing is never refilled into something, and a product can render
-/// "we cannot say" — where it would render an infinity as a number.
-#[test]
-fn a_cap_that_admits_nothing_says_so_rather_than_guessing() {
-    assert_eq!(
-        eta::admits(Alignment::Calendar, 0.0, 60, 0.0, 1.0, T).seconds,
-        None
-    );
-    // Nothing waiting is nothing to wait for, even against a spent cap.
-    assert_eq!(
-        eta::admits(Alignment::Calendar, 100.0, 60, 100.0, 0.0, T).seconds,
-        Some(0.0)
-    );
-}
-
-/// The gate's consumer group is NOT its query id.
-///
-/// `RunOptions` leaves `consumer_group` unset and the SDK derives
-/// `streams.{query_id}` from it. Naming the query id instead would ask the
-/// broker about a group that has no cursor — and a group with no cursor owes its
-/// whole retained range, so the ETA would report every message ever pushed as
-/// waiting for budget, plausibly, for ever.
-#[test]
-fn the_gates_group_is_the_one_the_stream_runtime_derives() {
-    let s = spec(json!({
-        "application": "channel-manager", "name": "airbnb", "version": 1,
-        "budgets": [{ "id": "ip", "cap": 100, "periodSeconds": 10, "alignment": "rolling",
-                      "confidence": "inferred" }],
-        "lanes": [{ "name": "bulk", "cap": "ceiling", "concurrency": 8, "default": true }],
-        "cost": { "field": "httpCost", "default": 1, "max": 1 }
+fn a_node_may_size_its_own_stage() {
+    let d = doc(json!({
+      "application": "a", "graph": "g", "version": 1,
+      "nodes": { "n": { "ingress": true, "batch": 25, "concurrency": 3,
+                        "budgets": [{ "id": "b", "count": 100, "timeMs": 1000 }],
+                        "egress": "out" } },
+      "paths": [{ "name": "main", "nodes": ["n"] }]
     }));
-    assert_eq!(s.query_id("bulk"), "gate.channel-manager.airbnb.bulk");
+    let p = gate_core::compile(&d);
+    assert_eq!(p.stages[0].batch, 25);
+    assert_eq!(p.stages[0].concurrency, 3);
+}
+
+/// `null` rather than infinity when nothing is moving: "we cannot say" is an
+/// honest answer and a product can render it, where a number that means for ever
+/// would be rendered as a number.
+#[test]
+fn a_drain_estimate_without_a_rate_says_so() {
+    use gate_server::api::console::eta;
     assert_eq!(
-        gate::consumer_group(&s, "bulk"),
-        "streams.gate.channel-manager.airbnb.bulk"
+        eta(0, None),
+        Some(0),
+        "nothing waiting is nothing to wait for"
     );
+    assert_eq!(eta(100, None), None, "no measured rate, no answer");
+    assert_eq!(
+        eta(100, Some(0.0)),
+        None,
+        "and a zero rate is not an answer either"
+    );
+    assert_eq!(eta(100, Some(10.0)), Some(10));
+}
+
+/// The knobs are read once, and the defaults are the ones the design names.
+#[test]
+fn the_knobs_default_to_what_the_design_says() {
+    let k = gate_server::knobs::Knobs::default();
+    assert_eq!(k.batch, 200, "the per-claim batch");
+    assert_eq!(k.lease_seconds, 30, "a WORK lease, not a pacing quantum");
+    assert_eq!(k.poll_timeout.as_secs(), 30, "the parked long-poll window");
+    assert_eq!(
+        k.park_threshold.as_millis(),
+        1500,
+        "just above the one-second sub-window floor, so an ordinary rotation always parks"
+    );
+    assert_eq!(k.max_parks, 3);
+    assert_eq!(
+        k.retry_limit, 3,
+        "the DLQ is back: v1 had to disarm it because it paced by nacking"
+    );
+}
+
+/// `forwarded / commits` is THE number that explains a stage's throughput: the
+/// destination partition takes one row lock per transaction whoever holds it, so
+/// items-per-transaction is the multiplier on everything the workers do in
+/// parallel. In v1 it sat near 1; here it should sit near the batch.
+#[test]
+fn the_stage_view_reports_items_per_commit() {
+    let c = gate_server::obs::StageCounters::default();
+    assert!(
+        c.view()["itemsPerCommit"].is_null(),
+        "no commits is not a ratio of zero"
+    );
+    c.forwarded.store(400, std::sync::atomic::Ordering::Relaxed);
+    c.commits.store(2, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(c.view()["itemsPerCommit"], json!(200.0));
+}
+
+/// The refusal ring is bounded and drop-oldest: a flush that misses a pass loses
+/// the OLDEST denials and never blocks the hot path.
+#[test]
+fn the_trace_ring_drops_the_oldest_and_never_grows() {
+    let t = gate_server::obs::Traces::default();
+    for i in 0..(gate_server::obs::TRACE_RING + 50) {
+        t.push(gate_server::obs::Trace {
+            at: i as i64,
+            application: "a".into(),
+            graph: "g".into(),
+            node: "n".into(),
+            path: "p".into(),
+            op: String::new(),
+            outcome: "denied",
+            budget_id: Some("b".into()),
+        });
+    }
+    assert_eq!(t.len(), gate_server::obs::TRACE_RING);
+    let recent = t.recent(None, 1);
+    assert_eq!(
+        recent[0].at,
+        (gate_server::obs::TRACE_RING + 49) as i64,
+        "newest first"
+    );
+    assert!(t.recent(Some("admitted"), 10).is_empty(), "denials only");
 }

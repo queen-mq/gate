@@ -216,12 +216,18 @@ async fn push_into(
         }
     }
 
-    // ---- shed load, optionally.
+    // ---- shed load, if and only if the declaration asked for it.
     //
-    // A pre-check, never a charge: the decision is made by the relay when it
-    // pops, and charging here would spend budget for work that has not moved.
-    // What this buys is a caller who can back off instead of filling a queue —
-    // 429 with the vendor's own deadline, read off the counter's TTL.
+    // OFF by default, and the default is the important half: holding work that
+    // does not fit until it does is the entire point of this service, and a door
+    // that refuses the moment the window is full turns a limiter into a load
+    // shedder. A tight-looping producer would lose most of what it sent.
+    //
+    // Where it IS asked for, it is a pre-check and never a charge: the decision
+    // is made by the relay when it pops, and charging here would spend budget
+    // for work that has not moved. What it buys is a caller who can back off
+    // instead of filling a queue — 429 with the deadline read off the counter's
+    // own TTL.
     if let Some(retry_after) = shed(st, np, cost).await {
         return Err(Fail(
             StatusCode::TOO_MANY_REQUESTS,
@@ -260,6 +266,9 @@ async fn push_into(
 /// through and the relay decides, which is the right way round — the door must
 /// never be the thing that stops work when the limiter itself is fine.
 async fn shed(st: &Shared, np: &NodePlan, cost: i64) -> Option<i64> {
+    if !np.ingress_shed {
+        return None;
+    }
     let keys: Vec<String> = np.unscoped().map(|b| b.key.clone()).collect();
     if keys.is_empty() {
         return None;

@@ -290,6 +290,18 @@ pub struct IngressSpec {
     /// SDK did not ask for a second door.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http: Option<bool>,
+
+    /// Answer **429 with a Retry-After** at the front door when the node is
+    /// already at its ceiling, instead of queueing the work.
+    ///
+    /// **Off by default, and that is the important half.** Holding work that
+    /// does not fit until it does is the entire point of this service; a door
+    /// that refuses a producer the moment the window is full turns a limiter
+    /// into a load shedder, and a tight-looping producer would then lose most of
+    /// what it sent. Turn it on where the caller genuinely prefers a fast
+    /// refusal to a queue — a synchronous request path, say — and nowhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shed: Option<bool>,
 }
 
 impl Ingress {
@@ -318,6 +330,13 @@ impl Ingress {
         match self {
             Ingress::Owned(_) => true,
             Ingress::Named(s) => s.http.unwrap_or_else(|| s.queue.is_none()),
+        }
+    }
+
+    pub fn shed(&self) -> bool {
+        match self {
+            Ingress::Owned(_) => false,
+            Ingress::Named(s) => s.shed.unwrap_or(false),
         }
     }
 

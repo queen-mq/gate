@@ -40,7 +40,10 @@ impl Outcome {
     /// A request that never reached the server — a connection error, a timeout.
     /// Status 0 is not an HTTP code and is meant to stand out in the report.
     pub fn dead() -> Self {
-        Self { status: 0, units: 0 }
+        Self {
+            status: 0,
+            units: 0,
+        }
     }
     pub fn with_units(mut self, units: u64) -> Self {
         self.units = units;
@@ -63,21 +66,14 @@ impl Hist {
         self.us.push(us);
     }
 
-    /// Samples that were collected somewhere else — the end-to-end histograms
-    /// are filled by consumer tasks, not by a driver — and already ordered.
-    pub fn from_sorted(us: Vec<u64>) -> Self {
-        Self { us }
-    }
-
     pub fn extend(&mut self, other: &Hist) {
         self.us.extend_from_slice(&other.us);
     }
 
-    pub fn len(&self) -> usize {
-        self.us.len()
-    }
-
-    fn sorted(&mut self) {
+    /// Order the samples in place. `Run::finish` does it for the driver's own
+    /// histograms; a caller that filled one by hand — the end-to-end waits, read
+    /// off the payloads — has to say so before asking for a percentile.
+    pub fn sorted(&mut self) {
         self.us.sort_unstable();
     }
 
@@ -145,7 +141,13 @@ impl Run {
     fn status_line(&self) -> String {
         self.status
             .iter()
-            .map(|(s, n)| if *s == 0 { format!("dead:{n}") } else { format!("{s}:{n}") })
+            .map(|(s, n)| {
+                if *s == 0 {
+                    format!("dead:{n}")
+                } else {
+                    format!("{s}:{n}")
+                }
+            })
             .collect::<Vec<_>>()
             .join(" ")
     }
@@ -192,8 +194,8 @@ impl Run {
 
 pub fn header(what: &str) {
     println!(
-        "\n  {:<22} {:>10}  {:>11}  {:>11}   {:>7} {:>7} {:>7} {:>7} {:>8}   {}",
-        what, "load", "requests", "units", "p50", "p90", "p99", "p99.9", "max", "statuses"
+        "\n  {:<22} {:>10}  {:>11}  {:>11}   {:>7} {:>7} {:>7} {:>7} {:>8}   statuses",
+        what, "load", "requests", "units", "p50", "p90", "p99", "p99.9", "max"
     );
     println!(
         "  {:-<22} {:->10}  {:->11}  {:->11}   {:->7} {:->7} {:->7} {:->7} {:->8}   {:->12}",
@@ -329,7 +331,10 @@ where
             Err(_) => {
                 capped.fetch_add(1, Ordering::Relaxed);
                 slipped.store(true, Ordering::Relaxed);
-                Arc::clone(&gate).acquire_owned().await.expect("semaphore open")
+                Arc::clone(&gate)
+                    .acquire_owned()
+                    .await
+                    .expect("semaphore open")
             }
         };
 

@@ -10,11 +10,14 @@ name: Tests
 # per-key limits across shards). So a broker is provided, and
 # `GATE_TEST_REQUIRE_LIVE` turns a missing one from a skip into a failure.
 
+# `master`, not `main`. The old trigger named a branch this repository does not
+# have, so this workflow may never have run on a push at all — which is a
+# particularly quiet way for a test suite to stop being a test suite.
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "master" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "master" ]
   workflow_dispatch:
 
 concurrency:
@@ -30,6 +33,8 @@ jobs:
         image: postgres:16
         env:
           POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
         options: >-
           --health-cmd pg_isready
           --health-interval 5s
@@ -37,7 +42,10 @@ jobs:
           --health-retries 10
 
       queen:
-        image: ghcr.io/queen-mq/queen:1.0.3
+        # >= 1.0.4, so the depth route's HAPPY path is exercised and not only its
+        # 404 fallback — and so `kv.incr` with `max`, which is the whole limiter,
+        # is the one the broker actually ships.
+        image: ghcr.io/queen-mq/queen:1.0.5
         env:
           PG_HOST: postgres
           PG_PASSWORD: postgres
@@ -55,6 +63,11 @@ jobs:
       GATE_TEST_QUEEN_URL: http://127.0.0.1:6632
       # A missing broker is a red build here, never a skipped test.
       GATE_TEST_REQUIRE_LIVE: "1"
+      # The history layer was entirely untested because nothing set this: the
+      # schema, the upsert-sum and the rollup reads all short-circuit to `None`
+      # without it.
+      PG_HOST: 127.0.0.1
+      PG_PASSWORD: postgres
 
     steps:
     - uses: actions/checkout@v4
@@ -90,14 +103,24 @@ jobs:
         docker ps -a >&2
         exit 1
 
+    # `-D warnings`, so a lint is a red build rather than a line in a log
+    # nobody reads.
     - name: Clippy
-      run: cargo clippy --workspace --all-targets
+      run: cargo clippy --workspace --all-targets -- -D warnings
 
     # `--include-ignored`, because the live tests are ignored by default: a laptop
     # without a broker should report them as ignored rather than as passed, and this
     # is the job that actually runs them.
     - name: Test
       run: cargo test --workspace -- --include-ignored
+
+    # The MSRV is declared in the workspace manifest and was never checked, so
+    # nothing would have noticed a 1.87 feature until somebody on 1.86 tried to
+    # build it.
+    - name: MSRV
+      run: |
+        rustup toolchain install 1.86 --profile minimal
+        cargo +1.86 check --workspace --all-targets
 
     - name: Release build
       run: cargo build --release --workspace

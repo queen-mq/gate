@@ -310,6 +310,8 @@ pub fn from_v1_target(spec: &v1::TargetSpec) -> Result<Migrated, Refused> {
             queue: None,
             partitions: Some(spec.admitted.partitions.max(1)),
             http: Some(true),
+            // v1's push queued; so does v2's, unless a caller asks otherwise.
+            shed: None,
         })),
         egress: Some(Egress::Name(v1_admitted_queue(
             &spec.application,
@@ -406,6 +408,7 @@ pub fn from_v1_graph(spec: &v1::GraphSpec) -> Result<Migrated, Refused> {
                     queue: None,
                     partitions: Some(n.admitted.partitions.max(1)),
                     http: Some(true),
+                    shed: None,
                 })
             }),
             egress: spec.consume.iter().any(|c| c == name).then(|| {

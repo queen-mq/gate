@@ -425,6 +425,7 @@ dependencies = [
 name = "gate-bench"
 version = "0.1.6"
 dependencies = [
+ "queen-mq",
  "reqwest",
  "serde",
  "serde_json",
@@ -444,6 +445,7 @@ dependencies = [
 name = "gate-e2e"
 version = "0.1.6"
 dependencies = [
+ "queen-mq",
  "reqwest",
  "serde",
  "serde_json",

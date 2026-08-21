@@ -107,6 +107,9 @@ pub struct NodePlan {
     /// the application that made it.
     pub ingress_owned: bool,
     pub ingress_http: bool,
+    /// Whether the front door refuses with a 429 rather than queueing. Off
+    /// unless the declaration asks for it — see `IngressSpec::shed`.
+    pub ingress_shed: bool,
     /// Where relays into this node push. Always named, even for a node no path
     /// relays into — the name is cheap and a plan with a hole in it is not.
     pub interior_queue: String,
@@ -389,6 +392,11 @@ pub fn compile_with(doc: &GraphDoc, opts: &PlanOpts) -> Plan {
                     .as_ref()
                     .filter(|i| i.is_enabled())
                     .is_some_and(|i| i.http()),
+                ingress_shed: node
+                    .ingress
+                    .as_ref()
+                    .filter(|i| i.is_enabled())
+                    .is_some_and(|i| i.shed()),
                 interior_queue: interior_queue(app, graph, name),
                 egress_queue: node.egress.as_ref().map(|e| e.queue().to_string()),
                 egress_group: node
