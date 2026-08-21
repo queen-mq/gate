@@ -1031,6 +1031,73 @@ async fn a_failed_transaction_after_a_successful_charge_refunds() {
     h.cleanup("g").await;
 }
 
+/// A refund that arrives after the window rotated must NOT credit the next one.
+///
+/// The bug this pins: `min: 0` is a guard on the RESULTING VALUE, not on the
+/// identity of the window (`024_kv.sql`, the `incr` UPDATE branch). It refuses a
+/// refund into a REAPED key — the create branch is gated by the pure
+/// `delta >= min` comparison, and `-D >= 0` is false — and it happily applies
+/// one into a key another worker has just RECREATED. Sub-windows are a second
+/// wide by default and the refund path fires exactly when a counter is
+/// contended, which is exactly when its row is recreated at once, so a batch
+/// straddling a rotation handed its whole delta to the next window and that
+/// window then admitted `cap + delta`.
+///
+/// Driven against `Budgets` rather than through a graph, because the interleaving
+/// is the assertion: charge, let the window die, let somebody else found the next
+/// one, and only then refund.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn a_refund_cannot_credit_a_window_it_never_charged() {
+    use gate_server::budget::{Charge, Refund};
+    let Some(h) = harness("rotate").await else {
+        return;
+    };
+    let budgets = h.app.budgets.clone();
+    let key = format!("b:{}:rotate:n:b", h.application);
+    let charge = |delta: i64| Charge {
+        key: key.clone(),
+        max: 100,
+        ttl: 1,
+        delta,
+        budget_id: "b".into(),
+    };
+
+    // ---- the same window: a refund of our own charge applies, and the counter
+    // comes back to where it started. A denial charges nothing, still.
+    let a = budgets.charge(&[charge(8)]).await.expect("charge");
+    assert_eq!(a.applied, vec![true]);
+    assert_eq!(a.post, vec![Some(8)], "the value our charge left");
+    budgets.refund(&a.refunds(&[charge(8)])).await;
+    assert_eq!(h.counter(&key).await, 0, "the same window takes it back");
+
+    // ---- a rotated window: charge, let the one-second row expire, let another
+    // worker found the next window, and only then refund.
+    let a = budgets.charge(&[charge(8)]).await.expect("charge");
+    assert_eq!(a.applied, vec![true]);
+    let refunds: Vec<Refund> = a.refunds(&[charge(8)]);
+    assert_eq!(refunds.len(), 1);
+
+    tokio::time::sleep(Duration::from_millis(1400)).await;
+    let b = budgets.charge(&[charge(20)]).await.expect("charge");
+    assert_eq!(b.applied, vec![true], "a fresh window admits");
+    assert_eq!(
+        h.counter(&key).await,
+        20,
+        "the new window holds only the new charge"
+    );
+
+    budgets.refund(&refunds).await;
+    assert_eq!(
+        h.counter(&key).await,
+        20,
+        "the refund of a charge from the PREVIOUS window must be refused: crediting it here \
+         would let this window admit cap + 8"
+    );
+
+    let _ = budgets.clear(&[key]).await;
+}
+
 /// A KV route that refuses is NOT a refusal.
 ///
 /// Reading a failed charge as a refusal would park the graph; reading it as an

@@ -141,6 +141,18 @@ pub struct Stage {
     /// Whether this stage shares its source queue with another path's group, and
     /// therefore has to recognise and settle messages that are not its own.
     pub check_foreign: bool,
+    /// Whether an UNSTAMPED message on this stage's source belongs to it.
+    ///
+    /// A payload that is not a JSON object cannot carry `_gate` (see
+    /// `relay::stamp`), so on a shared interior queue there is nothing to read
+    /// ownership off. Reading "unstamped" as "mine" in every group made every
+    /// path forward the same message, under distinct derived ids that dedup
+    /// cannot collapse — a limiter multiplying a message by the number of
+    /// converging paths. So exactly ONE stage per shared source owns the
+    /// unstamped ones and the rest settle them as foreign, which is the same
+    /// machinery and costs nothing new. Always true where the source is read by
+    /// one stage.
+    pub owns_unstamped: bool,
     pub batch: u32,
     pub concurrency: u32,
     pub destinations: Vec<Destination>,
@@ -471,7 +483,8 @@ pub fn compile_with(doc: &GraphDoc, opts: &PlanOpts) -> Plan {
                     source,
                     group: stage_group(app, graph, &p.name, node_name),
                     first_hop: i == 0,
-                    check_foreign: false, // filled below
+                    check_foreign: false,  // filled below
+                    owns_unstamped: false, // filled below
                     batch: fitting_batch(np, share, declared_batch),
                     concurrency: node_doc
                         .and_then(|n| n.concurrency)
@@ -508,8 +521,16 @@ pub fn compile_with(doc: &GraphDoc, opts: &PlanOpts) -> Plan {
         .map(|(k, v)| (k.to_string(), v))
         .collect();
 
+    // One owner per source for the messages nobody stamped. Deterministic and
+    // decided here, so the relay reads a bool: the FIRST stage in plan order
+    // that reads a queue owns them, and every other reader of that queue settles
+    // them as foreign. Stages are built in path order then hop order, and
+    // `doc.paths` is a list, so this is stable across replicas compiling the
+    // same document.
+    let mut claimed: HashSet<String> = HashSet::new();
     for s in &mut stages {
         s.check_foreign = !s.first_hop && readers.get(&s.source).copied().unwrap_or(1) > 1;
+        s.owns_unstamped = claimed.insert(s.source.clone());
         let fanout = s.destinations.len() > 1;
         for d in &mut s.destinations {
             d.derive_id = fanout || converging.get(&d.queue).copied().unwrap_or(1) > 1;

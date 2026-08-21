@@ -56,6 +56,18 @@ pub struct StageCounters {
     /// Cost units admitted, so the console can divide by `admitted` and get the
     /// measured weight of an item.
     pub cost: AtomicU64,
+    /// Charges that MAY have been spent with nothing left that knows it: a kv
+    /// call that failed after the broker had already committed it — a read
+    /// timeout, a dropped connection, a proxy 502.
+    ///
+    /// It cannot be compensated. A blind refund is unsound for the same reason
+    /// `min: 0` was (see `budget::Budgets::refund`): `incr(-D)` cannot tell our
+    /// own charge from another worker's traffic, so giving it back on a guess
+    /// would hand out budget in the case where the call never landed. What is
+    /// available is to COUNT it, so a broker that is dropping responses shows up
+    /// as a number rather than as a limiter that quietly admits less than it
+    /// should.
+    pub leaked: AtomicU64,
 }
 
 impl StageCounters {
@@ -74,6 +86,7 @@ impl StageCounters {
             "duplicates": g(&self.duplicates),
             "foreign": g(&self.foreign),
             "deadlettered": g(&self.deadlettered),
+            "leaked": g(&self.leaked),
             "costAdmitted": g(&self.cost),
             // The ratio, computed here so nobody has to remember which two
             // numbers explain a stage's throughput.

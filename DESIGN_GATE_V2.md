@@ -73,7 +73,7 @@ do re-check them if the broker minor version moves.
 |---|---|---|
 | `kv.incr` with `max` does **not saturate and does not truncate**. The call that would break the ceiling does not apply and returns the **current** value. `applied` **is** the admission decision. | `server/sql/procedures/024_kv.sql`, `WHEN 'incr'` | The whole limiter. One round trip, no CAS loop, no read-then-write race. |
 | `incr`'s TTL is **create-only**: a live row keeps its expiry, an expired row reads as zero and the next incr recreates it with a fresh TTL. | same, the `expires_at = CASE WHEN kv_live_v1(...)` arms | Window rotation is automatic and costs nothing. No window index in the key, no sweeper, no `% 4` recycling. |
-| `min` is a **guard, not a clamp**. `incr(-7, {min: 0})` against a current value of 5 is **refused entirely**, not clamped to 0. | same | Exactly the refund semantics we want: a refund that arrives after the window rotated is refused rather than handing out free budget. §6.3. |
+| `min` is a **guard, not a clamp**. `incr(-7, {min: 0})` against a current value of 5 is **refused entirely**, not clamped to 0. | same | Half of the refund semantics we want. It is a guard on the **resulting value**, not on the identity of the window, so a refund into a REAPED key refuses and a refund into a RECREATED one applies — which is why a refund carries `min == max == was - delta` instead. §6.3. |
 | A **refused** `incr` result carries `applied`, `reason`, `key`, `value`, `version` — and **no `expiresAt`**. | same, the `ELSE v_res := jsonb_build_object(...)` arm | The wait deadline needs a separate read. We ride it in the same batch as a `getMany`. §6.2. |
 | `getMany` rows carry `expiresAt`. | `crates/queen-protocol/src/kv.rs`, `KvRow` | One round trip serves both the decision and the deadline. |
 | KV expiry is **whole seconds**, minimum 1, and `Until(deadline)` is converted to integer `ttlSeconds` at send time. | `crates/queen-protocol/src/kv.rs`, `Expiry` | **A window shorter than one second is not expressible as a TTL.** §5.3 and §11 rule `budget-window-floor`. |
@@ -605,12 +605,28 @@ DB round trips per 200 messages.
 If any `incr` refused:
 
 1. **Refund the ones that applied**, in the same `kv.batch` as step 3 where possible:
-   `incr(key, -total_delta, {min: 0})`. `min: 0` is a **guard, not a clamp** (§2): if the
-   window rotated between the charge and the refund, the refund is refused wholesale, which
-   is correct — refunding into a fresh window would hand out free budget. A refused refund is
-   logged at WARN with the key and the delta and is otherwise dropped: it is at most one
-   sub-window's over-count on one key, bounded and self-healing, and the alternative (a retry
-   loop against a rotating window) is unbounded.
+   `incr(key, -total_delta, {min: was - delta, max: was - delta})`, where `was` is the value
+   that charge's own `incr` returned.
+
+   **`min: 0` alone is not enough, and the reason is in the procedure.** `min` is a guard and
+   not a clamp (§2), but it is a guard on the *resulting value*, not on the identity of the
+   window: `024_kv.sql`'s UPDATE branch tests
+   `kv_num_v1(k.value, k.expires_at, v_now) + v_delta >= v_min`. It therefore refuses a refund
+   into a key that has been REAPED — the create branch is gated by the pure `delta >= min`
+   comparison and `-D >= 0` is false — and **applies** one into a key another worker has just
+   RECREATED. Sub-windows are a second wide by default and this path fires exactly when the
+   counter is contended, which is exactly when the row is recreated at once, so a batch that
+   straddled a rotation handed its whole delta to the next window, which then admitted
+   `cap + D`. That is the same over-admission class as v1's measured 7131-against-5000,
+   arriving by a different route.
+
+   So the identity travels in the value guard: **apply only if this counter still reads
+   exactly what my charge left on it.** A rotation, another worker's charge and another
+   worker's refund all refuse, which is the safe direction; `was - delta` is never negative,
+   so the `min: 0` property survives as a consequence. A refused refund is logged at WARN with
+   the key and the delta and is otherwise dropped: it is at most one sub-window's over-count on
+   one key, bounded and self-healing, and the alternative (a retry loop against a rotating
+   window) is unbounded.
 
 2. **Compute the prefix.** For every key, `remaining = max - current`, where `current` comes
    from the `getMany` in §6.2 (and from the refused `incr`'s own `value`, which is the same
@@ -667,9 +683,15 @@ txn.commit().await
 * **Budget charged before the transaction, not inside it.** `applied` *is* the decision, so
   it must be known before the transaction is built. The residual hazard is real and bounded:
   if the KV charge commits and the relay transaction then fails, budget was spent and nothing
-  moved. The handler **refunds on transaction failure** (`incr(-delta, {min: 0})`, same guard,
-  same WARN-and-drop on a rotated window) before returning without acking. That closes it to
-  the width of one crashed process between two calls.
+  moved. The handler **refunds on transaction failure** (`incr(-delta)` guarded on the value
+  the charge left, same WARN-and-drop when the counter has moved) before returning without
+  acking.
+
+  Two residues stay open and are counted rather than claimed closed. A process that dies
+  between the two calls loses the refund. And a KV call the broker **committed** whose answer
+  was then lost — a read timeout, a dropped connection, a proxy 502 — has spent the budget
+  with nothing left that knows about it; a blind compensating refund is unsound for the same
+  reason `min: 0` is (§6.3), so the stage counts it as `leaked` instead.
 
   We deliberately do **not** ride the `incr` inside the transaction with
   `TransactionBuilder::kv`, though the wire supports it: the decision would then be known

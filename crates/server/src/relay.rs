@@ -51,7 +51,7 @@ use serde_json::{json, Value};
 use gate_core::plan::{NodePlan, Stage};
 use gate_core::{cost_of, op_matches, op_of, scope_value, GATE_META};
 
-use crate::budget::{Budgets, Charge};
+use crate::budget::{Budgets, Charge, Ledger};
 use crate::knobs::knobs;
 use crate::obs::{StageCounters, Trace, Traces};
 
@@ -219,7 +219,7 @@ async fn handle(ctx: &Ctx, msgs: Vec<Message>) {
             // §6.7. Three groups read `ip.in` in the flagship graph and each sees
             // every message; only the one whose `_gate.path` matches forwards it.
             // The others must SETTLE it or their cursor never advances.
-            if st.stage.check_foreign && !owns(&st.stage.path, &m.data) {
+            if st.stage.check_foreign && !owns(&st.stage, &m.data) {
                 return Kind::Foreign;
             }
             match cost_of(&st.node.cost, &m.data) {
@@ -279,7 +279,7 @@ async fn admit(ctx: &Ctx, window: &[Message], kinds: &[Kind]) {
 
     // Nothing of ours in this claim: settle the whole thing and move on.
     if work.is_empty() {
-        settle(ctx, window, kinds, 0).await;
+        settle(ctx, window, kinds, 0, &Ledger::default()).await;
         return;
     }
 
@@ -289,7 +289,7 @@ async fn admit(ctx: &Ctx, window: &[Message], kinds: &[Kind]) {
     // `whenOp` that takes none of these ops. Nothing to ask, so nothing to wait
     // for.
     if grouped.keys.is_empty() {
-        settle(ctx, window, kinds, work.len()).await;
+        settle(ctx, window, kinds, work.len(), &Ledger::default()).await;
         return;
     }
 
@@ -302,18 +302,29 @@ async fn admit(ctx: &Ctx, window: &[Message], kinds: &[Kind]) {
             // park the graph; reading it as an admission would breach the
             // ceiling. Neither is available, so the batch simply does not
             // happen: return without acking and let the lease redeliver.
+            //
+            // "Does not happen" is true of a call that failed BEFORE it
+            // committed, and only of that one. A call the broker committed and
+            // whose answer was then lost — a read timeout, a dropped
+            // connection, a proxy 502 — has spent the budget with nothing left
+            // that knows about it, and the redelivered batch charges it again.
+            // That cannot be compensated safely (see `budget::Budgets::refund`),
+            // so it is counted instead.
             Err(e) => {
                 tracing::warn!(
                     stage = %st.key(), error = %e,
-                    "the budget call failed; the batch will be redelivered"
+                    "the budget call failed; the batch will be redelivered. If the call had \
+                     already committed, its charge is spent and nothing here can give it back"
                 );
                 st.counters.released.fetch_add(1, Ordering::Relaxed);
+                st.counters.leaked.fetch_add(1, Ordering::Relaxed);
                 return;
             }
         };
 
         if attempt.all_applied() {
-            settle(ctx, window, kinds, work.len()).await;
+            let ledger = Ledger::of(&charges, &attempt);
+            settle(ctx, window, kinds, work.len(), &ledger).await;
             return;
         }
 
@@ -324,7 +335,7 @@ async fn admit(ctx: &Ctx, window: &[Message], kinds: &[Kind]) {
         // refused — `min: 0`, which is a guard and not a clamp, so a refund
         // arriving after the window rotated is refused rather than handing out
         // free budget.
-        refund_applied(ctx, &charges, &attempt.applied).await;
+        refund_applied(ctx, &charges, &attempt).await;
         note_refusal(ctx, &charges, &attempt);
 
         // ---- §6.3 step 2: the PREFIX that fits.
@@ -340,7 +351,7 @@ async fn admit(ctx: &Ctx, window: &[Message], kinds: &[Kind]) {
             // another path and cost nothing to let go of, and settling them is
             // progress the budget has no say in.
             if settle_end(kinds, 0) > 0 {
-                settle(ctx, window, kinds, 0).await;
+                settle(ctx, window, kinds, 0, &Ledger::default()).await;
                 return;
             }
             match park_or_release(ctx, &charges, &attempt, &mut parked).await {
@@ -350,17 +361,26 @@ async fn admit(ctx: &Ctx, window: &[Message], kinds: &[Kind]) {
         }
 
         st.counters.deferred.fetch_add(1, Ordering::Relaxed);
+        let mut want = n;
         for attempt_no in 0..=k.max_prefix_retries {
-            let prefix = grouped.charges(n);
+            let prefix = grouped.charges(want);
             match ctx.budgets.charge(&prefix).await {
                 Ok(a) if a.all_applied() => {
-                    settle(ctx, window, kinds, n).await;
+                    let ledger = Ledger::of(&prefix, &a);
+                    settle(ctx, window, kinds, want, &ledger).await;
                     return;
                 }
                 Ok(a) => {
                     // Another worker took the headroom between the two calls.
-                    refund_applied(ctx, &prefix, &a.applied).await;
-                    if attempt_no == k.max_prefix_retries {
+                    refund_applied(ctx, &prefix, &a).await;
+                    // §6.3 step 3: RECOMPUTE from the newly reported values.
+                    // This retry exists precisely because somebody else took the
+                    // headroom, so re-asking for the identical amount is
+                    // near-certain to refuse again — and each burnt attempt is
+                    // another charge/refund pair on a contended counter. Never
+                    // upwards: the full-batch pass already said this much fits.
+                    let next = grouped.prefix(&prefix, &a).min(want);
+                    if next == 0 || attempt_no == k.max_prefix_retries {
                         // Treat it as `n == 0`: an unbounded retry loop against
                         // a contended counter is how a limiter turns into a
                         // spin.
@@ -369,6 +389,7 @@ async fn admit(ctx: &Ctx, window: &[Message], kinds: &[Kind]) {
                             Wait::Release => return,
                         }
                     }
+                    want = next;
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -376,6 +397,7 @@ async fn admit(ctx: &Ctx, window: &[Message], kinds: &[Kind]) {
                         "the prefix charge failed; the batch will be redelivered"
                     );
                     st.counters.released.fetch_add(1, Ordering::Relaxed);
+                    st.counters.leaked.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
             }
@@ -383,13 +405,8 @@ async fn admit(ctx: &Ctx, window: &[Message], kinds: &[Kind]) {
     }
 }
 
-async fn refund_applied(ctx: &Ctx, charges: &[Charge], applied: &[bool]) {
-    let give_back: Vec<Charge> = charges
-        .iter()
-        .zip(applied.iter())
-        .filter(|(_, ok)| **ok)
-        .map(|(c, _)| c.clone())
-        .collect();
+async fn refund_applied(ctx: &Ctx, charges: &[Charge], attempt: &crate::budget::Attempt) {
+    let give_back = attempt.refunds(charges);
     if !give_back.is_empty() {
         ctx.budgets.refund(&give_back).await;
     }
@@ -669,9 +686,11 @@ fn group(st: &StageRuntime, msgs: &[Message]) -> Grouped {
 /// `incr` ride inside via `TransactionBuilder::kv`, and that is deliberately not
 /// done — the decision would then be known only after the pushes were already
 /// staged, which is the read-then-write shape `incr` exists to remove.) The
-/// residual hazard is real and bounded, and it is closed below: if the charge
-/// commits and the transaction then fails, the charge is refunded.
-async fn settle(ctx: &Ctx, window: &[Message], kinds: &[Kind], admitted: usize) {
+/// residual hazard is real and bounded, and it is NARROWED below rather than
+/// closed: if the charge commits and the transaction then fails, the charge is
+/// refunded — but a charge whose call the broker committed and whose answer was
+/// lost is spent with nothing left that knows it, and is counted as `leaked`.
+async fn settle(ctx: &Ctx, window: &[Message], kinds: &[Kind], admitted: usize, ledger: &Ledger) {
     let st = &ctx.st;
     let end = settle_end(kinds, admitted);
     if end == 0 {
@@ -703,7 +722,7 @@ async fn settle(ctx: &Ctx, window: &[Message], kinds: &[Kind], admitted: usize) 
                 stage = %st.key(), partition = %prefix[0].partition,
                 "an item was already forwarded; halving the claim to find a prefix that commits"
             );
-            settle_after_dup(ctx, prefix, kinds, admitted, &charged).await;
+            settle_after_dup(ctx, prefix, kinds, admitted, &charged, ledger).await;
         }
         // Nothing was settled and nothing was pushed, but the budget WAS spent.
         // Give it back before returning, or a broker that refuses transactions
@@ -713,7 +732,7 @@ async fn settle(ctx: &Ctx, window: &[Message], kinds: &[Kind], admitted: usize) 
                 stage = %st.key(), error = %why,
                 "the relay transaction did not commit; refunding and letting the lease lapse"
             );
-            refund_for(ctx, &charged).await;
+            refund_for(ctx, &charged, ledger).await;
             st.counters.released.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -743,6 +762,7 @@ async fn settle_after_dup(
     kinds: &[Kind],
     admitted: usize,
     charged: &[Message],
+    ledger: &Ledger,
 ) {
     let mut want = admitted / 2;
     loop {
@@ -754,7 +774,7 @@ async fn settle_after_dup(
             Settled::Committed => {
                 // Everything this transaction did NOT carry gives its charge
                 // back; the rest of the claim comes back when the lease lapses.
-                refund_for(ctx, &charged[want.min(charged.len())..]).await;
+                refund_for(ctx, &charged[want.min(charged.len())..], ledger).await;
                 return;
             }
             Settled::Duplicate => want /= 2,
@@ -762,14 +782,19 @@ async fn settle_after_dup(
             // the whole charge back and let the lease lapse.
             Settled::Failed(why) => {
                 tracing::warn!(stage = %ctx.st.key(), error = %why, "the halved settle did not commit");
-                refund_for(ctx, charged).await;
+                refund_for(ctx, charged, ledger).await;
                 return;
             }
         }
     }
-    // Down to one item, and it is the one that is already downstream.
-    settle_head(ctx, &prefix[0], &kinds[0]).await;
-    refund_for(ctx, charged).await;
+    // Down to one item, and the loop bottomed out before establishing that it is
+    // the duplicate — so `settle_head` may genuinely FORWARD it. What is
+    // refunded is what did not go downstream, which is everything behind the
+    // head: refunding the head as well would give back a window an item is
+    // spending at the vendor right now.
+    let forwarded = settle_head(ctx, &prefix[0], &kinds[0]).await;
+    let keep = if forwarded { 1 } else { 0 };
+    refund_for(ctx, &charged[keep.min(charged.len())..], ledger).await;
 }
 
 /// What one settle attempt did.
@@ -794,8 +819,9 @@ enum Settled {
 /// `incr` ride inside via `TransactionBuilder::kv`, and that is deliberately not
 /// done — the decision would then be known only after the pushes were already
 /// staged, which is the read-then-write shape `incr` exists to remove.) The
-/// residual hazard is real and bounded, and the caller closes it: a charge whose
-/// transaction then fails is refunded.
+/// residual hazard is real and bounded, and the caller narrows it: a charge
+/// whose transaction then fails is refunded, guarded on the value that charge
+/// left behind.
 async fn stage_and_commit(
     ctx: &Ctx,
     prefix: &[Message],
@@ -865,12 +891,15 @@ fn push_for(st: &StageRuntime, m: &Message, dest: &gate_core::Destination) -> Tx
 }
 
 /// The last resort: settle exactly the head of the claim.
-async fn settle_head(ctx: &Ctx, m: &Message, kind: &Kind) {
+///
+/// Returns whether the head was FORWARDED, which is the difference between a
+/// charge that has been spent at the vendor and one that has to go back.
+async fn settle_head(ctx: &Ctx, m: &Message, kind: &Kind) -> bool {
     let st = &ctx.st;
     if !matches!(kind, Kind::Work) {
         let _ = ctx.queen.transaction().ack(m).commit().await;
         st.counters.foreign.fetch_add(1, Ordering::Relaxed);
-        return;
+        return false;
     }
 
     let mut tx = Some(ctx.queen.transaction().ack(m));
@@ -890,13 +919,14 @@ async fn settle_head(ctx: &Ctx, m: &Message, kind: &Kind) {
             .commit()
             .await;
         st.counters.deadlettered.fetch_add(1, Ordering::Relaxed);
-        return;
+        return false;
     };
     match tx.commit().await {
         Ok(_) => {
             st.counters.forwarded.fetch_add(1, Ordering::Relaxed);
             st.counters.admitted.fetch_add(1, Ordering::Relaxed);
             st.counters.commits.fetch_add(1, Ordering::Relaxed);
+            true
         }
         // Already downstream: settle it and move on. It does NOT count as
         // forwarded — it is not arriving at the destination a second time, so it
@@ -909,23 +939,35 @@ async fn settle_head(ctx: &Ctx, m: &Message, kind: &Kind) {
                      the claim will come back to the same place"
                 );
             }
+            false
         }
         // Leave it alone: its lease lapses and it comes back.
-        Err(e) => tracing::warn!(
-            stage = %st.key(), error = %e,
-            "could not settle the head of the claim; its lease will lapse"
-        ),
+        Err(e) => {
+            tracing::warn!(
+                stage = %st.key(), error = %e,
+                "could not settle the head of the claim; its lease will lapse"
+            );
+            false
+        }
     }
 }
 
 /// Give back what these messages were charged, after a transaction that did not
 /// commit.
-async fn refund_for(ctx: &Ctx, msgs: &[Message]) {
+///
+/// The charges are recomputed from the messages, so the value each counter was
+/// left at travels separately in `ledger` — a refund that cannot prove which
+/// window it is giving back to is dropped rather than guessed at.
+async fn refund_for(ctx: &Ctx, msgs: &[Message], ledger: &Ledger) {
+    if msgs.is_empty() || ledger.is_empty() {
+        return;
+    }
     let work: Vec<Message> = msgs.to_vec();
     let grouped = group(&ctx.st, &work);
     let charges = grouped.charges(work.len());
-    if !charges.is_empty() {
-        ctx.budgets.refund(&charges).await;
+    let refunds = ledger.refunds(&charges);
+    if !refunds.is_empty() {
+        ctx.budgets.refund(&refunds).await;
     }
 }
 
@@ -961,19 +1003,24 @@ pub fn stamp(data: &Value, st: &StageRuntime, dest_node: &str) -> Value {
     out
 }
 
-/// Whether this path owns a message on a shared interior queue.
+/// Whether this stage owns a message on a shared interior queue.
 ///
-/// An UNSTAMPED message belongs to whoever finds it: it was pushed by something
-/// that is not a Gate relay, and refusing to forward it would leave it on the
-/// queue for ever with every group skipping it.
-fn owns(path: &str, data: &Value) -> bool {
+/// An UNSTAMPED message belongs to the stage the compiler named as its owner
+/// (`Stage::owns_unstamped`) and to no other. It cannot be left for whoever
+/// finds it: a payload that is not a JSON object carries no stamp, every group
+/// then reads it as its own, and because a converging queue derives its
+/// transaction ids per path the copies do not dedup — one message becomes one
+/// per path, each charged. Nor can every group skip it: with no owner it would
+/// sit on the queue for ever. So exactly one forwards it and the rest ack it,
+/// which is what they already do for a message stamped with another path.
+fn owns(stage: &Stage, data: &Value) -> bool {
     match data
         .get(GATE_META)
         .and_then(|g| g.get("path"))
         .and_then(|p| p.as_str())
     {
-        Some(p) => p == path,
-        None => true,
+        Some(p) => p == stage.path,
+        None => stage.owns_unstamped,
     }
 }
 
@@ -1047,6 +1094,7 @@ mod tests {
                 group: "grp".into(),
                 first_hop: true,
                 check_foreign: false,
+                owns_unstamped: true,
                 batch: 200,
                 concurrency: 4,
                 destinations: vec![],
@@ -1117,6 +1165,7 @@ mod tests {
         // The counter already holds 2 of its 10, and our own 18 did not apply.
         let attempt = crate::budget::Attempt {
             applied: vec![false],
+            post: vec![None],
             states: vec![crate::budget::State {
                 key: charges[0].key.clone(),
                 value: 2,
@@ -1147,6 +1196,7 @@ mod tests {
         // `a` applied (4 of 10, so the row now reads 4); `b` refused at 4 of 4.
         let attempt = crate::budget::Attempt {
             applied: vec![true, false],
+            post: vec![Some(4), None],
             states: vec![
                 crate::budget::State {
                     key: charges[0].key.clone(),
@@ -1206,13 +1256,43 @@ mod tests {
         assert_eq!(l1.delta, 2);
     }
 
-    /// An unstamped message belongs to whoever finds it. Refusing to forward it
-    /// would leave it on the queue for ever with every group skipping it.
+    fn stage_named(path: &str, owns_unstamped: bool) -> Stage {
+        let mut s = runtime(vec![budget("b", 10)], 1.0).stage;
+        s.path = path.into();
+        s.check_foreign = true;
+        s.owns_unstamped = owns_unstamped;
+        s
+    }
+
+    /// A stamped message belongs to the path it names.
     #[test]
     fn ownership_of_a_shared_interior_queue_reads_the_stamp() {
-        assert!(owns("prices", &json!({})));
-        assert!(owns("prices", &json!({ "_gate": { "path": "prices" } })));
-        assert!(!owns("prices", &json!({ "_gate": { "path": "photos" } })));
+        let prices = stage_named("prices", true);
+        assert!(owns(&prices, &json!({ "_gate": { "path": "prices" } })));
+        assert!(!owns(&prices, &json!({ "_gate": { "path": "photos" } })));
+    }
+
+    /// An UNSTAMPED message — a payload that is not an object cannot carry the
+    /// stamp — belongs to exactly ONE reader of the queue.
+    ///
+    /// Read as "mine" by every group, one message became one per converging
+    /// path, each with its own derived id so dedup could not collapse them, and
+    /// each charged: a limiter multiplying the traffic it exists to cap. Read as
+    /// "nobody's" by every group, it would sit on the queue for ever.
+    #[test]
+    fn an_unstamped_message_has_exactly_one_owner() {
+        let owner = stage_named("prices", true);
+        let other = stage_named("photos", false);
+        let scalar = json!("a bare string, which cannot carry _gate");
+
+        assert!(owns(&owner, &scalar));
+        assert!(!owns(&other, &scalar));
+        assert!(owns(&owner, &json!([1, 2, 3])));
+        assert!(!owns(&other, &json!([1, 2, 3])));
+        // And an object a non-Gate producer wrote into an interior queue reads
+        // the same way.
+        assert!(owns(&owner, &json!({})));
+        assert!(!owns(&other, &json!({})));
     }
 
     #[test]

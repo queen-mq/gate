@@ -83,7 +83,15 @@ pub async fn trip(
 ) -> queen_mq::Result<Value> {
     let seconds = body.retry_after_seconds.clamp(MIN_SECONDS, MAX_SECONDS);
 
-    let keys: Vec<String> = node.unscoped().map(|b| b.key.clone()).collect();
+    // DEDUPLICATED, and it is not tidiness. Two budgets on one node may legally
+    // compile to the same key — `shared-conflict` only fires when their `count`,
+    // `time_ms` or `sub_windows` differ, so two budgets carrying the same
+    // `sharedKey` with identical parameters validate clean and map to one row.
+    // The broker refuses a call that writes one key twice
+    // (`024_kv.sql`, `kv_duplicate_key_in_call`, described there as load-bearing
+    // for the intra-space lock order), so without this the whole `trip` returns
+    // an error and the node KEEPS ADMITTING after a vendor has said 429.
+    let keys: Vec<String> = unique_keys(node);
     if keys.is_empty() {
         // `node-unscoped-budget` refuses this at declare time; a document stored
         // by an older build could still carry it.
@@ -98,8 +106,12 @@ pub async fn trip(
     }
 
     if let Some(refund) = body.refund_cost.filter(|c| *c > 0) {
-        let charges: Vec<crate::budget::Charge> = node
-            .unscoped()
+        // A CREDIT and not a refund: there is no charge of ours to identify, so
+        // there is no window to prove and `min: 0` is the only available guard.
+        // It is safe here and nowhere else, because the spend below overwrites
+        // whatever this credited a few microseconds later.
+        let charges: Vec<crate::budget::Charge> = first_by_key(node)
+            .into_iter()
             .map(|b| crate::budget::Charge {
                 key: b.key.clone(),
                 max: b.max_for(node.widest_share()),
@@ -108,14 +120,14 @@ pub async fn trip(
                 budget_id: b.id.clone(),
             })
             .collect();
-        budgets.refund(&charges).await;
+        budgets.credit(&charges).await;
     }
 
     // The WIDEST path's ceiling, so no path can slip under it: a path at
     // share 0.5 refuses itself at half the counter, and writing half would leave
     // it admitting.
-    let spend: Vec<(String, i64)> = node
-        .unscoped()
+    let spend: Vec<(String, i64)> = first_by_key(node)
+        .into_iter()
         .map(|b| (b.key.clone(), b.max_for(node.widest_share())))
         .collect();
     budgets.spend(&spend, seconds).await?;
@@ -160,11 +172,37 @@ pub async fn trip(
 /// recreates the row with a FRESH window, where a zero would keep whatever
 /// expiry the breaker wrote and rotate at the wrong moment.
 pub async fn reset(budgets: &Budgets, node: &NodePlan) -> queen_mq::Result<Value> {
-    let mut keys: Vec<String> = node.unscoped().map(|b| b.key.clone()).collect();
+    // Deduplicated for the same reason as `trip`: one key twice in one call is
+    // `kv_duplicate_key_in_call`, and a reset that errors leaves the node held.
+    let mut keys: Vec<String> = unique_keys(node);
     keys.push(node.breaker_key.clone());
     budgets.clear(&keys).await?;
     tracing::info!(node = %node.name, "breaker reset");
     Ok(json!({ "ok": true, "node": node.name, "cleared": keys }))
+}
+
+/// The unscoped budgets of a node, one per distinct kv key.
+///
+/// Two budgets can share a key (the same `sharedKey`, same parameters), and one
+/// key is one counter: it is spent once, credited once and cleared once.
+fn first_by_key(node: &NodePlan) -> Vec<&gate_core::CompiledBudget> {
+    let mut seen: Vec<&str> = Vec::new();
+    let mut out: Vec<&gate_core::CompiledBudget> = Vec::new();
+    for b in node.unscoped() {
+        if seen.contains(&b.key.as_str()) {
+            continue;
+        }
+        seen.push(b.key.as_str());
+        out.push(b);
+    }
+    out
+}
+
+fn unique_keys(node: &NodePlan) -> Vec<String> {
+    first_by_key(node)
+        .into_iter()
+        .map(|b| b.key.clone())
+        .collect()
 }
 
 /// Every breaker currently holding a node, fleet-wide.
