@@ -7,7 +7,15 @@ version = "0.1.6"
 
 
 edition = "2021"
-rust-version = "1.86"
+# 1.86 was declared and was never true: `reqwest` reaches `url` -> `idna` ->
+# `icu_*`, and those need 1.88, as does `time`. Nothing noticed, because nothing
+# checked — there was no CI job on the declared version. There is one now
+# (`.github/workflows/test.yml`, the MSRV step), and this is what it found.
+#
+# Pinning the whole transitive graph back was tried and is worse than the claim:
+# it means holding a dozen crates at old versions to support a compiler nobody
+# in this project is using.
+rust-version = "1.88"
 license = "Apache-2.0"
 
 [workspace.dependencies]

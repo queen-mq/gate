@@ -119,8 +119,9 @@ jobs:
     # build it.
     - name: MSRV
       run: |
-        rustup toolchain install 1.86 --profile minimal
-        cargo +1.86 check --workspace --all-targets
+        msrv=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
+        rustup toolchain install "$msrv" --profile minimal
+        cargo "+$msrv" check --workspace --all-targets
 
     - name: Release build
       run: cargo build --release --workspace
