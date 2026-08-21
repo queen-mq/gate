@@ -653,10 +653,11 @@ async fn idle(g: &Arc<Gate>, cfg: &Cfg) -> Result<(), String> {
          broker nothing else is using, or read pg_stat_statements instead."
     );
     println!(
-        "   Expected shape: one re-park per stage per poll timeout ({}s), so roughly {:.0} an\n   \
-         hour for seven stages — plus one reconcile pass every GATE_RECONCILE_SECONDS.",
-        30,
-        7.0 * 3600.0 / 30.0
+        "   Expected shape: one re-park per WORKER per poll timeout, so\n     \
+         stages x concurrency / poll_timeout pops a second — {:.0} an hour for seven stages of\n     \
+         sixteen workers on a 30s window — plus one reconcile pass every\n     \
+         GATE_RECONCILE_SECONDS. Nothing else: no depth probe, no state read, no meter tick.",
+        7.0 * 16.0 * 3600.0 / 30.0
     );
 
     g.drop_graph(&name).await;

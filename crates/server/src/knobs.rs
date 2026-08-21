@@ -26,6 +26,24 @@ pub struct Knobs {
     /// parking** and is woken by the push notifier (`server/src/handlers/data.rs`
     /// §10). The ceiling on it is shutdown latency, and the supervisor waits
     /// this plus two seconds for a stage to stop.
+    ///
+    /// # This, times the worker count, IS the idle cost
+    ///
+    /// A parked poll that times out re-issues its pop, so an idle graph costs
+    ///
+    /// ```text
+    ///     stages × concurrency ÷ poll_timeout   pops per second
+    /// ```
+    ///
+    /// and nothing else — no depth probe, no state read, no meter tick. For the
+    /// flagship seven-stage graph at the derived default of sixteen workers that
+    /// is 112 parked polls, or **~13,400 pops an hour**: twenty times less than
+    /// the ~275,000 "is there work?" calls v1 was measured making in prod, and
+    /// not the zero the design's acceptance criterion asks for. Both knobs move
+    /// it and both cost something: `GATE_POLL_TIMEOUT_SECONDS` is paid in
+    /// shutdown latency (the pop does not notice a cancel until it returns), and
+    /// `GATE_STAGE_CONCURRENCY` is paid in how many partitions a stage can drain
+    /// at once. `gate-bench idle` measures the number rather than asserting it.
     pub poll_timeout: Duration,
     /// How often a held claim is renewed while the handler is parked in-line.
     pub renew_lease: Duration,
