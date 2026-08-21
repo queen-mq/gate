@@ -176,10 +176,21 @@ struct Ctx {
 //    it. So what gets settled is a true PREFIX of the claimed batch in offset
 //    order, foreign messages included — never a subset.
 //
-// The bright side of (1): because the ack releases the lease, the tail of a
-// partly-admitted batch is immediately re-claimable. It does not wait out a
-// 30-second work lease; it comes back on the next poll, in order, and is charged
-// again when the window has rotated.
+// And one more, measured against the broker and asserted by
+// `an_ack_settles_the_whole_claim_or_pays_a_lease` in the live suite:
+//
+// 3. Settling a claim IN FULL re-arms its partition in about **seven
+//    milliseconds**. Settling a PREFIX of one leaves it parked until the lease
+//    expires — measured at exactly the lease, whatever the cursor says is
+//    pending. (A nack re-arms it in about four milliseconds, and is not
+//    available for pacing: it charges the retry budget and would dead-letter
+//    work that is merely waiting.)
+//
+// So the happy path costs nothing and the deferral path costs one lease, which
+// is why two things are the way they are: `plan::fitting_batch` sizes a claim to
+// what one sub-window admits, so the deferral is rare, and
+// `GATE_LEASE_SECONDS` is ten rather than thirty, so it is cheap when it
+// happens.
 
 /// What one claimed message is, decided once, in order.
 enum Kind {
@@ -648,67 +659,157 @@ async fn settle(ctx: &Ctx, window: &[Message], kinds: &[Kind], admitted: usize) 
     }
     let prefix = &window[..end];
     let kinds = &kinds[..end];
+    // Exactly what the charge above paid for, and therefore exactly what a
+    // failure has to give back. The foreign ones were never charged and must not
+    // be refunded, or a rolled-back batch would hand out free budget.
+    let charged: Vec<Message> = prefix
+        .iter()
+        .zip(kinds)
+        .filter(|(_, k)| matches!(k, Kind::Work))
+        .map(|(m, _)| m.clone())
+        .take(admitted)
+        .collect();
 
+    match stage_and_commit(ctx, prefix, kinds, admitted).await {
+        Settled::Committed => {}
+        // A duplicate transaction id is a soft verdict for a plain push and a
+        // HARD one inside a transaction: it rolls the whole bundle back
+        // (`005_log_ack.sql`). Left alone that is a partition stalled for ever —
+        // the batch comes back, the same push is refused, nothing is ever
+        // settled.
+        Settled::Duplicate => {
+            st.counters.duplicates.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                stage = %st.key(), partition = %prefix[0].partition,
+                "an item was already forwarded; halving the claim to find a prefix that commits"
+            );
+            settle_after_dup(ctx, prefix, kinds, admitted, &charged).await;
+        }
+        // Nothing was settled and nothing was pushed, but the budget WAS spent.
+        // Give it back before returning, or a broker that refuses transactions
+        // for a minute silently eats a minute of ceiling.
+        Settled::Failed(why) => {
+            tracing::warn!(
+                stage = %st.key(), error = %why,
+                "the relay transaction did not commit; refunding and letting the lease lapse"
+            );
+            refund_for(ctx, &charged).await;
+            st.counters.released.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The QDUP recovery: halve the claim until a prefix commits.
+///
+/// The constraint is that only ONE transaction may commit per claim — but a
+/// transaction that ROLLS BACK costs nothing and leaves the lease intact, so the
+/// recovery may attempt as many as it likes provided at most one succeeds. That
+/// makes the search one-sided: the first success ends the claim, so it walks
+/// DOWN from half the batch rather than binary-searching for the maximum.
+///
+/// The broker's QDUP does not name the offending id — it says only *"duplicate
+/// messages in queue X partition Y"* — so there is nothing to skip to. Halving
+/// settles at least half of the duplicate-free prefix per claim in
+/// `log2(batch)` rolled-back round trips, where settling only the head would
+/// settle one; and the remainder comes back after one lease, which is what
+/// `GATE_LEASE_SECONDS` is short for.
+///
+/// A single item that still refuses is already downstream: it is bare-acked,
+/// counts as settled and not as forwarded, and its charge is given back — it is
+/// not arriving at the destination a second time, so it spends no window.
+async fn settle_after_dup(
+    ctx: &Ctx,
+    prefix: &[Message],
+    kinds: &[Kind],
+    admitted: usize,
+    charged: &[Message],
+) {
+    let mut want = admitted / 2;
+    loop {
+        if want == 0 {
+            break;
+        }
+        let end = settle_end(kinds, want);
+        match stage_and_commit(ctx, &prefix[..end], &kinds[..end], want).await {
+            Settled::Committed => {
+                // Everything this transaction did NOT carry gives its charge
+                // back; the rest of the claim comes back when the lease lapses.
+                refund_for(ctx, &charged[want.min(charged.len())..]).await;
+                return;
+            }
+            Settled::Duplicate => want /= 2,
+            // A failure that is not a duplicate: nothing was settled, so give
+            // the whole charge back and let the lease lapse.
+            Settled::Failed(why) => {
+                tracing::warn!(stage = %ctx.st.key(), error = %why, "the halved settle did not commit");
+                refund_for(ctx, charged).await;
+                return;
+            }
+        }
+    }
+    // Down to one item, and it is the one that is already downstream.
+    settle_head(ctx, &prefix[0], &kinds[0]).await;
+    refund_for(ctx, charged).await;
+}
+
+/// What one settle attempt did.
+enum Settled {
+    Committed,
+    /// Rolled back on a duplicate — so the lease is still ours and another
+    /// attempt is allowed.
+    Duplicate,
+    Failed(String),
+}
+
+/// Build and commit one settle: `ack` the whole prefix, `push` the admitted part
+/// of it, atomically.
+///
+/// Ack-then-push loses the item; push-then-ack duplicates it. The transaction
+/// also carries the lease as a precondition, so a lease that lapsed while the
+/// relay worked rolls the whole thing back instead of forwarding work somebody
+/// else has re-claimed.
+///
+/// The budget is charged BEFORE this, not inside it: `applied` IS the decision,
+/// so it must be known before the transaction is built. (The wire would let the
+/// `incr` ride inside via `TransactionBuilder::kv`, and that is deliberately not
+/// done — the decision would then be known only after the pushes were already
+/// staged, which is the read-then-write shape `incr` exists to remove.) The
+/// residual hazard is real and bounded, and the caller closes it: a charge whose
+/// transaction then fails is refunded.
+async fn stage_and_commit(
+    ctx: &Ctx,
+    prefix: &[Message],
+    kinds: &[Kind],
+    admitted: usize,
+) -> Settled {
+    let st = &ctx.st;
     let mut tx = ctx.queen.transaction();
+    let mut forwarded = 0u64;
     let mut foreign = 0u64;
     let mut cost = 0i64;
-    // The work items this transaction stages, in order — exactly what the
-    // charge above paid for, and therefore exactly what a failure has to give
-    // back. The foreign ones were never charged and must not be refunded, or a
-    // rolled-back batch would hand out free budget.
-    let mut charged: Vec<Message> = Vec::with_capacity(admitted);
-
     for (m, kind) in prefix.iter().zip(kinds) {
         tx = tx.ack(m);
         if !matches!(kind, Kind::Work) {
             foreign += 1;
             continue;
         }
-        if charged.len() >= admitted {
-            // Only inside `settle_end`'s prefix, and only the admitted ones.
-            // Unreachable by construction; kept because "unreachable" and
-            // "cannot happen" are different words.
+        if forwarded as usize >= admitted {
             continue;
         }
-        charged.push(m.clone());
+        forwarded += 1;
         cost += cost_of(&st.node.cost, &m.data).unwrap_or(1);
         for dest in &st.stage.destinations {
-            let item = TxnPushItem {
-                queue: dest.queue.clone(),
-                // PARTITION PASSTHROUGH. Two things fall out of one line: a
-                // producer's partition key survives every hop, so per-connection
-                // ordering is preserved end to end; and the relay's transactions
-                // stay lane-disjoint end to end, so worker A moving `p7` never
-                // contends with worker B moving `p12`, at any hop.
-                partition: Some(m.partition.clone()),
-                payload: stamp(&m.data, st, dest.node.as_str()),
-                transaction_id: Some(if dest.derive_id {
-                    gate_core::derive(&m.transaction_id, &dest.label)
-                } else {
-                    m.transaction_id.clone()
-                }),
-                trace_id: None,
-            };
-            match tx.push_item(item) {
+            match tx.push_item(push_for(st, m, dest)) {
                 Ok(next) => tx = next,
                 // Nothing this loop passes can be refused — the only rejection
                 // is a malformed trace id and there is none. Kept anyway, and
                 // kept as a dropped BATCH rather than a returned task: a relay
                 // that exits on an unexpected error stops the graph for ever,
                 // while abandoning a batch costs one lease.
-                Err(e) => {
-                    tracing::warn!(
-                        stage = %st.key(), error = %e,
-                        "could not stage a push; the batch will be redelivered"
-                    );
-                    refund_for(ctx, &charged).await;
-                    return;
-                }
+                Err(e) => return Settled::Failed(format!("could not stage a push: {e}")),
             }
         }
     }
-
-    let forwarded = charged.len() as u64;
     match tx.commit().await {
         Ok(_) => {
             st.counters
@@ -720,52 +821,30 @@ async fn settle(ctx: &Ctx, window: &[Message], kinds: &[Kind], admitted: usize) 
             st.counters
                 .cost
                 .fetch_add(cost.max(0) as u64, Ordering::Relaxed);
+            Settled::Committed
         }
-        // A duplicate transaction id is a soft verdict for a plain push and a
-        // HARD one inside a transaction: it rolls the whole bundle back
-        // (`005_log_ack.sql`). Left alone that is a partition stalled for ever —
-        // the batch comes back, the same push is refused, nothing is ever
-        // settled.
-        Err(e) if e.to_string().contains("QDUP") => {
-            st.counters.duplicates.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(
-                stage = %st.key(), partition = %prefix[0].partition,
-                "an item was already forwarded; settling the head of the claim on its own"
-            );
-            // The head keeps its charge and everything behind it gives one
-            // back: the head is about to be settled on its own, and if it
-            // forwards it is arriving at the destination for the first time and
-            // must spend a window for that.
-            let keep = usize::from(matches!(kinds[0], Kind::Work));
-            refund_for(ctx, &charged[keep.min(charged.len())..]).await;
-            settle_head(ctx, &prefix[0], &kinds[0]).await;
-        }
-        // Nothing was settled and nothing was pushed, but the budget WAS spent.
-        // Give it back before returning, or a broker that refuses transactions
-        // for a minute silently eats a minute of ceiling.
-        Err(e) => {
-            tracing::warn!(
-                stage = %st.key(), error = %e,
-                "the relay transaction did not commit; refunding and letting the lease lapse"
-            );
-            refund_for(ctx, &charged).await;
-            st.counters.released.fetch_add(1, Ordering::Relaxed);
-        }
+        Err(e) if e.to_string().contains("QDUP") => Settled::Duplicate,
+        Err(e) => Settled::Failed(e.to_string()),
     }
 }
 
-/// The QDUP recovery: settle exactly the HEAD of the claim, on its own.
-///
-/// One item and not the batch, because an ack releases the claim (see the
-/// handler's module note): the second transaction under this lease would answer
-/// `invalid or expired lease` whatever it carried. So the recovery makes one
-/// item of progress per claim — the cursor moves past it and the rest come back
-/// immediately — which is slow and is correct, and QDUP is a lost-response
-/// artefact rather than a steady state.
-///
-/// The head's charge has already been given back by the caller, so an item that
-/// forwards here is charged again: it is arriving at the destination for the
-/// first time, and it must spend a window for that.
+/// One push, with the partition passed through and the transaction id decided at
+/// declare time.
+fn push_for(st: &StageRuntime, m: &Message, dest: &gate_core::Destination) -> TxnPushItem {
+    TxnPushItem {
+        queue: dest.queue.clone(),
+        partition: Some(m.partition.clone()),
+        payload: stamp(&m.data, st, dest.node.as_str()),
+        transaction_id: Some(if dest.derive_id {
+            gate_core::derive(&m.transaction_id, &dest.label)
+        } else {
+            m.transaction_id.clone()
+        }),
+        trace_id: None,
+    }
+}
+
+/// The last resort: settle exactly the head of the claim.
 async fn settle_head(ctx: &Ctx, m: &Message, kind: &Kind) {
     let st = &ctx.st;
     if !matches!(kind, Kind::Work) {
@@ -776,19 +855,8 @@ async fn settle_head(ctx: &Ctx, m: &Message, kind: &Kind) {
 
     let mut tx = Some(ctx.queen.transaction().ack(m));
     for dest in &st.stage.destinations {
-        let item = TxnPushItem {
-            queue: dest.queue.clone(),
-            partition: Some(m.partition.clone()),
-            payload: stamp(&m.data, st, dest.node.as_str()),
-            transaction_id: Some(if dest.derive_id {
-                gate_core::derive(&m.transaction_id, &dest.label)
-            } else {
-                m.transaction_id.clone()
-            }),
-            trace_id: None,
-        };
         let Some(builder) = tx.take() else { break };
-        match builder.push_item(item) {
+        match builder.push_item(push_for(st, m, dest)) {
             Ok(next) => tx = Some(next),
             Err(_) => break,
         }
@@ -814,10 +882,19 @@ async fn settle_head(ctx: &Ctx, m: &Message, kind: &Kind) {
         // forwarded — it is not arriving at the destination a second time, so it
         // spends no window.
         Err(e) if e.to_string().contains("QDUP") => {
-            let _ = ctx.queen.transaction().ack(m).commit().await;
+            if let Err(e) = ctx.queen.transaction().ack(m).commit().await {
+                tracing::warn!(
+                    stage = %st.key(), error = %e,
+                    "could not settle an item that is already downstream; its lease will lapse and \
+                     the claim will come back to the same place"
+                );
+            }
         }
         // Leave it alone: its lease lapses and it comes back.
-        Err(_) => {}
+        Err(e) => tracing::warn!(
+            stage = %st.key(), error = %e,
+            "could not settle the head of the claim; its lease will lapse"
+        ),
     }
 }
 

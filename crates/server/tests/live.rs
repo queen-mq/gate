@@ -2137,3 +2137,225 @@ async fn an_eta_tells_a_budget_backlog_from_a_worker_one() {
 
     h.cleanup("g").await;
 }
+
+// ====================================================== the broker's own rules
+//
+// Facts the whole admission algorithm rests on. They are the BROKER's, not
+// Gate's, so they are asserted against it rather than inferred from a reading of
+// its SQL — and if a minor version ever changes one of them, this is the test
+// that says so instead of a throughput graph six months later.
+
+/// Settling a claim IN FULL re-arms its partition immediately; settling a PREFIX
+/// of one leaves it parked until the lease expires; a nack re-arms it at once
+/// and is not available for pacing.
+///
+/// Measured, on this broker: **7ms** for the full ack, **the whole lease** for
+/// the prefix, **4ms** for the nack. Two decisions in the relay follow from it —
+/// `plan::fitting_batch` sizes a claim to what one sub-window admits so the
+/// prefix path is rare, and `GATE_LEASE_SECONDS` is ten rather than thirty so it
+/// is cheap when it is taken.
+///
+/// Nothing is LOST by a prefix settle: the group's own depth still owes the
+/// tail, and the cursor is exactly where the ack put it. It is a latency fact,
+/// not a durability one, and the assertions below check both halves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn an_ack_settles_the_whole_claim_or_pays_a_lease() {
+    let Some(h) = harness("ackrules").await else {
+        return;
+    };
+    const LEASE: i32 = 6;
+
+    async fn back(h: &Harness, q: &str, within: Duration) -> (Duration, Vec<i64>) {
+        let t0 = Instant::now();
+        loop {
+            let got = h
+                .queen
+                .queue(q)
+                .group("g")
+                .subscription_mode(SubscriptionMode::All)
+                .batch(9)
+                .partitions(1)
+                .auto_ack(false)
+                .pop()
+                .await
+                .unwrap_or_default();
+            if !got.is_empty() {
+                return (
+                    t0.elapsed(),
+                    got.iter()
+                        .filter_map(|m| m.data.get("n").and_then(|v| v.as_i64()))
+                        .collect(),
+                );
+            }
+            if t0.elapsed() > within {
+                return (t0.elapsed(), vec![]);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn claim(h: &Harness, tag: &str) -> (String, Vec<Message>) {
+        let q = format!("test.ackrules.{}.{tag}", h.application);
+        h.queen
+            .queue(&q)
+            .configure(queen_mq::QueueOptions {
+                lease_time: Some(LEASE),
+                retry_limit: Some(50),
+                ..Default::default()
+            })
+            .await
+            .expect("configure");
+        for i in 0..5 {
+            h.queen
+                .queue(&q)
+                .partition("p0")
+                .push(json!({ "n": i }))
+                .await
+                .expect("push");
+        }
+        let msgs = h
+            .queen
+            .queue(&q)
+            .group("g")
+            .subscription_mode(SubscriptionMode::All)
+            .batch(5)
+            .partitions(1)
+            .auto_ack(false)
+            .pop()
+            .await
+            .expect("pop");
+        assert_eq!(msgs.len(), 5, "one claim over the whole partition");
+        (q, msgs)
+    }
+
+    // ---- a prefix: the tail is still owed, and it waits the lease.
+    let (q, msgs) = claim(&h, "prefix").await;
+    h.queen
+        .transaction()
+        .ack(&msgs[0])
+        .ack(&msgs[1])
+        .commit()
+        .await
+        .expect("a prefix settles");
+    let owed: u64 = h
+        .app
+        .depths
+        .pending_of_group(&h.queen, &q, "g")
+        .await
+        .values()
+        .sum();
+    assert_eq!(owed, 3, "nothing is lost: the group still owes the tail");
+    let (took, got) = back(&h, &q, Duration::from_secs(LEASE as u64 * 3)).await;
+    assert_eq!(got, vec![2, 3, 4], "the tail, in order");
+    assert!(
+        took >= Duration::from_secs(LEASE as u64 - 1),
+        "a prefix settle costs a lease; it came back in {took:?}, so the batch sizing and the \
+         lease length are solving a problem that no longer exists"
+    );
+
+    // ---- the whole claim: re-armed at once.
+    let (q, msgs) = claim(&h, "full").await;
+    h.queen
+        .transaction()
+        .ack_all(&msgs)
+        .commit()
+        .await
+        .expect("the whole claim settles");
+    for i in 10..13 {
+        h.queen
+            .queue(&q)
+            .partition("p0")
+            .push(json!({ "n": i }))
+            .await
+            .expect("push");
+    }
+    let (took, got) = back(&h, &q, Duration::from_secs(LEASE as u64 * 3)).await;
+    assert_eq!(got, vec![10, 11, 12]);
+    assert!(
+        took < Duration::from_secs(LEASE as u64 - 1),
+        "the happy path must cost nothing; it waited {took:?}"
+    );
+
+    // ---- a nack: immediate, and therefore tempting — which is why the relay
+    // never uses one for pacing. It charges the retry budget, and work that is
+    // merely waiting would dead-letter.
+    let (q, msgs) = claim(&h, "nack").await;
+    h.queen
+        .transaction()
+        .nack(&msgs[0], "test")
+        .commit()
+        .await
+        .expect("nack");
+    let (took, got) = back(&h, &q, Duration::from_secs(LEASE as u64 * 3)).await;
+    assert_eq!(got, vec![0, 1, 2, 3, 4], "a nack moves no cursor");
+    assert!(took < Duration::from_secs(1), "it waited {took:?}");
+}
+
+/// The QDUP a transaction answers does not name the offending id.
+///
+/// That is why the recovery halves the claim rather than skipping to the
+/// duplicate: there is nothing to skip to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn a_duplicate_rolls_the_bundle_back_without_naming_itself() {
+    let Some(h) = harness("dupmsg").await else {
+        return;
+    };
+    let q = format!("test.dupmsg.{}", h.application);
+    h.queen.queue(&q).create().await.ok();
+    let dup = format!("dup-{}", h.application);
+    h.queen
+        .queue(&q)
+        .partition("p0")
+        .push_items(vec![queen_mq::PushItem {
+            queue: q.clone(),
+            partition: Some("p0".into()),
+            payload: json!({ "n": -1 }),
+            transaction_id: Some(dup.clone()),
+        }])
+        .await
+        .expect("plant");
+
+    let mut tx = h.queen.transaction();
+    for (i, id) in [None, Some(dup.clone()), None].iter().enumerate() {
+        tx = tx
+            .push_item(queen_mq::TxnPushItem {
+                queue: q.clone(),
+                partition: Some("p0".into()),
+                payload: json!({ "n": i }),
+                transaction_id: id.clone(),
+                trace_id: None,
+            })
+            .expect("stage");
+    }
+    let err = tx
+        .commit()
+        .await
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(
+        err.contains("QDUP"),
+        "the relay matches on this string: {err:?}"
+    );
+    assert!(
+        !err.contains(&dup),
+        "if the broker ever names the duplicate, the halving recovery can be replaced by a skip: \
+         {err:?}"
+    );
+
+    // And nothing of the bundle landed: a QDUP is a HARD verdict inside a
+    // transaction, not a per-item skip.
+    let there = h
+        .queen
+        .queue(&q)
+        .group("check")
+        .subscription_mode(SubscriptionMode::All)
+        .batch(10)
+        .partitions(1)
+        .pop_auto_ack()
+        .await
+        .unwrap_or_default();
+    assert_eq!(there.len(), 1, "only the planted one is on the queue");
+}

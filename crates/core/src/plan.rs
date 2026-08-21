@@ -461,6 +461,7 @@ pub fn compile_with(doc: &GraphDoc, opts: &PlanOpts) -> Plan {
                 let share = np.shares.get(&p.name).copied().unwrap_or(1.0);
                 let node_doc = doc.nodes.get(node_name);
                 let partitions_hint = partitions_hint(opts, &source, node_doc);
+                let declared_batch = node_doc.and_then(|n| n.batch).unwrap_or(opts.batch).max(1);
                 stages.push(Stage {
                     path: p.name.clone(),
                     priority: p.priority,
@@ -471,7 +472,7 @@ pub fn compile_with(doc: &GraphDoc, opts: &PlanOpts) -> Plan {
                     group: stage_group(app, graph, &p.name, node_name),
                     first_hop: i == 0,
                     check_foreign: false, // filled below
-                    batch: node_doc.and_then(|n| n.batch).unwrap_or(opts.batch).max(1),
+                    batch: fitting_batch(np, share, declared_batch),
                     concurrency: node_doc
                         .and_then(|n| n.concurrency)
                         .or(opts.concurrency)
@@ -575,6 +576,38 @@ pub fn compile_with(doc: &GraphDoc, opts: &PlanOpts) -> Plan {
         stages,
         queues,
         counters_window_seconds: doc.counters.as_ref().map(|c| c.window_seconds),
+    }
+}
+
+/// How many messages one claim should carry, given what this path may spend in
+/// one sub-window.
+///
+/// **This is the number that keeps the deferral path rare, and the reason it
+/// exists is a measurement of the broker.** Settling a claim in full re-arms its
+/// partition in about **seven milliseconds**; settling a PREFIX of one leaves the
+/// partition parked until the lease expires — measured at exactly the lease, and
+/// asserted by `an_ack_settles_the_whole_claim_or_pays_a_lease` in the live
+/// suite. So a claim that routinely exceeds what the window admits would pace
+/// itself by the LEASE, which is the thing this design set out to remove.
+///
+/// So the batch is clamped to what one sub-window admits at the typical item
+/// cost: `round(count_sub × share) / cost.default`, over the tightest UNSCOPED
+/// budget. Scoped budgets are excluded on purpose — a batch of two hundred
+/// messages across two hundred different keys spends one unit of each, and
+/// sizing on a per-key count would shrink every claim to a per-key allowance.
+///
+/// It is a floor of one and a ceiling of what the declaration asked for: a wide
+/// budget leaves the declared batch untouched, and a tight one gets a claim that
+/// fits.
+fn fitting_batch(np: &NodePlan, share: f64, declared: u32) -> u32 {
+    let per_item = np.cost.default_value().max(1);
+    let fits = np
+        .unscoped()
+        .map(|b| (b.max_for(share) / per_item).max(1))
+        .min();
+    match fits {
+        Some(n) => declared.min(n.clamp(1, u32::MAX as i64) as u32),
+        None => declared,
     }
 }
 

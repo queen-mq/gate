@@ -19,7 +19,15 @@ pub struct Knobs {
     pub concurrency: Option<u32>,
     /// A **work** lease, not a pacing quantum. v1's was one second because the
     /// lease WAS the pacing; here the budget window is the pacing and the lease
-    /// only has to outlive a handler.
+    /// only has to outlive a handler — a charge, a transaction, and up to
+    /// `max_parks × park_threshold` of parking, which renewal covers anyway.
+    ///
+    /// Ten and not thirty, for a measured reason. Settling a claim IN FULL
+    /// re-arms its partition in about seven milliseconds; settling a PREFIX of
+    /// one leaves the partition parked for exactly this long. The prefix path is
+    /// rare — `plan::fitting_batch` sizes a claim to what a sub-window admits —
+    /// but when it is taken, this is what the tail waits, so it is as short as a
+    /// handler can safely live with.
     pub lease_seconds: i32,
     /// The parked long-poll window. It can be thirty seconds rather than five
     /// because a parked poll **releases its pooled PG connection before
@@ -70,9 +78,9 @@ impl Default for Knobs {
         Self {
             batch: 200,
             concurrency: None,
-            lease_seconds: 30,
+            lease_seconds: 10,
             poll_timeout: Duration::from_secs(30),
-            renew_lease: Duration::from_secs(10),
+            renew_lease: Duration::from_secs(3),
             park_threshold: Duration::from_millis(1500),
             max_parks: 3,
             max_prefix_retries: 2,
