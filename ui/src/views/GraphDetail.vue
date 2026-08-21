@@ -24,7 +24,7 @@ import Metric from '../components/Metric.vue'
 import ConfirmModal from '../components/ConfirmModal.vue'
 import Icon from '../components/Icon.vue'
 import {
-  api, num, pct, period, window as windowOf, ago, utilisation, ceilingOf,
+  api, num, pct, period, window as windowOf, ago, utilisation,
   isAdmin, READ_ONLY_NOTE, graphApi, graphPath, DEFAULT_APP,
 } from '../lib/api.js'
 import { usePoll } from '../lib/poll.js'
