@@ -357,18 +357,57 @@ pub fn default_sub_windows(count: i64, time_ms: i64) -> u32 {
 
 /// `(count_sub, window_sub_seconds)`.
 ///
-/// **Rounding is always down, in both terms**, so the enforced ceiling is at or
-/// below the declared one. Enforcing tighter than declared is the safe
-/// direction; enforcing looser is a vendor block.
+/// # The property, and it is the only one that matters
+///
+/// ```text
+/// count_sub / window_sub_seconds  <=  count / (time_ms / 1000)
+/// ```
+///
+/// **The enforced rate is at or below the declared one, for every input.**
+/// Enforcing tighter than declared is the safe direction; enforcing looser is a
+/// vendor block, which is the failure this whole service exists to prevent.
+///
+/// This used to say *"rounding is always down, in both terms, so the enforced
+/// ceiling is at or below the declared one"*, and that was wrong — the two terms
+/// are not on the same side of the fraction. Rounding the COUNT down lowers a
+/// numerator, which is tighter; rounding the WINDOW down lowers a DENOMINATOR,
+/// which is **looser**. `subdivide(200000, 3600000, 2000)` gave `100` per
+/// `floor(1800ms) = 1s`, enforcing 100/s against a declared 55.6/s — very nearly
+/// twice the ceiling the caller wrote down.
+///
+/// So the window is not derived from `time_ms / n` at all. It is derived from
+/// the count that was actually chosen, rounded **up**:
+///
+/// ```text
+/// window_sub_seconds = max(1, ceil(count_sub * time_ms / (count * 1000)))
+/// ```
+///
+/// which is the inequality above, solved for the window. Deriving it from
+/// `count_sub` rather than from `n` also closes the second leak: `count_sub` has
+/// a floor of 1, so a budget with more sub-windows than count (`count: 5` over
+/// ten of them) enforced `1` per `1s` where `1` per `2s` was declared —
+/// `subwindow-fits` refuses that document, but this function is public and is
+/// called before anything has validated.
 ///
 /// The one-second floor is not a choice: a kv TTL is whole seconds with a
 /// minimum of one, so a budget declared over 200ms is enforced as `count` per
 /// SECOND — tighter than `count` per 200ms, never looser, but slower. The
 /// declare response says so loudly (`window-sub-second`).
+///
+/// Rounding up costs exactness where the division is not clean: 20000 per 300s
+/// over 150 sub-windows is `133` per `2s` (66.5/s) against a declared 66.67/s.
+/// That is the trade, taken deliberately in the safe direction. `migrate`
+/// avoids paying it at all by choosing an `n` that DIVIDES the period (§12.2),
+/// and a hand-written document can do the same.
 pub fn subdivide(count: i64, time_ms: i64, sub_windows: u32) -> (i64, i64) {
     let n = sub_windows.max(1) as i64;
     let count_sub = (count / n).max(1);
-    let window_sub_seconds = ((time_ms / n) / 1000).max(1);
+    // i128 because the numerator is a product of two declared numbers and this
+    // must not be the place a large budget wraps. Ceiling division, written out
+    // rather than as floats: the whole point is an exact comparison.
+    let num = (count_sub as i128) * (time_ms.max(1) as i128);
+    let den = (count.max(1) as i128) * 1000;
+    let window_sub_seconds = ((num + den - 1) / den).max(1) as i64;
     (count_sub, window_sub_seconds)
 }
 

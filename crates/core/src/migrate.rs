@@ -80,11 +80,17 @@ fn default_lane_name(lanes: &[v1::Lane]) -> String {
 ///   fewer than one hundred calls a second while `cost.max: 100` is what a v1
 ///   caller wrote.
 ///
-/// Then it is shrunk to a DIVISOR of the window in seconds. `subdivide` floors
-/// the sub-window to whole seconds, so an `N` that does not divide the period
-/// evenly turns `200000 per 3600s` into `100 per 1800ms` and enforces it as
-/// `100 per 1000s`— a ceiling almost twice what was declared. A divisor keeps
-/// the arithmetic exact and the enforced rate at or below the declared one.
+/// Then it is shrunk to a DIVISOR of the window in seconds, which buys
+/// EXACTNESS and no longer safety. A sub-window is a whole number of seconds, so
+/// an `N` that does not divide the period evenly cannot express the declared
+/// rate: `subdivide` rounds the window up and the migrated document then
+/// enforces slightly less than the caller asked for (20000 per 300s over 150
+/// sub-windows is 66.5/s against 66.67/s). A divisor makes it land exactly.
+///
+/// It used to buy safety too, because `subdivide` floored the window and
+/// enforced `100 per 1800ms` as `100 per 1000ms` — nearly twice the declared
+/// ceiling. That is fixed at the source now, so a migration that picked a
+/// non-divisor would be merely tighter than asked rather than a vendor block.
 fn rolling_sub_windows(time_ms: i64, count: i64, cost_max: i64) -> u32 {
     let seconds = (time_ms / 1000).max(1);
     let per_item = (count / cost_max.max(1)).max(1);

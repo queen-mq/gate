@@ -517,8 +517,8 @@ warnings** where a declaration's `subWindows` leaves a sub-window longer than 2 
 
 ```
 N          = subWindows, or the default below
-window_sub = timeMs / N   rounded DOWN to whole seconds, floored at 1
 count_sub  = floor(count / N), floored at 1
+window_sub = ceil(count_sub * timeMs / (count * 1000)), floored at 1
 ```
 
 Default `N`:
@@ -532,10 +532,31 @@ else              : N = clamp(timeMs / 1000, 1, count)      // aim for a 1s sub-
 budget enforces `N` per window instead of `count` per window. Validation `subwindow-fits`
 (§11) refuses an explicit `subWindows > count`.
 
-Rounding is **always down**, in both terms, so the enforced ceiling is at or below the
-declared one. Enforcing tighter than declared is the safe direction; enforcing looser is a
-vendor block. Where `floor` loses more than 2% of the declared count the declare response
-warns and names both numbers (§11 `subwindow-rounding`).
+**The property is one inequality**, and it is the only thing the arithmetic above is for:
+
+```
+count_sub / window_sub  <=  count / (timeMs / 1000)
+```
+
+The enforced rate is at or below the declared one, for every accepted document. Enforcing
+tighter than declared is the safe direction; enforcing looser is a vendor block.
+
+This section used to say *"rounding is always down, in both terms"*, and that was wrong — the
+two terms are not on the same side of the fraction. Rounding the COUNT down lowers a
+numerator, which is tighter; rounding the WINDOW down lowers a DENOMINATOR, which is
+**looser**. `count: 200000, timeMs: 3600000, subWindows: 2000` gave `100` per
+`floor(1800ms) = 1s`: 100/s enforced against 55.6/s declared, on a document that validates
+clean. So `window_sub` is not derived from `timeMs / N` at all — it is derived from the
+`count_sub` actually chosen and rounded UP, which is the inequality solved for the window.
+Deriving it from `count_sub` also covers the case where `count_sub` hits its floor of 1
+(`count: 5` over ten sub-windows enforced `1` per `1s` where `1` per `2s` was declared).
+
+Rounding up costs exactness where the division is not clean: 20000 per 300s over 150
+sub-windows is `133` per `2s`, 66.5/s against a declared 66.67/s. That is the trade, taken
+deliberately in the safe direction; a caller who wants the declared rate exactly picks an `N`
+that divides the period, which is what §12.2's migration does. Where `floor` loses more than
+2% of the declared count the declare response warns and names both numbers
+(§11 `subwindow-rounding`).
 
 **The one-second floor.** TTLs are whole seconds (§2). A declared `timeMs` below 1000 cannot
 be enforced at its own width. The rule: `window_sub` is floored at 1 second and `count_sub`

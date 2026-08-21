@@ -318,14 +318,101 @@ fn default_shares_are_equal_steps_by_rank() {
 
 // -------------------------------------------------------------- subdivision
 
-/// Rounding is always DOWN, in both terms, so the enforced ceiling is at or
-/// below the declared one. Enforcing tighter than declared is the safe
-/// direction; enforcing looser is a vendor block.
+/// The enforced rate is at or below the declared one. Enforcing tighter than
+/// declared is the safe direction; enforcing LOOSER is a vendor block, which is
+/// the failure this whole service exists to prevent.
+///
+/// This test used to be called `subdivision_always_rounds_down` and it pinned
+/// the leak as if it were the rule. Rounding down in both terms is not one
+/// property but two opposite ones: the count is a NUMERATOR, so rounding it
+/// down is tighter, and the window is a DENOMINATOR, so rounding it down is
+/// looser. The third line below was `(1, 1)` — one call per second against a
+/// declared 0.7 — and it was green.
 #[test]
-fn subdivision_always_rounds_down() {
+fn the_enforced_rate_is_never_above_the_declared_one() {
+    // A clean division is exact, and stays exact: 1000 per 10s is 100 per 1s.
     assert_eq!(plan::subdivide(1000, 10_000, 10), (100, 1));
+    // 105 per 10s over ten sub-windows: the count floors to 10, and 10 per 1s
+    // would be 10/s against a declared 10.5/s — under it, so one second stands.
     assert_eq!(plan::subdivide(105, 10_000, 10), (10, 1));
-    assert_eq!(plan::subdivide(7, 10_000, 10), (1, 1));
+    // More sub-windows than count. `count_sub` floors to 1, and a one-second
+    // window would enforce 1/s against a declared 0.7/s: 43% MORE than the
+    // ceiling the caller wrote. Two seconds is 0.5/s, which is under it.
+    assert_eq!(plan::subdivide(7, 10_000, 10), (1, 2));
+}
+
+/// The exact case from the report, spelled out in the numbers an operator would
+/// check by hand.
+///
+/// 200,000 calls an hour, smoothed over 2000 sub-windows. Each carries 100, and
+/// each window is 1800ms — which floored to ONE second, so the limiter enforced
+/// 100 per second where 55.6 per second was declared. Not a rounding artefact:
+/// very nearly twice the vendor's ceiling, on a document that validates clean
+/// and that anybody might write.
+#[test]
+fn a_window_that_is_not_a_whole_number_of_seconds_rounds_up_and_not_down() {
+    let (count_sub, window) = plan::subdivide(200_000, 3_600_000, 2000);
+    assert_eq!(count_sub, 100, "200000 over 2000 sub-windows");
+    assert_eq!(
+        window, 2,
+        "1800ms is not expressible as a whole number of seconds, and the choice between one and          two is the choice between 100/s and 50/s against a declared 55.6/s"
+    );
+    // The declared rate, and the enforced one, as integers so the comparison is
+    // exact rather than a float that happens to agree.
+    assert!(
+        count_sub * 3_600_000 <= 200_000 * 1000 * window,
+        "{count_sub} per {window}s is above 200000 per 3600s"
+    );
+}
+
+/// And the property over a spread of shapes, because the two cases above are
+/// the ones that were noticed.
+///
+/// `count_sub / window_sub_seconds <= count / (time_ms / 1000)`, cross-multiplied
+/// so it is integer arithmetic and not a float comparison that rounds its way to
+/// agreement. Every shape here is one somebody could declare: sub-second windows,
+/// windows that divide evenly and windows that do not, a single window, more
+/// sub-windows than count, and the daily ceilings that made the flagship
+/// documents fail to migrate at all. The sub-second window needs no exception:
+/// stretching it to a whole second is already the tight direction.
+#[test]
+fn no_shape_of_budget_is_enforced_above_what_it_declared() {
+    let counts = [1i64, 2, 5, 7, 100, 105, 999, 1000, 4_500_000];
+    let periods = [
+        200i64, 1_000, 10_000, 30_000, 60_000, 300_000, 3_600_000, 86_400_000,
+    ];
+    let subs = [1u32, 2, 3, 4, 10, 60, 150, 1800, 2000, 3600];
+
+    let mut checked = 0usize;
+    for &count in &counts {
+        for &time_ms in &periods {
+            for &n in &subs {
+                let (count_sub, window) = plan::subdivide(count, time_ms, n);
+                assert!(
+                    count_sub >= 1,
+                    "a sub-window that admits nothing admits nothing for ever"
+                );
+                assert!(
+                    window >= 1,
+                    "a kv TTL is whole seconds with a minimum of one"
+                );
+                // One inequality, no special cases — including the sub-second
+                // window, where stretching to a whole second is already the
+                // tight direction and so satisfies the same test.
+                assert!(
+                    (count_sub as i128) * (time_ms as i128)
+                        <= (count as i128) * 1000 * (window as i128),
+                    "count {count} over {time_ms}ms in {n} sub-windows is enforced as \
+                     {count_sub} per {window}s, which is ABOVE the declared rate"
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert!(
+        checked > 500,
+        "the spread must actually cover something: {checked}"
+    );
 }
 
 /// A kv TTL is whole seconds with a minimum of one, so a window declared under a
