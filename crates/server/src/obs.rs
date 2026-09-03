@@ -68,6 +68,18 @@ pub struct StageCounters {
     /// as a number rather than as a limiter that quietly admits less than it
     /// should.
     pub leaked: AtomicU64,
+    /// Times this stage was found WEDGED: the broker refusing the ack that
+    /// would advance the cursor, at a claim head that never moves, so the same
+    /// batch comes back for ever.
+    ///
+    /// It is here because the 2026-09-02 incident had no number of its own. A
+    /// stage whose group had been seeded at the head of another path's twelve-
+    /// day-old backlog could not ack a single frame — `log_txns` no longer held
+    /// the hashes — and every figure the console could show said something else:
+    /// `released` (which is ordinary pacing), `popped` (which was climbing), and
+    /// worst of all `waitingForBudget`, which named a counter that was not the
+    /// problem. Counted once per escalation, not once per refusal.
+    pub wedged: AtomicU64,
 }
 
 impl StageCounters {
@@ -87,6 +99,7 @@ impl StageCounters {
             "foreign": g(&self.foreign),
             "deadlettered": g(&self.deadlettered),
             "leaked": g(&self.leaked),
+            "wedged": g(&self.wedged),
             "costAdmitted": g(&self.cost),
             // The ratio, computed here so nobody has to remember which two
             // numbers explain a stage's throughput.

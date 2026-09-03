@@ -229,6 +229,24 @@ fn logs() {
         if std::env::var("GATE_POLL_TIMEOUT_SECONDS").is_err() {
             std::env::set_var("GATE_POLL_TIMEOUT_SECONDS", "3");
         }
+        // A narrow seeding margin, unless the caller asked for one.
+        //
+        // A new group on a Gate-owned interior queue starts at this runtime's
+        // start MINUS `relay::INTERIOR_SEED_SKEW`, two minutes, which exists to
+        // absorb disagreement between Gate's clock and the broker's. Here they
+        // are the same machine, and a two-minute margin would mean
+        // `a_path_added_to_a_running_graph_starts_at_the_tail` had to spend two
+        // minutes ageing its backlog before the assertion meant anything. Three
+        // seconds still absorbs a container clock a few hundred milliseconds
+        // out — which Docker's VM clock routinely is — while leaving the
+        // property testable in one wait. It is NOT a value to run in
+        // production: the shipped margin also has to cover the spread between
+        // replicas picking a declare up through the reconcile loop, and this
+        // suite has one replica. `interior_seed`'s own unit tests pin the
+        // shipped value.
+        if std::env::var("GATE_INTERIOR_SEED_SKEW_SECONDS").is_err() {
+            std::env::set_var("GATE_INTERIOR_SEED_SKEW_SECONDS", "3");
+        }
         let _ = tracing_subscriber::fmt()
             .with_env_filter(
                 tracing_subscriber::EnvFilter::try_from_default_env()
@@ -1748,6 +1766,17 @@ async fn a_fan_in_on_one_queue_does_not_dedup_collapse() {
 /// Three groups read one interior queue and each sees every message. Only the one
 /// whose `_gate.path` matches forwards it; the others settle it with a bare ack.
 /// It is the one piece of bookkeeping v2 adds that v1 did not have.
+///
+/// # Still meaningful under tail seeding, and this is why
+///
+/// Both paths are declared in ONE document, so both groups on `ip.in` are
+/// created by the same runtime start and seeded from the same instant — and the
+/// queue is freshly provisioned, so its tail IS its head and there is nothing
+/// before the seed to skip. Every frame pushed below therefore reaches every
+/// group, exactly as it did when the mode was `All`, and the foreign skip is
+/// what has to settle them. The case where the seed does bite is a path added to
+/// a graph that was already running, which is
+/// `a_path_added_to_a_running_graph_starts_at_the_tail`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn a_foreign_path_message_is_acked_and_not_forwarded() {
@@ -1804,6 +1833,146 @@ async fn a_foreign_path_message_is_acked_and_not_forwarded() {
         foreign >= N as u64,
         "each group reads the other's messages and must settle them: {view}"
     );
+
+    h.cleanup("g").await;
+}
+
+/// A path added to a running graph starts at the TAIL of the interior queue it
+/// joins, not at the head of the other paths' backlog.
+///
+/// # The incident this is the regression test for, 2026-09-02
+///
+/// `channel-go` redeclared `vrbo` adding a path `reviews` through the terminal
+/// node `partner`, which three other paths already ended at. The new stage read
+/// `partner`'s INTERIOR queue under a brand-new group, and every group Gate
+/// owned was seeded with `All` — so the cursor started at the oldest retained
+/// frame of all 105 partitions: ~19,800 frames belonging to the other three
+/// paths, the oldest twelve days old. Every one of them was foreign, foreign
+/// frames are settled by ack inside the relay transaction, and an ack resolves
+/// by hash against `queen.log_txns`, which the broker purges after
+/// `GREATEST(dedup_window, completed_retention, 900s)` while retaining the
+/// segments for far longer. So every ack resolved nowhere, every transaction
+/// rolled back, the cursor never moved, and the console blamed the budget.
+///
+/// What is asserted here is the property that makes that impossible: the new
+/// group **never sees** what the other paths left behind (`foreign == 0`, `lag
+/// == 0`), while the path itself works end to end and the path that was already
+/// running is untouched.
+///
+/// The one timing assumption is the seed margin — see `logs()`, which narrows it
+/// to three seconds for this suite, and the wait below that ages the backlog past
+/// it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn a_path_added_to_a_running_graph_starts_at_the_tail() {
+    let Some(h) = harness("tailseed").await else {
+        return;
+    };
+    let out = egress_of("tailseed", &h.application);
+
+    // Phase 1: one path, `push` -> `partner`, and a backlog on `partner`'s
+    // interior queue that belongs entirely to it.
+    let mut doc = json!({
+      "version": 1,
+      "nodes": {
+        "push":    { "ingress": true, "budgets": [wide("push")] },
+        "partner": { "budgets": [wide("partner")], "egress": out }
+      },
+      "paths": [{ "name": "push", "nodes": ["push", "partner"] }]
+    });
+    let (status, body) = h.put_graph("g", doc.clone()).await;
+    assert_eq!(status, 200, "declare: {body}");
+
+    const N: usize = 8;
+    for i in 0..N {
+        let (status, res) = h
+            .push(
+                "g",
+                "push",
+                json!({ "op": "test", "partition": "p0", "payload": { "n": i } }),
+            )
+            .await;
+        assert_eq!(status, 200, "push {i}: {res}");
+    }
+    let got = h.drain(&out, N, Duration::from_secs(40)).await;
+    assert_eq!(
+        got.len(),
+        N,
+        "the first path must run before we add a second"
+    );
+
+    // The frames are still on `gate.{app}.g.partner.in` — draining the EGRESS
+    // does not retire them — and that retained log is what a new group would be
+    // handed. Age it past the seeding margin so "did not see the backlog" is a
+    // statement about the seed rather than about the clock.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Phase 2: add `reviews` -> `partner`, exactly the shape of the incident.
+    doc["nodes"]["reviews"] = json!({ "ingress": true, "budgets": [wide("reviews")] });
+    doc["paths"] = json!([
+        { "name": "push",    "nodes": ["push",    "partner"] },
+        { "name": "reviews", "nodes": ["reviews", "partner"] }
+    ]);
+    let (status, body) = h.put_graph("g", doc).await;
+    assert_eq!(status, 200, "redeclare: {body}");
+
+    // The new path works end to end. This is also what proves its group EXISTS:
+    // the frame cannot reach the egress unless the stage popped, which is what
+    // creates the cursor the assertions below read.
+    let (status, res) = h
+        .push(
+            "g",
+            "reviews",
+            json!({ "op": "test", "partition": "p0", "payload": { "who": "reviews" } }),
+        )
+        .await;
+    assert_eq!(status, 200, "push on the new path: {res}");
+    let got = h.drain(&out, 1, Duration::from_secs(40)).await;
+    assert_eq!(got.len(), 1, "the added path must admit and forward");
+    assert_eq!(got[0].data["_gate"]["path"], "reviews");
+
+    // The assertion. `foreign` is the discriminator that cannot be undone by
+    // timing: seeded with `All`, this stage would have popped all N frames the
+    // `push` path left behind and settled every one of them as foreign. Seeded
+    // at the tail it never saw them.
+    let (_, view) = h.get_graph("g").await;
+    let stages = view["stages"].as_array().cloned().unwrap_or_default();
+    let added = stages
+        .iter()
+        .find(|s| s["path"] == "reviews" && s["node"] == "partner")
+        .unwrap_or_else(|| panic!("the added hop must be running: {view}"));
+    assert_eq!(
+        added["source"],
+        "gate.".to_string() + &h.application + ".g.partner.in",
+        "the added hop reads the interior queue"
+    );
+    assert_eq!(
+        added["counters"]["foreign"], 0,
+        "the new group must never have been handed the other path's backlog: {view}"
+    );
+    assert_eq!(
+        added["lag"], 0,
+        "and must owe nothing on a queue it joined at the tail: {view}"
+    );
+    assert_eq!(
+        added["counters"]["wedged"], 0,
+        "nothing here should be refusing to settle: {view}"
+    );
+
+    // And the path that was already running kept its own cursor: it is still
+    // draining, and it settles the newcomer's frames as foreign the way §6.7
+    // says it should.
+    let (status, res) = h
+        .push(
+            "g",
+            "push",
+            json!({ "op": "test", "partition": "p0", "payload": { "n": 99 } }),
+        )
+        .await;
+    assert_eq!(status, 200, "push on the original path: {res}");
+    let got = h.drain(&out, 1, Duration::from_secs(40)).await;
+    assert_eq!(got.len(), 1, "the original path must still run");
+    assert_eq!(got[0].data["n"], 99, "and it is the frame we just pushed");
 
     h.cleanup("g").await;
 }

@@ -194,6 +194,53 @@ pub struct Stage {
     /// heard of Gate is the writer. Nothing there carries a `_gate` stamp Gate
     /// wrote, so nothing there can be foreign.
     pub first_hop: bool,
+    /// Whether this stage's source is a Gate-owned INTERIOR queue — one written
+    /// **only** by Gate's own relay and never by an application producer.
+    ///
+    /// It decides where a NEW group's cursor is seeded, and it is the one fact
+    /// that makes seeding at the tail safe. See `relay::spawn`.
+    ///
+    /// # The incident, 2026-09-02
+    ///
+    /// `channel-go` redeclared its `vrbo` graph adding a path `reviews` through
+    /// the pre-existing terminal node `partner`. That compiled a stage reading
+    /// the INTERIOR queue `gate.channel-go.vrbo.partner.in` under a brand-new
+    /// group, and every group Gate owned was seeded with `All` — so the group's
+    /// cursor started at the oldest retained frame of all 105 partitions, about
+    /// 19,800 frames belonging to the other three paths, the oldest twelve days
+    /// old. Every one of them was foreign, foreign frames are settled by ack
+    /// inside the relay's single transaction (§6.4/§6.7), and the broker
+    /// resolves those acks by transaction hash against `queen.log_txns` — which
+    /// it purges after `GREATEST(dedup_window, completed_retention, 900s)`
+    /// (`006_log_maintenance.sql:389`), far short of the segment retention. A
+    /// twelve-day-old hash resolves nowhere, so the broker raised `QTXN ack
+    /// references unknown transactionId; transaction rolled back`
+    /// (`005_log_ack.sql:1451`) and rolled the whole relay transaction back. The
+    /// cursor never moved, the stage retried about ten times a second per
+    /// replica for ever, both replicas OOMed, and the console reported the
+    /// backlog as `waiting_for_budget` — which nothing was.
+    ///
+    /// # Why the rule is exact and not a heuristic
+    ///
+    /// A frame lands on an interior queue only because a stage of some path `P`
+    /// relayed it there, and it carries `P`'s `_gate.path` stamp. A group for
+    /// path `P` on that queue can therefore never need anything older than the
+    /// instant `P`'s own upstream stage started relaying. Seeding it at the tail
+    /// as of *this runtime's start* skips exactly the other paths' backlog and
+    /// nothing of its own.
+    ///
+    /// An INGRESS queue is the opposite case and keeps `All`: an application
+    /// producer writes it, a backlog there is real work the limiter exists to
+    /// pace, and two paths entering at one node is pub-sub by design
+    /// (§4.2/§6.7). That holds for a user-owned ingress (`DocIngress.queue`) and
+    /// for the Gate-owned `gate.{app}.{graph}.{node}.ingress` HTTP door alike.
+    ///
+    /// Derived from the plan, never from the shape of the name: a stage's source
+    /// is interior exactly when it is the node's [`NodePlan::interior_queue`],
+    /// which is true at every hop after the first and at a first hop whose node
+    /// declares no ingress at all (a shape `path-entry` refuses, and one where
+    /// the stage could never own a frame anyway).
+    pub source_is_interior: bool,
     /// Whether this stage shares its source queue with another path's group, and
     /// therefore has to recognise and settle messages that are not its own.
     pub check_foreign: bool,
@@ -577,6 +624,13 @@ pub fn compile_with(doc: &GraphDoc, opts: &PlanOpts) -> Plan {
                 } else {
                     np.interior_queue.clone()
                 };
+                // The `unwrap_or_else` above is why this is a comparison and not
+                // `i > 0`: a first hop whose node declares an ingress reads a
+                // queue somebody else writes, and a first hop whose node
+                // declares none falls back to the interior queue. Only the
+                // second is Gate-written. (`path-entry` refuses the second, so
+                // this arm exists for a caller who skipped validation.)
+                let source_is_interior = source == np.interior_queue;
 
                 let destinations: Vec<Destination> = if last {
                     match &np.egress_queue {
@@ -619,6 +673,7 @@ pub fn compile_with(doc: &GraphDoc, opts: &PlanOpts) -> Plan {
                     source,
                     group: stage_group(app, graph, &p.name, node_name),
                     first_hop: i == 0,
+                    source_is_interior,
                     check_foreign: false,  // filled below
                     owns_unstamped: false, // filled below
                     batch: fitting_batch(np, share, declared_batch),

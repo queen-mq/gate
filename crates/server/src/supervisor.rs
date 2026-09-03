@@ -30,6 +30,14 @@ pub async fn start(
     doc: GraphDoc,
     plan: Plan,
 ) -> Result<Arc<GraphRuntime>> {
+    // BEFORE the provisioning and before anything is spawned, and that ordering
+    // is the whole point. A stage whose source is a Gate-owned interior queue
+    // seeds a new group at this instant (`relay::interior_seed`), so it has to
+    // be taken before any stage of this runtime can possibly have relayed a
+    // frame into one — otherwise the frame would land below the cursor that is
+    // about to be created, and be dropped.
+    let started_at = std::time::SystemTime::now();
+
     provision(queen, &plan).await?;
 
     let cancel = Cancel::new();
@@ -45,6 +53,8 @@ pub async fn start(
             node: node.clone(),
             counters: Default::default(),
             last_refusal: parking_lot::RwLock::new(None),
+            started_at,
+            wedge: parking_lot::RwLock::new(None),
             cancel: cancel.clone(),
         }));
     }

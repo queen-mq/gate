@@ -107,6 +107,15 @@ pub struct Knobs {
     /// between the two calls. An unbounded retry loop against a contended
     /// counter is how a limiter turns into a spin.
     pub max_prefix_retries: u32,
+    /// How far before a graph runtime's start a NEW group on a Gate-owned
+    /// interior queue is seeded. See `relay::INTERIOR_SEED_SKEW` for both bounds
+    /// — the clock skew it absorbs below, the broker's transaction window above.
+    ///
+    /// `GATE_INTERIOR_SEED_SKEW_SECONDS`, clamped to ten minutes: a margin at or
+    /// past the broker's 900-second `log_txns` floor would put the seed back
+    /// among frames whose acks can no longer resolve, which is the rollback loop
+    /// the seeding exists to prevent.
+    pub interior_seed_skew: Duration,
     /// The DLQ is BACK. v1 had to set `retry_limit: 0` on its push queue
     /// because it could not tell waiting from failing — it paced by nacking.
     /// v2 paces by releasing, and queen charges no retry budget on lease expiry
@@ -129,6 +138,7 @@ impl Default for Knobs {
             renew_lease: Duration::from_secs(3),
             max_park: Duration::from_secs(30),
             max_prefix_retries: 2,
+            interior_seed_skew: crate::relay::INTERIOR_SEED_SKEW,
             retry_limit: 3,
         }
     }
@@ -163,6 +173,12 @@ pub fn knobs() -> &'static Knobs {
                 .map(|n| Duration::from_millis(n as u64))
                 .unwrap_or(d.max_park),
             max_prefix_retries: d.max_prefix_retries,
+            // Clamped, not free: see the field. Zero is allowed and means "no
+            // margin", which is the right answer only where Gate and the broker
+            // share a clock.
+            interior_seed_skew: env_u32("GATE_INTERIOR_SEED_SKEW_SECONDS")
+                .map(|n| Duration::from_secs(n.min(600) as u64))
+                .unwrap_or(d.interior_seed_skew),
             retry_limit: env_u32("GATE_RETRY_LIMIT")
                 .map(|n| n as i32)
                 .unwrap_or(d.retry_limit),
