@@ -608,3 +608,193 @@ fn an_assumed_budget_is_enforced_at_its_declared_count_until_somebody_says_other
     // A documented budget is never discounted, whatever the factor says.
     assert_eq!(discounted.node("prices").unwrap().budgets[0].count_sub, 100);
 }
+
+// ------------------------------------------------- where a new group starts
+
+/// A hop that reads a queue only Gate's own relay writes is seeded at the TAIL.
+///
+/// The rule in one line: `source_is_interior` is true exactly where the stage's
+/// source is its node's interior queue. In `airbnb` that is the four hops into
+/// `ip` and `audit`, and nothing else.
+#[test]
+fn a_hop_that_reads_a_gate_written_interior_queue_is_seeded_at_the_tail() {
+    let p = compile(&airbnb());
+    let mut interior: Vec<String> = p
+        .stages
+        .iter()
+        .filter(|s| s.source_is_interior)
+        .map(|s| format!("{}/{} <- {}", s.path, s.node, s.source))
+        .collect();
+    interior.sort();
+    assert_eq!(
+        interior,
+        vec![
+            "messages/ip <- gate.channel.airbnb.ip.in",
+            "photos/audit <- gate.channel.airbnb.audit.in",
+            "photos/ip <- gate.channel.airbnb.ip.in",
+            "prices/ip <- gate.channel.airbnb.ip.in",
+        ]
+    );
+    // And the derivation, stated as the plan sees it rather than as a name:
+    // interior exactly where the source is the node's own interior queue.
+    for s in &p.stages {
+        let np = p.node(&s.node).expect("every stage has a node");
+        assert_eq!(
+            s.source_is_interior,
+            s.source == np.interior_queue,
+            "{}/{} reads {}",
+            s.path,
+            s.node,
+            s.source
+        );
+    }
+}
+
+/// A first hop on a queue the APPLICATION owns keeps the whole retained backlog.
+///
+/// A producer that has never heard of Gate writes it, so what is waiting there
+/// is real work the limiter exists to pace — the original "never `new`" rule,
+/// unchanged.
+#[test]
+fn a_first_hop_on_a_user_owned_ingress_queue_keeps_the_whole_backlog() {
+    let p = compile(&airbnb());
+    let s = p.stage("messages", "messages").expect("the messages stage");
+    assert_eq!(s.source, "channel.airbnb.messages.in");
+    assert_eq!(
+        p.queue(&s.source).map(|q| q.kind),
+        Some(QueueKind::UserIngress)
+    );
+    assert!(
+        !s.source_is_interior,
+        "a user's queue is never seeded at the tail"
+    );
+}
+
+/// A first hop on GATE's own HTTP ingress queue keeps the whole backlog too.
+///
+/// Gate created it, but a caller's `POST` is what writes it, and two paths
+/// entering at one node is pub-sub by design — so the same rule applies as for a
+/// queue the application made.
+#[test]
+fn a_first_hop_on_gates_own_http_ingress_queue_keeps_the_whole_backlog() {
+    let p = compile(&airbnb());
+    for (path, node) in [("prices", "prices"), ("photos", "photos")] {
+        let s = p.stage(path, node).expect("the entry stage");
+        assert_eq!(s.source, format!("gate.channel.airbnb.{node}.ingress"));
+        assert_eq!(
+            p.queue(&s.source).map(|q| q.kind),
+            Some(QueueKind::OwnedIngress)
+        );
+        assert!(
+            !s.source_is_interior,
+            "{path}/{node} reads a front door, not an interior queue"
+        );
+    }
+}
+
+/// A node may own a user ingress queue AND be a downstream hop of another path.
+///
+/// The two are different queues and get different answers: the hop that ENTERS
+/// through the user's queue keeps the backlog, and the hop that arrives by relay
+/// reads the interior queue and starts at the tail. Owning an ingress does not
+/// make a node's interior queue any less Gate-written.
+#[test]
+fn a_node_that_owns_a_user_ingress_still_reads_an_interior_queue_downstream_of_it() {
+    let doc: GraphDoc = serde_json::from_str(
+        r#"
+        {
+          "application": "app", "graph": "g", "version": 1,
+          "nodes": {
+            "x": { "ingress": true,
+                   "budgets": [{ "id": "x", "count": 100, "timeMs": 1000 }] },
+            "t": { "ingress": { "queue": "app.t.in" },
+                   "budgets": [{ "id": "t", "count": 100, "timeMs": 1000 }],
+                   "egress": "app.g.out" }
+          },
+          "paths": [
+            { "name": "direct", "nodes": ["t"] },
+            { "name": "via",    "nodes": ["x", "t"] }
+          ]
+        }
+        "#,
+    )
+    .expect("parse");
+    assert_eq!(
+        gate_core::validate(&doc),
+        vec![],
+        "the shape under test must be a legal one"
+    );
+
+    let p = compile(&doc);
+    let direct = p.stage("direct", "t").expect("the direct entry");
+    assert_eq!(direct.source, "app.t.in");
+    assert!(
+        !direct.source_is_interior,
+        "entering by the user's own queue keeps the backlog"
+    );
+
+    let via = p.stage("via", "t").expect("the relayed hop");
+    assert_eq!(via.source, "gate.app.g.t.in");
+    assert!(
+        via.source_is_interior,
+        "arriving by relay reads a queue only Gate writes"
+    );
+}
+
+/// The 2026-09-02 incident, as a compiled plan.
+///
+/// A path added to a running graph through a node three other paths already
+/// terminate at. Its new group on that node's interior queue must start at the
+/// tail: everything already there was relayed by — and stamped with — one of the
+/// other paths, so the new one can never need any of it, and reading it would
+/// mean acking frames whose transaction hashes the broker has long since purged.
+#[test]
+fn a_path_added_through_an_existing_terminal_node_starts_at_the_tail() {
+    let before: GraphDoc = serde_json::from_str(VRBO).expect("parse");
+    let after: GraphDoc =
+        serde_json::from_str(&VRBO.replace(r#""paths": ["#, PATHS_WITH_REVIEWS)).expect("parse");
+
+    let old = compile(&before);
+    let new = compile(&after);
+    assert_eq!(old.stages.len() + 2, new.stages.len(), "one path, two hops");
+
+    let added = new.stage("reviews", "partner").expect("the new hop");
+    assert_eq!(added.source, "gate.channel-go.vrbo.partner.in");
+    assert_eq!(added.group, "gate.channel-go.vrbo.reviews.partner");
+    assert!(
+        added.source_is_interior,
+        "the queue holds the other paths' frames and nothing this path can use"
+    );
+    // The entry of the new path is a front door and keeps `All`: a caller may
+    // well have been pushing at it before the declare landed.
+    let entry = new.stage("reviews", "reviews").expect("the new entry");
+    assert!(!entry.source_is_interior);
+    // And nothing about the paths that were already running changed.
+    for s in &old.stages {
+        let same = new.stage(&s.path, &s.node).expect("still there");
+        assert_eq!(same.source_is_interior, s.source_is_interior);
+        assert_eq!(same.group, s.group);
+    }
+}
+
+const VRBO: &str = r#"
+{
+  "application": "channel-go", "graph": "vrbo", "version": 1,
+  "nodes": {
+    "push":       { "ingress": true, "budgets": [{ "id": "p", "count": 100, "timeMs": 1000 }] },
+    "promotions": { "ingress": true, "budgets": [{ "id": "m", "count": 100, "timeMs": 1000 }] },
+    "content":    { "ingress": true, "budgets": [{ "id": "c", "count": 100, "timeMs": 1000 }] },
+    "reviews":    { "ingress": true, "budgets": [{ "id": "r", "count": 100, "timeMs": 1000 }] },
+    "partner":    { "budgets": [{ "id": "x", "count": 100, "timeMs": 1000 }],
+                    "egress": "channel-go.vrbo.out" }
+  },
+  "paths": [
+    { "name": "push",       "nodes": ["push",       "partner"] },
+    { "name": "promotions", "nodes": ["promotions", "partner"] },
+    { "name": "content",    "nodes": ["content",    "partner"] }
+  ]
+}
+"#;
+
+const PATHS_WITH_REVIEWS: &str = r#""paths": [
+    { "name": "reviews", "nodes": ["reviews", "partner"] },"#;

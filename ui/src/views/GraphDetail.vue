@@ -103,9 +103,10 @@ function counters(node) {
       duplicates: a.duplicates + (s.counters?.duplicates ?? 0),
       foreign: a.foreign + (s.counters?.foreign ?? 0),
       deadlettered: a.deadlettered + (s.counters?.deadlettered ?? 0),
+      wedged: a.wedged + (s.counters?.wedged ?? 0),
     }),
     { admitted: 0, deferred: 0, parked: 0, released: 0, forwarded: 0, commits: 0,
-      duplicates: 0, foreign: 0, deadlettered: 0 },
+      duplicates: 0, foreign: 0, deadlettered: 0, wedged: 0 },
   )
 }
 
@@ -381,6 +382,7 @@ async function remove() {
                 <th class="font-normal pb-1.5">foreign</th>
                 <th class="font-normal pb-1.5">already there</th>
                 <th class="font-normal pb-1.5">dead-lettered</th>
+                <th class="font-normal pb-1.5">wedged</th>
               </tr>
             </thead>
             <tbody>
@@ -409,6 +411,16 @@ async function remove() {
                 <td class="py-2 tabular-nums"
                     :class="s.counters?.deadlettered ? 'text-bad' : 'text-fg-3'">
                   {{ num(s.counters?.deadlettered) }}
+                </td>
+                <!-- The broker refusing the ack that would advance this stage's
+                     cursor, at a head that never moves. A STUCK CURSOR, not a
+                     budget backlog — which is what the 2026-09-02 incident was
+                     read as for hours, because `waiting for budget` was the only
+                     number that moved. Non-zero means an operator has to seek
+                     the group; the stage's own ERROR line carries the call. -->
+                <td class="py-2 tabular-nums"
+                    :class="s.counters?.wedged ? 'text-bad' : 'text-fg-3'">
+                  {{ num(s.counters?.wedged) }}
                 </td>
               </tr>
             </tbody>

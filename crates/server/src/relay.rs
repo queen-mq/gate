@@ -42,8 +42,9 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
+use chrono::{DateTime, SecondsFormat, Utc};
 use parking_lot::RwLock;
 use queen_mq::{Cancel, Message, Queen, SubscriptionMode, TxnPushItem};
 use serde_json::{json, Value};
@@ -65,6 +66,13 @@ pub struct StageRuntime {
     /// `(budget id, at)` — what last said no here. The console's "why am I
     /// waiting" answer, without a query.
     pub last_refusal: RwLock<Option<(String, i64)>>,
+    /// When this graph runtime started, taken ONCE in `supervisor::start`
+    /// before anything was provisioned or spawned. It is what a new group on a
+    /// Gate-owned interior queue is seeded from — see [`interior_seed`].
+    pub started_at: SystemTime,
+    /// A relay transaction the broker keeps refusing at the same claim head.
+    /// See [`Wedge`].
+    pub wedge: RwLock<Option<Wedge>>,
     pub cancel: Cancel,
 }
 
@@ -74,6 +82,120 @@ impl StageRuntime {
     }
 }
 
+/// How far BEFORE this runtime's start an interior queue's new group is seeded.
+///
+/// # The clock this compares against is not ours
+///
+/// The seed is a wall-clock instant taken from **Gate's** clock, and the broker
+/// resolves it against `log_segments.created_at`, stamped from **Postgres's**
+/// `clock_timestamp()` (`003_log_push.sql:219-224`). The two can disagree. Gate
+/// running AHEAD of the database is the direction that loses work — a frame
+/// this runtime relays could carry a database timestamp below our seed and be
+/// skipped — so the seed is pushed back by a margin that no plausible skew
+/// crosses.
+///
+/// Two minutes, and it is bounded on BOTH sides:
+///
+/// * below, by the skew it has to absorb — and by the spread between replicas.
+///   A declare lands on ONE replica and the others follow through the reconcile
+///   loop, up to `GATE_RECONCILE_SECONDS` later, each starting its own runtime
+///   with its own instant; whichever pops first is the one that creates the
+///   group and seeds it. The margin has to cover that spread as well, or a peer
+///   that seeded late could skip what the declaring replica had already
+///   relayed. Two minutes against a fifteen-second reconcile is eight times the
+///   room;
+/// * above, by the broker's transaction window. Frames inside the margin are
+///   foreign and are settled by ack, and an ack resolves by hash against
+///   `queen.log_txns`, purged at
+///   `now() - GREATEST(dedup_window, completed_retention, 900s)`
+///   (`006_log_maintenance.sql:389`). A margin at or past that window would
+///   re-create the very rollback loop this seeding exists to prevent, so it must
+///   stay comfortably inside the 900-second floor.
+///
+/// `GATE_INTERIOR_SEED_SKEW_SECONDS` moves it; the ceiling above is why the knob
+/// is clamped rather than free.
+pub const INTERIOR_SEED_SKEW: Duration = Duration::from_secs(120);
+
+/// The ISO-8601 instant a new group on a Gate-owned interior queue starts from.
+///
+/// `subscription_from` and not `SubscriptionMode::New`, and the difference is a
+/// race. Every stage of a runtime is spawned at once (`supervisor::start`), so
+/// the entry stage of a newly added path can relay a frame into an interior
+/// queue **before** the downstream stage's first pop has created its group. With
+/// `New` the broker seeds that group at `last_offset` as of the first pop
+/// (`004_log_pop.sql:844-850`), so the frame lands BELOW the cursor and is
+/// silently dropped — which is the failure the old blanket `All` was written to
+/// prevent. A cursor seeded from an instant taken before any stage was spawned
+/// has no such race: anything this runtime relays is at or after the seed.
+///
+/// The mode travels alongside as `New` only so that a broker which ignores
+/// `subscriptionFrom` degrades to the race rather than to the incident; queen
+/// 1.0.5 gives the timestamp precedence over the mode outright
+/// (`004_log_pop.sql:779-790`), so on the broker we run against the mode is not
+/// read at all.
+///
+/// # When `started_at` is old, which is exactly one case
+///
+/// The seed only ever applies to a group that does not exist yet, and in every
+/// ordinary way that happens the runtime is SECONDS old: a graph's first declare
+/// starts a runtime, adding a path swaps one for a new one, and a process
+/// restart makes one. The group's absence and the runtime's youth are the same
+/// event.
+///
+/// The exception is an operator DELETING a consumer group on a runtime that has
+/// been up for weeks. The next pop then re-creates it seeded at that runtime's
+/// start, which may be well outside the broker's transaction window — the
+/// incident's own shape, arrived at from the other direction. This is not
+/// closed, and it is not new: before this change the same deletion reseeded with
+/// `All`, at the head of the whole retained log, which is strictly worse. What
+/// is different is that the blast radius is now bounded by the runtime's age
+/// rather than by the retention, and that the stage says so — see [`Wedge`],
+/// which names the remedy. The remedy for a group that must be moved is
+/// `seek`, never `delete`.
+///
+/// # Floored at the epoch, and the floor is not decoration
+///
+/// A seed before 1970 is
+/// `All` wearing a timestamp — the broker's own "everything" sentinel IS the
+/// epoch (`004_log_pop.sql`) — so a machine whose clock reads zero would quietly
+/// restore the exact behaviour this function replaces. Such a clock breaks more
+/// than Gate, but it must not break it in THIS direction.
+pub fn interior_seed(started_at: SystemTime, skew: Duration) -> String {
+    let at = started_at
+        .checked_sub(skew)
+        .unwrap_or(started_at)
+        .max(SystemTime::UNIX_EPOCH);
+    let at: DateTime<Utc> = at.into();
+    at.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+/// A relay transaction the broker refuses, at the same claim head, over and
+/// over.
+///
+/// It exists because the 2026-09-02 incident was invisible for hours: the stage
+/// WARNed the identical rollback about ten times a second, and the only number
+/// that moved was `waiting_for_budget`, which said the backlog was waiting for a
+/// counter when nothing was. So a refusal that repeats at a head that never
+/// advances is escalated ONCE to `ERROR`, with the remedy in the line, and
+/// counted separately from a released batch.
+pub struct Wedge {
+    /// The transaction id of the claim's head. A different head means the
+    /// cursor moved, which means this is not the same wedge.
+    pub head: String,
+    pub attempts: u64,
+    /// Whether the `ERROR` line has already been written for this head. Once,
+    /// not once per attempt: ten lines a second is how the last one hid.
+    pub escalated: bool,
+}
+
+/// How many refusals at one head before the stage says so at `ERROR`.
+///
+/// Small, because the failure it names does not resolve on its own — the cursor
+/// cannot move until an operator seeks the group — but not one, because a
+/// single rolled-back transaction is an ordinary thing (a lapsed lease, a
+/// concurrent seek) and does not deserve an `ERROR`.
+const WEDGE_ESCALATE_AFTER: u64 = 5;
+
 /// Start the consumer.
 ///
 /// Every line of the builder below is load-bearing:
@@ -81,9 +203,19 @@ impl StageRuntime {
 /// * **no `.partition()`** — the wildcard pop is the scheduler (module doc);
 /// * **`.partitions(1)`** — one source partition per claim, which is the lane
 ///   discipline the 33-vs-603 txn/s measurement bought;
-/// * **`.subscription_mode(All)`** — never `new`: a group created at the tail
-///   silently skips everything already waiting, which for a limiter means
-///   silently dropping the backlog it exists to pace;
+/// * **the subscription seed** — two rules, decided by
+///   `Stage::source_is_interior` and by nothing else:
+///   * an INGRESS source (user-owned or the Gate-owned HTTP door) gets
+///     **`All`**, never `new`: an application producer writes it, so a group
+///     created at the tail silently skips everything already waiting, which for
+///     a limiter means silently dropping the backlog it exists to pace;
+///   * a Gate-owned INTERIOR source gets **the tail as of this runtime's
+///     start**, expressed as a `subscription_from` timestamp. Only Gate's own
+///     relay writes such a queue, and only for a path that stamped its own name
+///     on the frame, so a new group there can never need anything older than
+///     the instant its own upstream stage started relaying. See
+///     [`interior_seed`], `Stage::source_is_interior`, and the incident both
+///     name;
 /// * **`.auto_ack(false)`** — the relay settles inside its own transaction, so
 ///   an ack the client sent on its own would forward nothing and lose the item;
 /// * **`.wait(true)` with a 30s poll timeout** — this is the line that turns
@@ -107,10 +239,26 @@ pub fn spawn(
             traces,
         };
         let ctx = Arc::new(ctx);
-        let res = q
-            .queue(&st.stage.source)
-            .group(&st.stage.group)
-            .subscription_mode(SubscriptionMode::All)
+        // The seed is applied only where the group does not exist yet — the
+        // broker never re-seeds a cursor it already has (`QueueBuilder::
+        // subscription_mode`, and `004_log_pop.sql`'s `ON CONFLICT DO NOTHING`
+        // on both the metadata row and the per-partition cursors) — so this is
+        // a no-op on every restart of a graph that has run before.
+        let subscribe = q.queue(&st.stage.source).group(&st.stage.group);
+        let subscribe = if st.stage.source_is_interior {
+            let from = interior_seed(st.started_at, k.interior_seed_skew);
+            tracing::debug!(
+                stage = %st.key(), queue = %st.stage.source, group = %st.stage.group, from = %from,
+                "a Gate-owned interior source: a new group here starts at the tail as of this \
+                 runtime's start, never at the head of another path's backlog"
+            );
+            subscribe
+                .subscription_mode(SubscriptionMode::New)
+                .subscription_from(from)
+        } else {
+            subscribe.subscription_mode(SubscriptionMode::All)
+        };
+        let res = subscribe
             .batch(st.stage.batch as i32)
             .partitions(1)
             .concurrency(st.stage.concurrency as usize)
@@ -735,14 +883,95 @@ async fn settle(ctx: &Ctx, window: &[Message], kinds: &[Kind], admitted: usize, 
         // Give it back before returning, or a broker that refuses transactions
         // for a minute silently eats a minute of ceiling.
         Settled::Failed(why) => {
-            tracing::warn!(
-                stage = %st.key(), error = %why,
-                "the relay transaction did not commit; refunding and letting the lease lapse"
-            );
+            note_failed_settle(ctx, prefix, &why);
             refund_for(ctx, &charged, ledger).await;
             st.counters.released.fetch_add(1, Ordering::Relaxed);
         }
     }
+}
+
+/// Whether the broker refused the ACK itself, for a reason that cannot resolve
+/// on its own.
+///
+/// `QTXN ack references unknown transactionId; transaction rolled back`
+/// (`005_log_ack.sql:1451`), surfaced by the broker as the `ack_rejected`
+/// failure kind (`handlers/data.rs`, `txn_reason_for`). It means the hash the
+/// ack names resolves nowhere: either the transaction never existed, or — the
+/// case that took Gate down — its `log_txns` row was purged, which happens at
+/// `now() - GREATEST(dedup_window, completed_retention, 900s)`
+/// (`006_log_maintenance.sql:389`) while the segment itself is retained for far
+/// longer. Nothing Gate does moves that frame: the cursor is behind it, the ack
+/// that would advance the cursor is the thing being refused, and lease expiry
+/// hands the identical claim straight back.
+///
+/// Matched on the text because the text is what the client surfaces; both the
+/// broker's kind and the SQL's own wording are accepted so a rewording on
+/// either side does not silently switch the escalation off. A miss costs the
+/// `ERROR` line, never correctness.
+fn is_ack_rejected(why: &str) -> bool {
+    let w = why.to_ascii_lowercase();
+    w.contains("ack_rejected")
+        || (w.contains("ack") && w.contains("unknown transactionid"))
+        || w.contains("qtxn ack")
+}
+
+/// A settle the broker refused: warn always, escalate once.
+///
+/// The 2026-09-02 incident ran for hours at `WARN`, ten lines a second, saying
+/// the same thing each time — and the only figure that moved was
+/// `waiting_for_budget`, which attributed a wedged cursor to a counter that had
+/// plenty left. So a refusal that repeats at a claim head that never advances is
+/// counted as [`StageCounters::wedged`] and said ONCE at `ERROR`, with the
+/// remedy in the line.
+fn note_failed_settle(ctx: &Ctx, prefix: &[Message], why: &str) {
+    let st = &ctx.st;
+    let head = prefix
+        .first()
+        .map(|m| m.transaction_id.clone())
+        .unwrap_or_default();
+
+    // A different head means the cursor moved, which means whatever this is, it
+    // is not the wedge we were counting.
+    let (attempts, escalate) = {
+        let mut guard = st.wedge.write();
+        let fresh = !matches!(guard.as_ref(), Some(w) if w.head == head);
+        if fresh {
+            *guard = Some(Wedge {
+                head: head.clone(),
+                attempts: 0,
+                escalated: false,
+            });
+        }
+        let w = guard.as_mut().expect("just set");
+        w.attempts += 1;
+        let escalate = is_ack_rejected(why) && w.attempts >= WEDGE_ESCALATE_AFTER && !w.escalated;
+        if escalate {
+            w.escalated = true;
+        }
+        (w.attempts, escalate)
+    };
+
+    if escalate {
+        st.counters.wedged.fetch_add(1, Ordering::Relaxed);
+        tracing::error!(
+            stage = %st.key(), queue = %st.stage.source, group = %st.stage.group,
+            partition = %prefix.first().map(|m| m.partition.as_str()).unwrap_or(""),
+            attempts, error = %why,
+            "this stage is WEDGED: the broker refuses the ack that would advance the cursor, so \
+             the same claim comes back for ever and nothing here can move it. This is a stuck \
+             cursor and NOT a budget backlog, whatever `waitingForBudget` says. Remedy: POST \
+             /api/v1/consumer-groups/{}/queues/{}/seek with {{\"toEnd\":true}} on the broker, \
+             then check why this group is reading frames older than the broker's transaction \
+             window",
+            st.stage.group, st.stage.source
+        );
+        return;
+    }
+
+    tracing::warn!(
+        stage = %st.key(), attempts, error = %why,
+        "the relay transaction did not commit; refunding and letting the lease lapse"
+    );
 }
 
 /// The QDUP recovery: halve the claim until a prefix commits.
@@ -874,6 +1103,11 @@ async fn stage_and_commit(
             st.counters
                 .cost
                 .fetch_add(cost.max(0) as u64, Ordering::Relaxed);
+            // The cursor moved, so whatever was being counted at the old head is
+            // over. The head comparison in `note_failed_settle` would notice on
+            // its own; this keeps the count honest without waiting for a second
+            // failure to say so.
+            *st.wedge.write() = None;
             Settled::Committed
         }
         Err(e) if e.to_string().contains("QDUP") => Settled::Duplicate,
@@ -1112,6 +1346,7 @@ mod tests {
                 source: "src".into(),
                 group: "grp".into(),
                 first_hop: true,
+                source_is_interior: false,
                 check_foreign: false,
                 owns_unstamped: true,
                 batch: 200,
@@ -1138,6 +1373,8 @@ mod tests {
             },
             counters: Default::default(),
             last_refusal: RwLock::new(None),
+            started_at: SystemTime::UNIX_EPOCH,
+            wedge: RwLock::new(None),
             cancel: Cancel::new(),
         }
     }
@@ -1364,6 +1601,136 @@ mod tests {
     #[test]
     fn nothing_admitted_at_the_head_settles_nothing() {
         assert_eq!(settle_end(&[Kind::Work, Kind::Foreign], 0), 0);
+    }
+
+    // ------------------------------------------- where a new group starts
+
+    /// The seed is the runtime's start, pushed back by the skew margin, as an
+    /// ISO-8601 instant the broker parses with `::timestamptz`.
+    #[test]
+    fn the_interior_seed_is_the_runtimes_start_less_the_skew() {
+        // 2026-09-02T12:00:00Z, in seconds since the epoch.
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_788_350_400);
+        assert_eq!(
+            interior_seed(start, Duration::ZERO),
+            "2026-09-02T12:00:00.000Z"
+        );
+        assert_eq!(
+            interior_seed(start, Duration::from_secs(120)),
+            "2026-09-02T11:58:00.000Z"
+        );
+        assert_eq!(
+            interior_seed(start, INTERIOR_SEED_SKEW),
+            "2026-09-02T11:58:00.000Z",
+            "the shipped margin is two minutes"
+        );
+    }
+
+    /// A seed before the epoch would be `All` in disguise — the broker's own
+    /// "deliver everything" sentinel IS the epoch — so the margin is floored
+    /// there rather than allowed to walk back past it.
+    #[test]
+    fn the_interior_seed_never_underflows_the_epoch() {
+        let seed = interior_seed(SystemTime::UNIX_EPOCH, Duration::from_secs(600));
+        assert_eq!(seed, "1970-01-01T00:00:00.000Z");
+        let seed = interior_seed(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(60),
+            Duration::from_secs(600),
+        );
+        assert_eq!(seed, "1970-01-01T00:00:00.000Z");
+    }
+
+    /// The margin has a hard ceiling and it is the broker's, not ours.
+    ///
+    /// Frames inside the margin are foreign and are settled by ack; an ack
+    /// resolves by hash against `queen.log_txns`, purged at `now() -
+    /// GREATEST(dedup_window, completed_retention, 900s)`. A margin at or past
+    /// that floor would seed the cursor among frames that can no longer be
+    /// acked, which is precisely the rollback loop the seeding exists to
+    /// prevent — so this is the assertion that stops somebody "fixing" a skew
+    /// complaint by widening it to an hour.
+    #[test]
+    fn the_seed_margin_stays_inside_the_brokers_transaction_window() {
+        const BROKER_TXNS_FLOOR: Duration = Duration::from_secs(900);
+        assert!(
+            INTERIOR_SEED_SKEW * 2 < BROKER_TXNS_FLOOR,
+            "the default margin must sit well inside the broker's txns window"
+        );
+        assert!(knobs().interior_seed_skew <= Duration::from_secs(600));
+    }
+
+    /// Only the refusal that cannot resolve on its own escalates.
+    ///
+    /// A lapsed lease, a concurrent seek, a broker restart: those roll a
+    /// transaction back too, and they clear by themselves. The ack the broker
+    /// cannot resolve does not — the cursor is behind the frame, the ack that
+    /// would move it is the thing being refused, and the lease hands the same
+    /// claim straight back.
+    #[test]
+    fn only_an_unresolvable_ack_counts_as_a_wedge() {
+        assert!(is_ack_rejected(
+            "QTXN ack references unknown transactionId; transaction rolled back"
+        ));
+        assert!(is_ack_rejected("broker error: ack_rejected"));
+        assert!(!is_ack_rejected("invalid or expired lease"));
+        assert!(!is_ack_rejected(
+            "QDUP duplicate messages in queue q partition p"
+        ));
+        assert!(!is_ack_rejected("connection reset by peer"));
+    }
+
+    /// The escalation is once per wedged head, not once per attempt — ten lines
+    /// a second is how the last one hid — and a head that moves resets it.
+    #[test]
+    fn a_wedge_says_so_once_and_a_moving_cursor_resets_it() {
+        let st = runtime(vec![budget("b", 10)], 1.0);
+        let refusal = "QTXN ack references unknown transactionId; transaction rolled back";
+
+        let mut escalations = 0;
+        for _ in 0..50 {
+            if wedge_step(&st, "head-1", refusal) {
+                escalations += 1;
+            }
+        }
+        assert_eq!(escalations, 1, "one ERROR for one wedge, not fifty");
+
+        // The cursor moved: a different head is a different situation, and it
+        // must be able to escalate on its own account.
+        let mut again = 0;
+        for _ in 0..WEDGE_ESCALATE_AFTER {
+            if wedge_step(&st, "head-2", refusal) {
+                again += 1;
+            }
+        }
+        assert_eq!(again, 1);
+
+        // And a refusal that resolves on its own never escalates, however often
+        // it repeats at one head.
+        let ordinary = runtime(vec![budget("b", 10)], 1.0);
+        for _ in 0..50 {
+            assert!(!wedge_step(&ordinary, "head-1", "invalid or expired lease"));
+        }
+    }
+
+    /// The book-keeping half of `note_failed_settle`, without a broker: returns
+    /// whether THIS refusal is the one that escalates.
+    fn wedge_step(st: &StageRuntime, head: &str, why: &str) -> bool {
+        let mut guard = st.wedge.write();
+        let fresh = !matches!(guard.as_ref(), Some(w) if w.head == head);
+        if fresh {
+            *guard = Some(Wedge {
+                head: head.to_string(),
+                attempts: 0,
+                escalated: false,
+            });
+        }
+        let w = guard.as_mut().expect("just set");
+        w.attempts += 1;
+        let escalate = is_ack_rejected(why) && w.attempts >= WEDGE_ESCALATE_AFTER && !w.escalated;
+        if escalate {
+            w.escalated = true;
+        }
+        escalate
     }
 
     #[test]

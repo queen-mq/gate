@@ -207,15 +207,30 @@ with no broker configured, which is green lines that verified nothing. CI sets
 | `GATE_LEASE_SECONDS` | 10 | a **work** lease, renewed while a handler runs |
 | `GATE_POLL_TIMEOUT_SECONDS` | 30 | the parked long-poll window; paid in shutdown latency |
 | `GATE_MAX_PARK_MS` | 30000 | how long a handler holds its claim waiting for a window before releasing |
+| `GATE_INTERIOR_SEED_SKEW_SECONDS` | 120 | how far before a graph's start a new group on an **interior** queue is seeded; a margin for Gate's clock against the broker's, capped at 600 |
 | `GATE_RECONCILE_SECONDS` | 15 | how often a replica re-reads the store |
+
+**Where a new consumer group starts, and it is two rules.** On an **ingress** queue — yours, or
+Gate's own HTTP front door — a new group is seeded at the *head* of the retained log, because a
+producer writes it and a backlog there is real work the limiter exists to pace. On an **interior**
+queue, which only Gate's own relay ever writes, a new group is seeded at the *tail* as of the
+moment the graph runtime started. That difference is not decoration: a frame reaches an interior
+queue only because some path relayed it there and stamped its own name on it, so a group for a path
+added later can never need anything that was already sitting there — and reading it would mean
+acking frames whose transaction rows the broker has long since purged, which is a stage that can
+never advance its cursor again. The first declare of a graph provisions those queues empty, so tail
+and head are the same thing and nothing changes; a restart finds the group already there and the
+broker leaves its cursor alone.
 
 **Replicas are safe.** Declarations live in `queen.kv` and every replica reconciles against them on
 that timer; counters are one row each, so N replicas spend one budget.
 
 **The hot path writes nothing** — one kv batch and one transaction is the entire budget. Per stage
 there are counters (`popped`, `admitted`, `deferred`, `parked`, `released`, `forwarded`, `commits`,
-`duplicates`, `foreign`, `deadlettered`), and `forwarded / commits` is the number that explains a
-stage's throughput. Denials are kept in a bounded in-process ring; admissions are counted, never
+`duplicates`, `foreign`, `deadlettered`, `wedged`), and `forwarded / commits` is the number that
+explains a stage's throughput. `wedged` is the one to alert on: it counts a stage whose ack the
+broker keeps refusing at a claim head that never moves, which is a stuck cursor and not a budget
+backlog — the stage says so once at `ERROR` with the `seek` that fixes it. Denials are kept in a bounded in-process ring; admissions are counted, never
 traced. Rollups are opt-in per graph (`"counters": { "windowSeconds": 60 }`), because observability
 is a thing you switch on, not a thing that runs whether or not anyone is looking.
 

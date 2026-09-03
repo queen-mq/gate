@@ -83,7 +83,7 @@ do re-check them if the broker minor version moves.
 | The wildcard pop picks candidate partitions in **randomised order** and claims with **`FOR UPDATE SKIP LOCKED`**, precisely so concurrent consumers of one group spread across partitions instead of convoying. | `004_log_pop.sql`, `log_pop_wildcard_wire_v1` and the `SKIP LOCKED` NB | **This is the scheduler.** Gate does not need to pin runners to partitions, does not need to probe which partitions are hot, and does not need a rotation cursor. The broker already does all three. |
 | A parked long-poll **releases its pooled PG connection before parking** and is woken by the push notifier. | `server/src/handlers/data.rs` §10 comments | An idle graph costs parked timers, not queries. This is the acceptance criterion in §15. |
 | `GET /api/v1/resources/queues/:queue/depth?group=` is watermark arithmetic only, ~1ms; per-group form is `pending` per partition against that group's cursor. Broker ≥ 1.0.4. | `011_log_stats.sql` `log_queue_depth_v1`; `clients/client-rust/src/admin.rs` `queue_depth` | ETA and the console read it **on demand**. Nothing in the hot path reads a depth, ever. |
-| Rust client surface: `QueueBuilder` has `group / batch / partitions / concurrency / auto_ack / wait / poll_timeout / renew_lease / lease_seconds / subscription_mode / cancel` and `consume_batch`; `Kv` has `incr / get / get_many / batch`; `TransactionBuilder` has `ack / push_item / kv / commit`; `Admin` has `queue_depth`. | `clients/client-rust/src/{queue,consumer,kv,transaction,admin}.rs` | **Everything v2 needs is in the `queen-mq` crate.** No fallback to Gate's internal HTTP client is required for the data plane. |
+| Rust client surface: `QueueBuilder` has `group / batch / partitions / concurrency / auto_ack / wait / poll_timeout / renew_lease / lease_seconds / subscription_mode / subscription_from / cancel` and `consume_batch`; `Kv` has `incr / get / get_many / batch`; `TransactionBuilder` has `ack / push_item / kv / commit`; `Admin` has `queue_depth`. | `clients/client-rust/src/{queue,consumer,kv,transaction,admin}.rs` | **Everything v2 needs is in the `queen-mq` crate.** No fallback to Gate's internal HTTP client is required for the data plane. |
 
 ### 2.1 The one primitive queen does not have
 
@@ -437,8 +437,10 @@ One `tokio` task per stage, holding one `queen_mq::QueueBuilder` `consume_batch`
 ```rust
 queen.queue(stage.source)
      .group(&stage.group)
-     .subscription_mode(SubscriptionMode::All)   // never `new`: a group at the tail
-                                                 // silently skips everything already waiting
+     // Where a NEW group starts, and it is two rules — see below.
+     //   ingress source:   .subscription_mode(All)
+     //   interior source:  .subscription_mode(New)
+     //                     .subscription_from(runtime_start - INTERIOR_SEED_SKEW)
      .batch(stage.batch)                         // default 200
      .partitions(1)                              // ONE source partition per claim — §6.4
      .concurrency(stage.concurrency)             // default = max(4, source partitions)
@@ -472,6 +474,70 @@ Every line of that is load-bearing and every one gets a comment in the source:
 * **`renew_lease`.** The handler may park in-line for up to a sub-window. Without renewal the
   lease could lapse mid-park and the batch would be redelivered while this worker still holds
   it.
+* **The subscription seed**, and it is **two rules, decided by what writes the source queue**.
+  The plan carries the answer per stage as `Stage::source_is_interior`, so the consumer reads a
+  bool and nobody matches on a queue name.
+
+  * An **ingress** source — a queue the application owns, or Gate's own
+    `gate.{app}.{graph}.{node}.ingress` HTTP door — gets **`All`**, never `new`. A producer
+    writes it; a group created at the tail silently skips everything already waiting, which for a
+    limiter means silently dropping the backlog it exists to pace. Two paths entering at one node
+    is pub-sub by design (§4.2/§6.7), so this is unchanged and for the unchanged reason.
+  * A Gate-owned **interior** source — `gate.{app}.{graph}.{node}.in`, written only by Gate's own
+    relay — is seeded at **the tail as of the moment this graph runtime started**, expressed as a
+    `subscription_from` timestamp.
+
+  **Why that is exact and not a heuristic.** A frame lands on an interior queue only because a
+  stage of some path `P` relayed it there, and it carries `P`'s `_gate.path` stamp. A group for
+  `P` on that queue can therefore never need anything older than the instant `P`'s own upstream
+  stage started relaying. The three cases fall out: a graph's **first declare** provisions its
+  interior queues empty, so tail is head and nothing changes; a **restart** finds the group
+  already there and the broker never re-seeds a cursor that exists; a **path added to a running
+  graph** starts at the tail and skips the other paths' backlog, which is the whole point.
+
+  **Why a timestamp and not `SubscriptionMode::New`.** `New` has a startup race. Every stage of a
+  runtime is spawned at once, so the entry stage of the added path can relay a frame into the
+  interior queue before the downstream stage's first pop has created its group; `New` seeds that
+  group at `last_offset` as of the first pop, so the frame lands below the cursor and is dropped —
+  the exact failure the blanket `All` was written to prevent. A cursor seeded from an instant taken
+  in `supervisor::start` **before anything is provisioned or spawned** cannot lose that race:
+  anything this runtime relays is at or after the seed. Verified against the broker, and the three
+  facts it rests on are (`004_log_pop.sql` in the queen server):
+
+  * a new group's per-partition cursors are seeded at the first segment with
+    `created_at >= T`, cursor `= base_offset - 1`, falling back to `last_offset` when nothing is
+    that recent (the group-first-contact bulk seed, `:832-843`);
+  * a partition that materialises **later** — and that queue had 105 of them, created lazily per
+    key — reads the group's stored `subscription_timestamp` from `consumer_groups_metadata` and
+    walks the same way (`:182-199` and `:305-319`), rather than starting at that partition's tail;
+  * `subscription_from` takes precedence over the mode outright (`:779-790`), and the symbolic
+    `now` is resolved broker-side — but `now` is *not* what Gate sends, because it degrades to
+    `new` and hands the race straight back.
+
+  **The seed is Gate's clock and the frames carry Postgres's**
+  (`003_log_push.sql:219-224`), so the instant is pushed back by `INTERIOR_SEED_SKEW`, two minutes,
+  `GATE_INTERIOR_SEED_SKEW_SECONDS`. The margin is bounded on both sides: below by the skew it
+  absorbs and by the spread between replicas — a declare lands on one replica and the others
+  follow through the reconcile loop up to `GATE_RECONCILE_SECONDS` later, each with its own start
+  instant, and whichever pops first is the one that seeds the group — above by the broker's
+  `log_txns` purge at
+  `now() - GREATEST(dedup_window, completed_retention, 900s)`
+  (`006_log_maintenance.sql:389`) — frames inside the margin are foreign and are settled by ack,
+  and an ack older than that window resolves nowhere. Which is the incident, below.
+
+  **The incident, 2026-09-02.** `channel-go` redeclared `vrbo` adding a path `reviews` through the
+  pre-existing terminal node `partner`. The new stage `(reviews, partner)` read
+  `gate.channel-go.vrbo.partner.in` under a brand-new group, seeded with `All` at the oldest
+  retained frame of all 105 partitions: ~19,800 frames belonging to the other three paths, the
+  oldest twelve days old. Every one was foreign, foreign frames are settled by ack inside the
+  single relay transaction (§6.4/§6.7), and the broker resolves those acks by transaction hash
+  against `queen.log_txns` — purged long before the segments are. So every ack resolved nowhere,
+  the broker raised `QTXN ack references unknown transactionId; transaction rolled back`
+  (`005_log_ack.sql:1451`), and the transaction rolled back. Gate logged the refusal about ten
+  times a second per replica, for ever; the cursor never moved; both replicas OOMed at 512Mi; and
+  the console reported the backlog as `waiting_for_budget`, which was a lie — nothing was waiting
+  for a counter. An operator fixed it by seeking the group to the end. Two things came out of it:
+  this rule, and `StageCounters::wedged` (§6.4), so the next one has a number of its own.
 
 ### 4.4 What no longer runs
 
@@ -718,6 +784,20 @@ txn.commit().await
   `TransactionBuilder::kv`, though the wire supports it: the decision would then be known
   only after the pushes were already staged, which is the read-then-write shape `incr` exists
   to remove.
+* **A transaction the broker refuses at a head that never moves is WEDGED, and says so.** Most
+  rolled-back transactions clear by themselves — a lapsed lease, a concurrent seek, a broker
+  restart — and are a `WARN` and a refund. One does not: `QTXN ack references unknown
+  transactionId` (`005_log_ack.sql:1451`, surfaced as the `ack_rejected` kind) means the hash the
+  ack names resolves nowhere, usually because its `log_txns` row was purged while the frame itself
+  is still retained. Nothing Gate does moves that frame — the cursor is behind it, the ack that
+  would advance the cursor is the thing being refused, and lease expiry hands the identical claim
+  straight back. So after a few refusals at one claim head the stage escalates **once** to `ERROR`
+  — once, because ten identical `WARN` lines a second is precisely how the 2026-09-02 incident
+  stayed invisible for hours — naming the remedy
+  (`POST /api/v1/consumer-groups/{group}/queues/{queue}/seek` with `{"toEnd": true}`) and bumping
+  `StageCounters::wedged`. The counter matters as much as the line: with only `released`,
+  `popped` and `waitingForBudget` to look at, a wedged cursor reads on the console as a busy
+  limiter doing its job.
 
 ### 6.5 Park or release
 
@@ -793,6 +873,20 @@ extra acks per message, batched. At three paths it is two extra acks per message
 extra ack transaction per batch per group. Measurable, bounded, and the thing §16.1 asks
 whether to trade away for per-path interior queues (`gate.{app}.{graph}.{node}.{path}.in`),
 which would remove it entirely at the cost of one queue per path-hop.
+
+**And the cost is bounded only because of where a new group starts.** "One ack per foreign
+message" is cheap when the foreign messages are *recent*. It is not cheap, and on 2026-09-02 it
+was not even possible, when a group's cursor is seeded at the head of a twelve-day retained log:
+an ack resolves by transaction hash against `queen.log_txns`, which the broker purges after
+`GREATEST(dedup_window, completed_retention, 900s)` while the segments live for far longer, so an
+ack for a frame older than that window resolves nowhere and rolls the whole relay transaction
+back. The skip has no way out of that — the cursor cannot move, the ack that would move it is the
+thing being refused, and lease expiry hands the identical claim back. So the skip is only ever
+asked to settle frames a group could plausibly have been meant to see, and that is what §4.3's
+seeding rule guarantees: a new group on an interior queue starts at the tail as of its runtime's
+start, plus a small clock-skew margin that is deliberately far inside the broker's transaction
+window. A stage that finds itself in the old situation anyway now says so — see
+`StageCounters::wedged` and the `ERROR` it escalates to once, naming the `seek` that clears it.
 
 ### 6.8 The `_gate` stamp
 
@@ -1204,7 +1298,7 @@ move.
 |---|---|---|
 | One gate runner per lane per shard, pinned | O | The wildcard pop + `SKIP LOCKED` is the scheduler (§4.3). No pinning, no runner-per-partition, no `max_partitions = 1` correctness argument. |
 | Gate consumer group named explicitly | R | §4.1: `gate.{app}.{graph}.{path}.{node}`, minted in one function, for the same measured reason (a group with no cursor owes its whole retained range). |
-| `subscription_mode = All` | R | §4.3, on every group Gate owns, unchanged and for the unchanged reason. |
+| `subscription_mode = All` | R, **narrowed 2026-09-02** | §4.3. Kept, and for the unchanged reason, on every group whose source is an **ingress** queue — a producer writes it, so a group at the tail drops the backlog the limiter exists to pace. **Not** on a group whose source is a Gate-owned **interior** queue: those are seeded at the tail of the log as of the runtime's start (`subscription_from`), because only Gate's own relay writes them and only for a path that stamped its own name on the frame. `All` there put a newly declared path's group at the head of three other paths' twelve-day backlog, and acking a frame older than the broker's `log_txns` window is not possible — the stage rolled back for ever. `Stage::source_is_interior` carries the distinction so the consumer reads a bool. |
 | `reset: true` on registration | O | No streams registration, no config hash, no state to clobber. |
 | `STREAM_MAX_WAIT` (the idle poll window) | R | Becomes `poll_timeout(30s)` on a parked long-poll. It can be 30s rather than 5s because the parked poll holds no connection and is push-woken; the ceiling is still shutdown latency, and the supervisor still awaits handles for `poll_timeout + 2s`. |
 | Gate closure: scope extraction and cost | R | §6.1. Five fixed dimensions become an arbitrary `scopeBy` payload path; cost is a declared path with a default and a max, integer-valued (§3.2). |
@@ -1376,7 +1470,9 @@ Call-event queue and meter loop **O** · `LaneStats` and `last_breach` **R** (pe
 only) · depth probe + 404 memory **R** · the ETA answer, `assumes` and routes **R** ·
 `/v1/.../metrics` **R** · console read API **R** · console UI **R** (§14.7) · console identity
 **R** · logging **R** (same `tracing` setup, same structured fields, nothing per message;
-new WARN sites: a refused refund, a QDUP split, a stage parked past `MAX_PARKS`).
+new WARN sites: a refused refund, a QDUP split, a stage parked past `MAX_PARKS`; one new ERROR
+site, the wedged-cursor escalation of §6.4, which fires once per wedge and carries the `seek` that
+clears it).
 
 ### 13.14 Attestation
 
@@ -1401,7 +1497,7 @@ new WARN sites: a refused refund, a QDUP split, a stage parked past `MAX_PARKS`)
 | `core/tests/graph.rs` (31 tests, 609 lines) | **mostly rewritten** | The `airbnb()` fixture is ported to the v2 document (§3.7) and must still *validate clean and warn about nothing* — that is the single most valuable test in the file and it stays, in the new vocabulary. The rule-name assertions follow §11's table. Tests for rules that are gone are deleted with a one-line reason each in the commit body. |
 | `core/tests/validate.rs` (33 tests, 567 lines) | **mostly rewritten** | Same. The flagship property test (`every_spec_that_validates_clean_divides_exactly_one_ceiling`, exhaustive over 6×5×5×22) is **deleted**, and its epitaph goes in the commit: *the property it enforces is now structural — there is one counter, so N ceilings cannot oversubscribe it. The 7131-against-5000 defect is not expressible.* Its replacement is `every_share_is_a_ceiling_on_one_counter`, which asserts the compiled `max` per path is `round(count_sub × share)` and monotone in priority. |
 | `server/tests/units.rs` (9 tests) | **partly ported** | `window_for` and the edge-group test go (no window, new group name). The five `eta::admits` tests port with their fixtures and their fixed instant. `the_gates_group_is_the_one_the_stream_runtime_derives` is replaced by a stage-group naming test. |
-| `server/tests/live.rs` (32 tests, 3076 lines) | **kept, ported, extended** | This suite is the most valuable artefact in the repository and the port is the bulk of the work. Ported unchanged in intent: exactly-once relay, per-partition ordering, replay refusal, QDUP poison recovery, interior-queue ownership, one-owner, declare/provision/store failure recovery, both replica-convergence tests, the reconcile loop, the depth stale-serve and 404 memo, the three ETA tests, the console draw. Rewritten: the priority tests, because §3.6 changes what priority *means* — the new assertion is that under saturation the high-share path continues to admit while the low-share path refuses, which is the property that was bought. Deleted with reasons: the strict-ordering leg tests, `a_leg_that_is_not_dry_holds_its_window_but_not_for_ever`, `a_wide_window_does_not_leak_priority_to_the_next_leg`. New: budget refund on a failed transaction, park-vs-release at the threshold, jitter under contention, fan-out branch identity, fan-in non-collapse, the breaker, and a foreign-path skip on a shared interior queue. |
+| `server/tests/live.rs` (32 tests, 3076 lines) | **kept, ported, extended** | This suite is the most valuable artefact in the repository and the port is the bulk of the work. Ported unchanged in intent: exactly-once relay, per-partition ordering, replay refusal, QDUP poison recovery, interior-queue ownership, one-owner, declare/provision/store failure recovery, both replica-convergence tests, the reconcile loop, the depth stale-serve and 404 memo, the three ETA tests, the console draw. Rewritten: the priority tests, because §3.6 changes what priority *means* — the new assertion is that under saturation the high-share path continues to admit while the low-share path refuses, which is the property that was bought. Deleted with reasons: the strict-ordering leg tests, `a_leg_that_is_not_dry_holds_its_window_but_not_for_ever`, `a_wide_window_does_not_leak_priority_to_the_next_leg`. New: budget refund on a failed transaction, park-vs-release at the threshold, jitter under contention, fan-out branch identity, fan-in non-collapse, the breaker, and a foreign-path skip on a shared interior queue. Added 2026-09-02: `a_path_added_to_a_running_graph_starts_at_the_tail`, the regression test for §4.3's seeding rule — declare one path, leave a backlog on the terminal node's interior queue, add a second path through it, and assert the new group's `foreign` and `lag` are both zero while both paths still run end to end. |
 | `FaultyBroker` harness | R, extended | §13.7. |
 | CI (`test.yml`) | R, **three fixes** | The trigger moves from `main` to `master` (the workflow may never have run on a push); the broker service moves to ≥ 1.0.4 so the depth route's happy path is exercised and not only its 404 fallback; clippy gets `-D warnings`. `PG_HOST` is set for Gate so the history layer stops being entirely untested. |
 | Dockerfile, `docker-build.yml`, `build.rs`, `ui/dist` compile dependency | R | Unchanged, plus the one dead layer-cache line fixed (`crates/bench/Cargo.toml` is missing from the manifest pre-copy, and the pre-copy buys nothing anyway without a `cargo fetch` between it and `COPY crates`). |
