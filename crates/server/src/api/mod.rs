@@ -30,7 +30,7 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use parking_lot::RwLock;
 use queen_mq::Queen;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::budget::Budgets;
 use crate::obs::Traces;
@@ -289,6 +289,23 @@ pub fn ok(v: serde_json::Value) -> ApiResult {
     Ok(Json(v).into_response())
 }
 
+/// Gate's HTTP doors add `_gate` metadata to the application payload. Refuse a
+/// shape that cannot carry that metadata instead of silently replacing the
+/// caller's data with an empty object.
+pub(crate) fn object_payload(payload: Value) -> Result<Value, Fail> {
+    if payload.is_object() {
+        return Ok(payload);
+    }
+    Err(Fail(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        format!(
+            "payload must be a JSON object: Gate must add `{}` metadata without changing the \
+             application value",
+            gate_core::GATE_META
+        ),
+    ))
+}
+
 impl From<crate::graph::Refusal> for Fail {
     fn from(r: crate::graph::Refusal) -> Self {
         match r {
@@ -350,4 +367,22 @@ pub fn refuse_if_stopped(rt: &Arc<crate::registry::GraphRuntime>) -> Result<(), 
             rt.key()
         ),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_http_payload_must_be_an_object_instead_of_being_discarded() {
+        let kept = object_payload(json!({ "kept": true }))
+            .ok()
+            .expect("object refused");
+        assert_eq!(kept["kept"], true);
+        for value in [json!(null), json!(7), json!("lost"), json!([1, 2])] {
+            let err = object_payload(value).expect_err("non-object accepted");
+            assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+            assert!(err.1.contains("must be a JSON object"));
+        }
+    }
 }

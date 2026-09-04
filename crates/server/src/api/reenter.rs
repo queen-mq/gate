@@ -38,7 +38,7 @@ use serde_json::{json, Value};
 
 use gate_core::GATE_META;
 
-use crate::api::{find, ok, refuse_if_stopped, resolve, ApiResult, Fail, Shared};
+use crate::api::{find, object_payload, ok, refuse_if_stopped, resolve, ApiResult, Fail, Shared};
 use crate::registry::GraphRuntime;
 
 #[derive(Debug, Deserialize)]
@@ -85,7 +85,8 @@ pub async fn graph_reenter_default(
 async fn reenter(st: &Shared, rt: &std::sync::Arc<GraphRuntime>, body: ReenterBody) -> ApiResult {
     refuse_if_stopped(rt)?;
 
-    let stamp = body.payload.get(GATE_META);
+    let mut item = object_payload(body.payload.clone())?;
+    let stamp = item.get(GATE_META);
     let path = body
         .path
         .clone()
@@ -164,10 +165,6 @@ async fn reenter(st: &Shared, rt: &std::sync::Arc<GraphRuntime>, body: ReenterBo
     // Restamped at hop 0 of its own path, with the attempt on it. The relay
     // carries `attempt` forward across every hop, so the next report of this
     // item counts from here rather than starting again at one.
-    let mut item = body.payload.clone();
-    if !item.is_object() {
-        item = json!({});
-    }
     {
         let obj = item.as_object_mut().expect("object");
         obj.insert(
