@@ -1137,6 +1137,7 @@ Rule names are asserted on in tests, so they are API.
 | `path-entry` | a path's first node has no `ingress` | `` path `{p}` starts at `{n}`, which declares no ingress. Work cannot enter a node that has no queue to enter by: give `{n}` an `ingress`, or start the path at a node that has one. `` |
 | `path-terminal` | a path's last element contains a node with no `egress` | `` path `{p}` ends at `{n}`, which declares no egress. Work would be admitted and then have nowhere to go. Name the queue your consumers read: `"egress": "{app}.{graph}.out"`. `` |
 | `node-orphan` | a declared node appears in no path | `` node `{n}` is declared and no path visits it: it can never hold work. `` |
+| `graph-workers` | the resolved stages total more than 4096 consumer workers | `` this graph resolves to {workers} consumer workers across {stages} stages; the maximum is 4096. Each worker allocates a task and a broker long-poll before the graph starts, so an unbounded value can exhaust a replica. Lower `nodes[].concurrency` or `GATE_STAGE_CONCURRENCY`, or split the topology into separate graphs. `` |
 | `fanout-branch` | a fan-out array has fewer than 2 elements, or nested arrays | `` path `{p}` hop {i}: a fan-out is a flat array of at least two node names. `` |
 | `fanout-terminal` | a fan-out is not the last hop of its path | `` path `{p}` fans out to {list} at hop {i}, which is not the last hop. After a fan-out the branches are separate streams; give each one its own path. `` |
 

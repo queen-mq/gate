@@ -36,7 +36,10 @@ mod common;
 
 use common::{airbnb, rules};
 use gate_core::doc::{Egress, Ingress, PathElem};
-use gate_core::{validate, warnings, GraphDoc};
+use gate_core::{
+    compile_with, validate, validate_plan_with, warnings, ExternalFacts, GraphDoc, PlanOpts,
+    MAX_GRAPH_WORKERS,
+};
 
 /// The single most valuable test in the file: the flagship fixture must validate
 /// clean, in the new vocabulary. If it cannot, the schema is wrong.
@@ -522,6 +525,49 @@ fn a_batch_has_a_range_and_a_scoped_budget_is_why() {
         !rules(&validate(&doc)).contains(&"batch-range"),
         "the ceiling itself is legal"
     );
+}
+
+/// `queen-mq` preallocates a vector and spawns one task for every resolved
+/// worker. Before this rule, `concurrency: 4294967295` could abort the process
+/// while handling a tiny, otherwise valid declaration.
+#[test]
+fn a_graph_has_a_bounded_total_worker_width() {
+    let mut doc: GraphDoc = serde_json::from_str(
+        r#"{"application":"a","graph":"g","version":1,
+            "nodes":{"n":{"ingress":true,"concurrency":4096,
+                          "budgets":[{"count":100,"timeMs":1000}],
+                          "egress":"a.g.out"}},
+            "paths":[{"name":"main","nodes":["n"]}]}"#,
+    )
+    .unwrap();
+    assert_eq!(MAX_GRAPH_WORKERS, 4096);
+    assert!(!rules(&validate(&doc)).contains(&"graph-workers"));
+
+    doc.nodes.get_mut("n").unwrap().concurrency = Some(4097);
+    assert!(rules(&validate(&doc)).contains(&"graph-workers"));
+}
+
+/// The server compiles with `GATE_STAGE_CONCURRENCY`; validation must inspect
+/// that exact plan rather than recompiling the document with default options.
+#[test]
+fn a_resolved_global_worker_override_is_bounded_too() {
+    let doc: GraphDoc = serde_json::from_str(
+        r#"{"application":"a","graph":"g","version":1,
+            "nodes":{"n":{"ingress":true,
+                          "budgets":[{"count":100,"timeMs":1000}],
+                          "egress":"a.g.out"}},
+            "paths":[{"name":"main","nodes":["n"]}]}"#,
+    )
+    .unwrap();
+    let plan = compile_with(
+        &doc,
+        &PlanOpts {
+            concurrency: Some(4097),
+            ..Default::default()
+        },
+    );
+    let got = validate_plan_with(&doc, &plan, &ExternalFacts::default());
+    assert!(rules(&got).contains(&"graph-workers"), "{got:#?}");
 }
 
 #[test]

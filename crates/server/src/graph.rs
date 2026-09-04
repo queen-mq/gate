@@ -89,7 +89,11 @@ pub async fn declare_locked(
     let key = doc.key();
     let (plan, facts) = compile(app, &doc).await;
 
-    let problems = gate_core::validate_with(&doc, &facts);
+    // Validate the resolved plan, not a second compilation with library
+    // defaults. In particular this includes the fleet-wide worker override:
+    // an unsafe `GATE_STAGE_CONCURRENCY` must be refused before the SDK
+    // preallocates and spawns that many consumer tasks.
+    let problems = gate_core::validate_plan_with(&doc, &plan, &facts);
     if !problems.is_empty() {
         return Err(Refusal::Invalid(join(&problems)));
     }

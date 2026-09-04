@@ -26,6 +26,18 @@ use crate::plan::{self, Plan};
 /// enforced as a refusal.
 pub const MAX_BATCH: u32 = 1000;
 
+/// The largest number of consumer workers one graph may start across all of
+/// its stages.
+///
+/// `queen-mq` allocates a task and a long-poll loop for every worker before the
+/// consumer starts. Without a graph-wide bound, a small declaration containing
+/// a large `concurrency` integer can make the process reserve billions of task
+/// slots and abort before it can return a refusal. 4096 is already roughly four
+/// million items/s at the deliberately pessimistic one-lane capacity; larger
+/// deployments should be split into graphs so one declaration cannot exhaust a
+/// replica on its own.
+pub const MAX_GRAPH_WORKERS: u64 = 4096;
+
 /// The most re-entries a document may allow one item (§16.6). v1's
 /// `breach-attempts` policed the same number for the same reason.
 pub const MAX_ATTEMPTS_CEILING: u32 = 20;
@@ -84,6 +96,16 @@ pub fn validate(doc: &GraphDoc) -> Vec<Problem> {
 }
 
 pub fn validate_with(doc: &GraphDoc, facts: &ExternalFacts) -> Vec<Problem> {
+    let plan = plan::compile(doc);
+    validate_plan_with(doc, &plan, facts)
+}
+
+/// Validate the exact plan a caller is about to start.
+///
+/// Most callers use [`validate_with`]. The server compiles with broker facts
+/// and operator overrides first, however, so it must validate that resolved
+/// plan rather than silently recompile with library defaults.
+pub fn validate_plan_with(doc: &GraphDoc, plan: &Plan, facts: &ExternalFacts) -> Vec<Problem> {
     let mut out = Vec::new();
     naming(doc, &mut out);
     if doc.nodes.is_empty() {
@@ -100,12 +122,29 @@ pub fn validate_with(doc: &GraphDoc, facts: &ExternalFacts) -> Vec<Problem> {
         return out;
     }
 
-    let plan = plan::compile(doc);
     shape(doc, &mut out);
-    budgets(doc, &plan, &mut out);
-    shares(doc, &plan, &mut out);
+    worker_width(plan, &mut out);
+    budgets(doc, plan, &mut out);
+    shares(doc, plan, &mut out);
     ownership(doc, facts, &mut out);
     out
+}
+
+fn worker_width(plan: &Plan, out: &mut Vec<Problem>) {
+    let workers: u64 = plan.stages.iter().map(|s| u64::from(s.concurrency)).sum();
+    if workers > MAX_GRAPH_WORKERS {
+        out.push(p(
+            "graph-workers",
+            format!(
+                "this graph resolves to {workers} consumer workers across {} stages; the maximum \
+                 is {MAX_GRAPH_WORKERS}. Each worker allocates a task and a broker long-poll before \
+                 the graph starts, so an unbounded value can exhaust a replica. Lower \
+                 `nodes[].concurrency` or `GATE_STAGE_CONCURRENCY`, or split the topology into \
+                 separate graphs.",
+                plan.stages.len()
+            ),
+        ));
+    }
 }
 
 fn naming(doc: &GraphDoc, out: &mut Vec<Problem>) {
