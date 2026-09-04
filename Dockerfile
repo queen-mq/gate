@@ -9,7 +9,7 @@
 # Run:   docker run -p 8788:8788 -e QUEEN_URL=http://queen:6632 gate
 
 # ---------------------------------------------------------------- the console
-FROM node:22-alpine AS ui-builder
+FROM node:24-alpine AS ui-builder
 
 WORKDIR /app/ui
 COPY ui/package*.json ./
