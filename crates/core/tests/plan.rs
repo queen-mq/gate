@@ -527,10 +527,17 @@ fn a_payload_path_must_start_at_the_payload_root() {
     assert!(!gate_core::ok_payload_path("payload"));
     assert!(!gate_core::ok_payload_path("data.a"));
     assert!(!gate_core::ok_payload_path("payload."));
-    // `_gate` is Gate's own stamp and must stay unaddressable from a document.
-    assert!(
-        gate_core::resolve(&serde_json::json!({"_gate": {"path": "x"}}), "_gate.path").is_none()
-    );
+    // `_gate` is Gate's own root stamp and must stay unaddressable from a
+    // document even through the otherwise-required `payload` prefix.
+    assert!(!gate_core::ok_payload_path("payload._gate.path"));
+    assert!(gate_core::resolve(
+        &serde_json::json!({"_gate": {"path": "x"}}),
+        "payload._gate.path"
+    )
+    .is_none());
+    // A producer may still use the same spelling below another object. Only
+    // the root key is reserved for Gate.
+    assert!(gate_core::ok_payload_path("payload.vendor._gate"));
 }
 
 #[test]
