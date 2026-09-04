@@ -128,7 +128,7 @@ pub fn public_router(app: Shared) -> Router {
     routes()
         .route("/api/auth/google/login", get(crate::auth::login))
         .route("/api/auth/google/callback", get(crate::auth::callback))
-        .route("/api/auth/logout", get(crate::auth::logout))
+        .route("/api/auth/logout", post(crate::auth::logout))
         .merge(crate::webapp::router())
         .layer(axum::middleware::from_fn_with_state(
             app.clone(),
