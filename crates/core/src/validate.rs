@@ -419,7 +419,8 @@ fn budgets(doc: &GraphDoc, plan: &Plan, out: &mut Vec<Problem>) {
                         "scope-path",
                         format!(
                             "budget `{}` of node `{name}`: scopeBy `{path}` is not a payload path. \
-                             Write it as `payload.field` or `payload.a.b`.",
+                             Write it as `payload.field` or `payload.a.b`; `payload._gate` is \
+                             reserved for Gate's routing stamp.",
                             cb.id
                         ),
                     ));
@@ -503,7 +504,8 @@ fn cost_rules(name: &str, cost: &Cost, out: &mut Vec<Problem>) {
                     "cost-path",
                     format!(
                         "node `{name}`: cost.path `{}` is not a payload path. Write it as \
-                         `payload.field` or `payload.a.b`.",
+                         `payload.field` or `payload.a.b`; `payload._gate` is reserved for Gate's \
+                         routing stamp.",
                         c.path
                     ),
                 ));

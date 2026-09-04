@@ -278,9 +278,29 @@ fn a_cost_path_is_a_payload_path() {
 }
 
 #[test]
+fn a_cost_path_cannot_read_gates_provenance_stamp() {
+    let got = broken(|d| {
+        d.nodes.get_mut("audit").unwrap().cost = gate_core::Cost::Path(gate_core::CostPath {
+            path: "payload._gate.hop".into(),
+            default: 1,
+            max: Some(10),
+        })
+    });
+    assert!(got.contains(&"cost-path"), "{got:?}");
+}
+
+#[test]
 fn a_scope_path_is_a_payload_path() {
     let got = broken(|d| {
         d.nodes.get_mut("photos").unwrap().budgets[1].scope_by = Some("listingId".into())
+    });
+    assert!(got.contains(&"scope-path"), "{got:?}");
+}
+
+#[test]
+fn a_scope_path_cannot_key_on_gates_provenance_stamp() {
+    let got = broken(|d| {
+        d.nodes.get_mut("photos").unwrap().budgets[1].scope_by = Some("payload._gate.path".into())
     });
     assert!(got.contains(&"scope-path"), "{got:?}");
 }

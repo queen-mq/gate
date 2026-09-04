@@ -896,8 +896,9 @@ The one piece of per-item provenance v2 keeps, unchanged in spirit from v1:
 "_gate": { "graph": "airbnb", "path": "prices", "hop": 2, "at": 1755763200000 }
 ```
 
-One reserved object, not four top-level keys, so it cannot collide with a `scopeBy` path or a
-cost path. Stamped by the ingress push (HTTP front door) or by the first relay that handles an
+One reserved object, not four top-level keys. The declaration path grammar explicitly rejects
+`payload._gate` and anything below it, so neither `scopeBy` nor a cost path can read provenance as
+producer data. Stamped by the ingress push (HTTP front door) or by the first relay that handles an
 unstamped message (which is how a user-owned ingress queue works — producers know nothing
 about Gate). Carried verbatim by every relay, rewritten per hop. It is **not signed and not
 verified**: it is trusted because it is written server-side and because writing to an interior
@@ -1155,8 +1156,8 @@ Rule names are asserted on in tests, so they are API.
 | `cost-fits` | `cost.max > count_sub` for any budget | `` node `{n}`: an item may cost up to {max} and budget `{b}` admits {cs} per sub-window. An item that cannot fit a window can never be admitted — it parks the head of its partition for ever and never reaches a DLQ, because a lease that expires charges no retry. Raise the budget, lower cost.max, or lower subWindows. `` |
 | `cost-max` | `cost.max < cost.default` | `` node `{n}`: cost.max {m} is below cost.default {d}, so the default cost is itself inadmissible. `` |
 | `cost-integer` | a constant `cost` that is not an integer >= 1 | `` node `{n}`: cost must be a whole number of at least 1. The budget counter is an integer on this wire, so a fractional cost is not expressible — express the unit differently (count tenths, and multiply the budget by ten). `` |
-| `cost-path` | a `path` that is not a dotted payload path | `` node `{n}`: cost.path `{p}` is not a payload path. Write it as `payload.field` or `payload.a.b`. `` |
-| `scope-path` | `scopeBy` is not a dotted payload path | `` budget `{b}` of node `{n}`: scopeBy `{p}` is not a payload path. `` |
+| `cost-path` | a `path` that is not a dotted payload path, or starts with reserved `payload._gate` | `` node `{n}`: cost.path `{p}` is not a payload path. Write it as `payload.field` or `payload.a.b`; `payload._gate` is reserved for Gate's routing stamp. `` |
+| `scope-path` | `scopeBy` is not a dotted payload path, or starts with reserved `payload._gate` | `` budget `{b}` of node `{n}`: scopeBy `{p}` is not a payload path. Write it as `payload.field` or `payload.a.b`; `payload._gate` is reserved for Gate's routing stamp. `` |
 | `shared-conflict` | two budgets in this document share a `sharedKey` with different `count`/`timeMs`/`subWindows` | `` `{k}` is declared as {c1} per {t1}ms in node `{n1}` and {c2} per {t2}ms in node `{n2}`. They are one counter, so one of those declarations is a lie about what it enforces. Make them agree or give them different keys. `` |
 | `whenop-empty` | `whenOp: []` | `` budget `{b}` of node `{n}`: an empty whenOp matches nothing, so the budget charges nothing. Drop the field to take everything. `` |
 | `provenance` | `confidence: documented` with no `source` or no `asOf` | `` budget `{b}` of node `{n}` claims to be documented but names no {source/asOf}. A guess must never look like a measurement. `` |

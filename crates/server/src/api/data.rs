@@ -297,6 +297,9 @@ fn write_path(data: &mut Value, path: &str, value: Value) {
         return;
     }
     segs.remove(0);
+    if segs.first() == Some(&GATE_META) {
+        return;
+    }
     let last = segs.pop().expect("at least one segment");
     let mut cur = data;
     for s in segs {
@@ -464,5 +467,18 @@ fn egress_hint(st: &Shared, application: &str, graph: &str, node: &str) -> Strin
             "`{node}` declares no egress queue; name one in the declaration and consume it \
              directly."
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_path;
+    use serde_json::json;
+
+    #[test]
+    fn the_v1_cost_shim_cannot_write_the_gate_envelope() {
+        let mut data = json!({"_gate": {"path": "main"}});
+        write_path(&mut data, "payload._gate.path", json!(99));
+        assert_eq!(data, json!({"_gate": {"path": "main"}}));
     }
 }
