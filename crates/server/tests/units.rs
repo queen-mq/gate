@@ -376,5 +376,7 @@ fn the_trace_ring_drops_the_oldest_and_never_grows() {
         (gate_server::obs::TRACE_RING + 49) as i64,
         "newest first"
     );
+    assert_eq!(recent[0].view()["budget_id"], "b");
+    assert_eq!(recent[0].view()["budgetId"], "b", "compatibility alias");
     assert!(t.recent(Some("admitted"), 10).is_empty(), "denials only");
 }
