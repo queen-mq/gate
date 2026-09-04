@@ -4,6 +4,7 @@ import { useRoute } from 'vue-router'
 import Icon from './components/Icon.vue'
 import SignIn from './views/SignIn.vue'
 import { api, authState, me, fetchMe, isAdmin, LOGOUT_URL, READ_ONLY_NOTE } from './lib/api.js'
+import { usePoll } from './lib/poll.js'
 
 const route = useRoute()
 const overview = ref(null)
@@ -45,10 +46,10 @@ async function load() {
     overview.value = null
   }
 }
+const refresh = usePoll(load, 15000)
 onMounted(async () => {
   await fetchMe()
-  load()
-  setInterval(() => !document.hidden && load(), 15000)
+  refresh()
 })
 
 const brokerOk = computed(() => overview.value?.queen?.reachable === true)
