@@ -131,7 +131,7 @@ function nodeState(n) {
   if (!graph.value?.running) return 'down'
   if (n.breaker) return 'breached'
   if ((n.budgets ?? []).some((b) => b.confidence === 'assumed')) return 'blind'
-  if (counters(n.node).deferred > 0) return 'pacing'
+  if ((n.waiting_for_budget ?? 0) > 0) return 'pacing'
   return 'flowing'
 }
 
@@ -140,7 +140,7 @@ const state = computed(() => {
   if (nodes.value.some((n) => n.breaker)) return 'breached'
   if (nodes.value.some((n) => (n.budgets ?? []).some((b) => b.confidence === 'assumed')))
     return 'blind'
-  return totals.value.deferred > 0 ? 'pacing' : 'flowing'
+  return nodes.value.some((n) => (n.waiting_for_budget ?? 0) > 0) ? 'pacing' : 'flowing'
 })
 
 const CONFIDENCE_NOTE = {
