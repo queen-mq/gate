@@ -22,6 +22,7 @@
 //! 16 workers per cycle across 2 legs each, a reconcile loop, a history prune
 //! and a depth cache serving four read shapes. v2 runs seven consumers.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use crate::doc::{Confidence, Cost, GraphDoc, Node, Path, PathElem};
@@ -352,7 +353,7 @@ impl CompiledBudget {
     /// 64 state documents to hold the same thing.
     pub fn key_for(&self, scope: Option<&str>) -> String {
         match (self.scope_by.as_ref(), scope) {
-            (Some(_), Some(v)) => format!("{}:{v}", self.key),
+            (Some(_), Some(v)) => format!("{}:{}", self.key, budget_key_component(v)),
             _ => self.key.clone(),
         }
     }
@@ -395,11 +396,54 @@ pub fn stage_group(app: &str, graph: &str, path: &str, node: &str) -> String {
 }
 
 pub fn budget_key(app: &str, graph: &str, node: &str, bid: &str) -> String {
-    format!("b:{app}:{graph}:{node}:{bid}")
+    let graph = local_budget_graph_component(graph);
+    format!(
+        "b:{}:{graph}:{}:{}",
+        budget_key_component(app),
+        budget_key_component(node),
+        budget_key_component(bid)
+    )
 }
 
 pub fn shared_budget_key(app: &str, shared: &str) -> String {
-    format!("b:{app}:shared:{shared}")
+    format!(
+        "b:{}:shared:{}",
+        budget_key_component(app),
+        budget_key_component(shared)
+    )
+}
+
+/// Escape the separator and the escape byte in a dynamic KV-key component.
+///
+/// Budget ids, shared keys and scope values are deliberately free-form. A raw
+/// colon would otherwise make `(id = "a:b")` indistinguishable from
+/// `(id = "a", scope = "b")`, causing two declarations to spend one row.
+/// Ordinary names keep their historical spelling.
+fn budget_key_component(value: &str) -> Cow<'_, str> {
+    if !value.bytes().any(|b| matches!(b, b'%' | b':')) {
+        return Cow::Borrowed(value);
+    }
+    let mut escaped = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '%' => escaped.push_str("%25"),
+            ':' => escaped.push_str("%3A"),
+            _ => escaped.push(c),
+        }
+    }
+    Cow::Owned(escaped)
+}
+
+/// `shared` is the structural marker immediately after the application in a
+/// shared key. It is also a legal graph name, so encode that one local graph
+/// spelling to keep the two namespaces disjoint. A literal `%73hared` cannot
+/// collide because the general component encoder escapes its percent sign.
+fn local_budget_graph_component(graph: &str) -> Cow<'_, str> {
+    if graph == "shared" {
+        Cow::Borrowed("%73hared")
+    } else {
+        budget_key_component(graph)
+    }
 }
 
 pub fn breaker_key(app: &str, graph: &str, node: &str) -> String {

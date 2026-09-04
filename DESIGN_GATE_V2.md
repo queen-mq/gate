@@ -381,9 +381,9 @@ function, and echoed in the declare response so a caller never has to reconstruc
 | interior queue | `gate.{app}.{graph}.{node}.in` | every non-ingress node has one |
 | egress queue | whatever the declaration names | Gate pushes, the app consumes |
 | **stage consumer group** | `gate.{app}.{graph}.{path}.{node}` | one per (path, node) — this is the whole group taxonomy |
-| budget key (node) | `b:{app}:{graph}:{node}:{bid}` | namespace `gate` |
-| budget key (scoped) | `b:{app}:{graph}:{node}:{bid}:{scopeValue}` | one row per value, TTL-reaped |
-| budget key (shared) | `b:{app}:shared:{sharedKey}` | one row per app, across graphs |
+| budget key (node) | `b:{enc(app)}:{localGraph(graph)}:{enc(node)}:{enc(bid)}` | namespace `gate` |
+| budget key (scoped) | node key + `:{enc(scopeValue)}` | one row per value, TTL-reaped |
+| budget key (shared) | `b:{enc(app)}:shared:{enc(sharedKey)}` | one row per app, across graphs |
 | breaker record | `brk:{app}:{graph}:{node}` | TTL = `retryAfterSeconds` |
 | spec store | `graph:{app}:{name}` | namespace `gate`, `Expiry::forever()` — unchanged from v1 |
 
@@ -392,6 +392,11 @@ the reason for it is unchanged and still measured: a near-miss on a consumer gro
 fail loudly, because the broker answers a group with no cursor with the queue's whole
 retained range — so an ETA built on a misspelling reports every message ever pushed as
 waiting for budget, plausibly, for ever.
+
+`enc` percent-escapes `%` as `%25` and the structural `:` separator as `%3A`. Ordinary names
+therefore keep their existing keys, while free-form budget ids, shared keys and scope values cannot
+smuggle a separator. `localGraph` applies the same encoding and spells the legal graph name
+`shared` as `%73hared`, because the unescaped word is the shared-budget namespace marker.
 
 **One group per (path, node), not per node.** Two paths sharing an ingress node is
 **pub-sub**: each path's group gets **every** message, so the message traverses both paths.
@@ -553,7 +558,8 @@ serving four read shapes. v2 runs **7 consumers, 1 reconcile loop, 1 history pru
 ### 5.1 One key, one counter, no window index
 
 ```
-key   = b:{app}:{graph}:{node}:{bid}[:{scope}]     (or b:{app}:shared:{sharedKey})
+key   = b:{enc(app)}:{localGraph(graph)}:{enc(node)}:{enc(bid)}[:{enc(scope)}]
+        (or b:{enc(app)}:shared:{enc(sharedKey)}[:{enc(scope)}])
 max   = round(count_sub * share(path))
 ttl   = window_sub_seconds
 delta = cost
