@@ -807,10 +807,9 @@ pub fn compile_with(doc: &GraphDoc, opts: &PlanOpts) -> Plan {
 /// itself by the LEASE, which is the thing this design set out to remove.
 ///
 /// So the batch is clamped to what one sub-window admits at the typical item
-/// cost: `round(count_sub × share) / cost.default`, over the tightest UNSCOPED
-/// budget. Scoped budgets are excluded on purpose — a batch of two hundred
-/// messages across two hundred different keys spends one unit of each, and
-/// sizing on a per-key count would shrink every claim to a per-key allowance.
+/// cost: `round(count_sub × share) / cost.default`, over the tightest NODE-WIDE
+/// budget. Scoped and `whenOp` budgets are excluded on purpose: neither is a
+/// ceiling every item in the claim necessarily meets.
 ///
 /// It is a floor of one and a ceiling of what the declaration asked for: a wide
 /// budget leaves the declared batch untouched, and a tight one gets a claim that
@@ -818,7 +817,7 @@ pub fn compile_with(doc: &GraphDoc, opts: &PlanOpts) -> Plan {
 fn fitting_batch(np: &NodePlan, share: f64, declared: u32) -> u32 {
     let per_item = np.cost.default_value().max(1);
     let fits = np
-        .unscoped()
+        .node_wide()
         .map(|b| (b.max_for(share) / per_item).max(1))
         .min();
     match fits {
@@ -845,9 +844,10 @@ fn fitting_batch(np: &NodePlan, share: f64, declared: u32) -> u32 {
 /// that can never have work. Stage, measured: ~200 gate consumers for a system
 /// whose largest declared budget is 400 items a second.
 ///
-/// Only the UNSCOPED budgets, for the same reason `fitting_batch` uses them: a
-/// per-key budget is not a rate the node has. *100 photo deletions per listing
-/// per week* says nothing about how fast the node drains.
+/// Only NODE-WIDE budgets, for the same reason `fitting_batch` uses them: a
+/// per-key budget is not a rate the node has, and neither is one selected by
+/// `whenOp`. *100 photo deletions per listing per week* says nothing about how
+/// fast the whole node drains.
 ///
 /// And not the migration's [`PASSTHROUGH_BUDGET_ID`], which is a sentinel and
 /// not a measurement: a million a second means "this node limits nothing", and
@@ -862,7 +862,7 @@ fn fitting_batch(np: &NodePlan, share: f64, declared: u32) -> u32 {
 fn fitting_workers(np: &NodePlan, share: f64, partitions: u32, lane_capacity: u32) -> u32 {
     let capacity = lane_capacity.max(1) as f64;
     let tightest = np
-        .unscoped()
+        .node_wide()
         .filter(|b| b.id != PASSTHROUGH_BUDGET_ID)
         .map(|b| b.max_for(share) as f64 / b.window_sub_seconds.max(1) as f64)
         .fold(f64::INFINITY, f64::min);
@@ -1025,6 +1025,13 @@ impl NodePlan {
     /// not a rate every item meets.
     pub fn unscoped(&self) -> impl Iterator<Item = &CompiledBudget> {
         self.budgets.iter().filter(|b| !b.is_scoped())
+    }
+
+    /// Budgets every item through the node must meet. These are the only honest
+    /// denominator for aggregate scheduling, ETA and utilisation: `whenOp`
+    /// counters apply to a subset whose size those calculations cannot know.
+    pub fn node_wide(&self) -> impl Iterator<Item = &CompiledBudget> {
+        self.unscoped().filter(|b| b.when_op.is_none())
     }
 
     /// The widest ceiling any path can reach at this node — what the breaker

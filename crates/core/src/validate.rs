@@ -336,7 +336,7 @@ fn budgets(doc: &GraphDoc, plan: &Plan, out: &mut Vec<Problem>) {
             ));
             continue;
         }
-        if !np.unscoped().any(|b| b.when_op.is_none()) {
+        if np.node_wide().next().is_none() {
             out.push(p(
                 "node-unscoped-budget",
                 format!(

@@ -316,14 +316,14 @@ pub async fn flow(State(app): State<Shared>, Query(q): Query<FlowQuery>) -> ApiR
         return ok(json!({ "minutes": [], "applications": [], "durable": false }));
     };
 
-    // The ceiling per node, from the DECLARATION rather than from the data: it
-    // is what the counter enforces, and a node that admitted nothing this minute
-    // still has one.
+    // The node-wide ceiling from the DECLARATION rather than from the data. A
+    // `whenOp` counter covers only an unknown subset of these admissions, so it
+    // cannot be the denominator for the whole node.
     let mut ceiling: HashMap<(String, String), f64> = HashMap::new();
     for g in app.registry.all() {
         for (name, np) in &g.plan.nodes {
             let per_min = np
-                .unscoped()
+                .node_wide()
                 .map(|b| b.count_sub as f64 * 60.0 / b.window_sub_seconds.max(1) as f64)
                 .fold(f64::INFINITY, f64::min);
             if per_min.is_finite() && per_min > 0.0 {

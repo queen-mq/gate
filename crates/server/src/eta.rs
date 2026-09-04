@@ -148,29 +148,10 @@ pub async fn view(app: &Shared, rt: &Arc<GraphRuntime>, node: &str, path: &str) 
     let want = waiting_for_budget as f64 * cost_per_item;
 
     // ---- rate.
-    let keys: Vec<String> = np.unscoped().map(|b| b.key.clone()).collect();
+    let keys: Vec<String> = np.node_wide().map(|b| b.key.clone()).collect();
     let states = app.budgets.read(&keys).await.unwrap_or_default();
 
-    let mut bound: Option<(&CompiledBudget, Schedule)> = None;
-    for b in np.unscoped() {
-        let s = states.iter().find(|s| s.key == b.key);
-        let sched = admits(
-            b.max_for(stage.share),
-            b.window_sub_seconds,
-            s.map(|s| s.value).unwrap_or(0),
-            s.and_then(|s| s.expires_at_ms)
-                .map(|e| e - now)
-                .unwrap_or(0),
-            want,
-            now,
-        );
-        // The slowest binds, and "never" beats every number.
-        let key = |x: &Schedule| x.seconds.unwrap_or(f64::INFINITY);
-        bound = match bound {
-            Some(a) if key(&a.1) >= key(&sched) => Some(a),
-            _ => Some((b, sched)),
-        };
-    }
+    let bound = binding_schedule(np, stage.share, &states, want, now);
 
     let (bound_by, eta_seconds, resets_at) = match bound {
         Some((b, s)) => (
@@ -204,6 +185,39 @@ pub async fn view(app: &Shared, rt: &Arc<GraphRuntime>, node: &str, path: &str) 
         "waitingForWorkers": waiting_for_workers,
         "assumes": assumes(rt, np, stage, measured, cost_per_item, worker_group_known, held.as_ref()),
     }))
+}
+
+/// The slowest schedule every queued item is guaranteed to meet. A conditional
+/// budget may delay selected operations, but applying it to the whole queue
+/// would turn an unknown mix into a confidently late (and false) bound.
+fn binding_schedule<'a>(
+    np: &'a NodePlan,
+    share: f64,
+    states: &[crate::budget::State],
+    want: f64,
+    now: i64,
+) -> Option<(&'a CompiledBudget, Schedule)> {
+    let mut bound: Option<(&CompiledBudget, Schedule)> = None;
+    for b in np.node_wide() {
+        let s = states.iter().find(|s| s.key == b.key);
+        let sched = admits(
+            b.max_for(share),
+            b.window_sub_seconds,
+            s.map(|s| s.value).unwrap_or(0),
+            s.and_then(|s| s.expires_at_ms)
+                .map(|e| e - now)
+                .unwrap_or(0),
+            want,
+            now,
+        );
+        // The slowest binds, and "never" beats every number.
+        let key = |x: &Schedule| x.seconds.unwrap_or(f64::INFINITY);
+        bound = match bound {
+            Some(a) if key(&a.1) >= key(&sched) => Some(a),
+            _ => Some((b, sched)),
+        };
+    }
+    bound
 }
 
 /// What an item was measured costing, over the counters stream when it is on.
@@ -276,6 +290,20 @@ fn assumes(
             "budget {} is one counter per key and this number does not resolve which key your item \
              will meet",
             scoped.join(", ")
+        ));
+    }
+
+    let conditional: Vec<&str> = np
+        .budgets
+        .iter()
+        .filter(|b| b.when_op.is_some())
+        .map(|b| b.id.as_str())
+        .collect();
+    if !conditional.is_empty() {
+        parts.push(format!(
+            "budget {} applies only to selected operations and this queue-level number cannot \
+             resolve which operations are ahead",
+            conditional.join(", ")
         ));
     }
 
@@ -386,5 +414,29 @@ mod tests {
     fn a_spent_window_still_answers_from_the_declared_schedule() {
         let s = admits(150, 10, 150, 9_500, 150.0, 0);
         assert_eq!(s.seconds, Some(9.5));
+    }
+
+    /// Queue depth has no operation breakdown. Applying a selective limit to
+    /// every item would produce a confidently late bound for unrelated work.
+    #[test]
+    fn a_conditional_budget_does_not_bind_the_whole_queues_eta() {
+        let doc: gate_core::GraphDoc = serde_json::from_value(serde_json::json!({
+          "application": "a", "graph": "g", "version": 1,
+          "nodes": { "n": { "ingress": true, "egress": "out",
+                            "budgets": [
+                              { "id": "base", "count": 100, "timeMs": 1000 },
+                              { "id": "rare", "count": 1, "timeMs": 3600000,
+                                "subWindows": 1, "whenOp": ["photo.delete"] }
+                            ] } },
+          "paths": [{ "name": "main", "nodes": ["n"] }]
+        }))
+        .expect("document");
+        let plan = gate_core::compile(&doc);
+        let np = plan.node("n").expect("node");
+
+        let (budget, schedule) =
+            binding_schedule(np, 1.0, &[], 50.0, 1_000_000).expect("base budget");
+        assert_eq!(budget.id, "base");
+        assert_eq!(schedule.seconds, Some(0.0));
     }
 }
