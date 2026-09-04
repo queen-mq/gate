@@ -2191,6 +2191,43 @@ async fn a_partially_refused_sync_reaps_nothing() {
     h.cleanup("keep").await;
 }
 
+/// A complete target inventory is authoritative even when it reaches a replica
+/// that has not reconciled the stored targets into its local registry yet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn a_fresh_replica_reaps_targets_from_the_stored_inventory() {
+    let Some(h) = harness("sync-store").await else {
+        return;
+    };
+    let out = egress_of("sync-store", &h.application);
+    let (status, body) = h.put_graph("old", one_node(&out, wide("b"))).await;
+    assert_eq!(status, 200, "initial declare: {body}");
+
+    // The second replica deliberately knows no runtimes. An empty sync still
+    // means this application owns no standalone targets, not merely "remove
+    // whichever targets this process happens to have seen".
+    let second = serve(&h.app.queen_url).await;
+    assert!(second.registry.all().is_empty());
+    let second_base = spawn_server(second).await;
+    let res = reqwest::Client::new()
+        .put(format!("{second_base}/v1/apps/{}/targets", h.application))
+        .json(&json!([]))
+        .send()
+        .await
+        .expect("sync on fresh replica");
+    let status = res.status().as_u16();
+    let body: Value = res.json().await.unwrap_or(Value::Null);
+    assert_eq!(status, 200, "sync response: {body}");
+    assert_eq!(body["ok"], json!(true), "sync response: {body}");
+    assert_eq!(body["removed"], json!(["old"]), "sync response: {body}");
+
+    gate_server::reconcile(&h.app).await;
+    assert!(
+        h.app.registry.get(&h.application, "old").is_none(),
+        "the omitted target survived in the durable store"
+    );
+}
+
 /// The routes that are gone say where to go instead.
 ///
 /// A 404 would read as "wrong URL" and send somebody hunting; a 410 with the
