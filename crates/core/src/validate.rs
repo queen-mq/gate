@@ -19,7 +19,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::cost::ok_payload_path;
-use crate::doc::{ok_name, Confidence, Cost, GraphDoc, PathElem};
+use crate::doc::{ok_name, Confidence, Cost, GraphDoc, PathElem, COUNTERS_WINDOW_SECONDS};
 use crate::plan::{self, Plan};
 
 /// The largest claim a node may ask for. §12.2's clamp on v1's `pacing.batch`,
@@ -102,10 +102,28 @@ pub fn validate_with(doc: &GraphDoc, facts: &ExternalFacts) -> Vec<Problem> {
 
     let plan = plan::compile(doc);
     shape(doc, &mut out);
+    counters(doc, &mut out);
     budgets(doc, &plan, &mut out);
     shares(doc, &plan, &mut out);
     ownership(doc, facts, &mut out);
     out
+}
+
+fn counters(doc: &GraphDoc, out: &mut Vec<Problem>) {
+    let Some(counters) = &doc.counters else {
+        return;
+    };
+    if counters.window_seconds != COUNTERS_WINDOW_SECONDS {
+        out.push(p(
+            "counters-window",
+            format!(
+                "counters.windowSeconds is {}, but Gate currently stores and serves fixed \
+                 one-minute roll-ups. Set windowSeconds to {COUNTERS_WINDOW_SECONDS}, or omit \
+                 counters to leave durable roll-ups off.",
+                counters.window_seconds
+            ),
+        ));
+    }
 }
 
 fn naming(doc: &GraphDoc, out: &mut Vec<Problem>) {

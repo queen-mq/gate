@@ -231,8 +231,9 @@ there are counters (`popped`, `admitted`, `deferred`, `parked`, `released`, `for
 explains a stage's throughput. `wedged` is the one to alert on: it counts a stage whose ack the
 broker keeps refusing at a claim head that never moves, which is a stuck cursor and not a budget
 backlog — the stage says so once at `ERROR` with the `seek` that fixes it. Denials are kept in a bounded in-process ring; admissions are counted, never
-traced. Rollups are opt-in per graph (`"counters": { "windowSeconds": 60 }`), because observability
-is a thing you switch on, not a thing that runs whether or not anyone is looking.
+traced. Rollups are opt-in per graph (`"counters": { "windowSeconds": 60 }`); the current storage
+and API contract is a fixed one-minute window, so `60` is the only accepted value. Observability is
+a thing you switch on, not a thing that runs whether or not anyone is looking.
 
 **One thing to say out loud.** The declaration names your egress queue, and:
 
