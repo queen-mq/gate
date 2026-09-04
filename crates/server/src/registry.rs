@@ -143,17 +143,20 @@ impl Registry {
         }
     }
 
-    /// Ingress queues already claimed, excluding one graph — what the
-    /// `ingress-owner` rule is asked against on a redeclare.
+    /// Stage source queues already claimed, excluding one graph — what the
+    /// `ingress-owner` rule is asked against on a redeclare. This includes
+    /// Gate-owned interior queues: allowing another graph to call one a
+    /// user-owned ingress gives the same physical stream a second consumer.
     pub fn ingress_owners(&self, except: &str) -> Vec<(String, String, String)> {
         let mut out = Vec::new();
         for g in self.all() {
             if g.key() == except {
                 continue;
             }
-            for (name, np) in &g.plan.nodes {
-                if let Some(q) = &np.ingress_queue {
-                    out.push((q.clone(), g.key(), name.clone()));
+            let mut seen = std::collections::HashSet::new();
+            for stage in &g.plan.stages {
+                if seen.insert(stage.source.clone()) {
+                    out.push((stage.source.clone(), g.key(), stage.node.clone()));
                 }
             }
         }

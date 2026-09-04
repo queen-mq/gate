@@ -380,6 +380,40 @@ fn an_ingress_queue_claimed_elsewhere_in_the_fleet_is_refused() {
     assert!(got.contains(&"ingress-owner"), "{got:?}");
 }
 
+/// A named ingress can spell one of Gate's derived interior names. It is still
+/// one physical queue, so treating the two appearances as different logical
+/// sources duplicates the stream under two consumer groups.
+#[test]
+fn a_named_ingress_may_not_alias_an_interior_queue() {
+    let got = broken(|d| {
+        d.nodes.get_mut("messages").unwrap().ingress =
+            Some(Ingress::Named(gate_core::IngressSpec {
+                queue: Some("gate.channel.airbnb.ip.in".into()),
+                partitions: None,
+                http: None,
+                shed: None,
+            }));
+    });
+    assert!(got.contains(&"ingress-owner"), "{got:?}");
+}
+
+/// Node-cycle validation cannot see a loop made only by physical queue names.
+/// Without this refusal the relay acks each input and atomically pushes its
+/// output back into the same queue, for ever.
+#[test]
+fn an_egress_may_not_feed_a_source_of_the_same_graph() {
+    let doc: GraphDoc = serde_json::from_str(
+        r#"{"application":"a","graph":"g","version":1,
+            "nodes":{"n":{"ingress":{"queue":"loop"},
+                          "budgets":[{"id":"b","count":100,"timeMs":1000}],
+                          "egress":"loop"}},
+            "paths":[{"name":"main","nodes":["n"]}]}"#,
+    )
+    .unwrap();
+    let got = rules(&validate(&doc));
+    assert!(got.contains(&"queue-cycle"), "{got:?}");
+}
+
 // ------------------------------------------------------------------ warnings
 
 /// A kv TTL is whole seconds, so a window declared under one is enforced at one

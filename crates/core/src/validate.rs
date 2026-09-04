@@ -56,7 +56,8 @@ impl std::fmt::Display for Problem {
 #[derive(Debug, Clone, Default)]
 pub struct ExternalFacts {
     pub queues: BTreeMap<String, QueueFacts>,
-    /// Ingress queues already claimed elsewhere in the fleet:
+    /// Stage source queues already claimed elsewhere in the fleet (both
+    /// ingress and Gate-owned interior queues):
     /// `(queue, "app/graph", node)`. This graph's own entries must be excluded
     /// by the caller, or a redeclare would collide with itself.
     pub ingress_owners: Vec<(String, String, String)>,
@@ -104,7 +105,7 @@ pub fn validate_with(doc: &GraphDoc, facts: &ExternalFacts) -> Vec<Problem> {
     shape(doc, &mut out);
     budgets(doc, &plan, &mut out);
     shares(doc, &plan, &mut out);
-    ownership(doc, facts, &mut out);
+    ownership(&plan, facts, &mut out);
     out
 }
 
@@ -613,39 +614,70 @@ fn shares(doc: &GraphDoc, plan: &Plan, out: &mut Vec<Problem>) {
     }
 }
 
-fn ownership(doc: &GraphDoc, facts: &ExternalFacts, out: &mut Vec<Problem>) {
-    // Two nodes in ONE document naming one ingress queue, and the same question
-    // asked of the fleet. Both are refusals: two consumers of one queue in
-    // different groups each get every message, which doubles what leaves.
+fn ownership(plan: &Plan, facts: &ExternalFacts, out: &mut Vec<Problem>) {
+    // One logical node per source queue, including Gate-owned interior queues.
+    // Looking only at `node.ingress` misses a named ingress that aliases an
+    // interior queue: two consumers then read the same physical stream under
+    // different groups even though the document appears to name two queues.
     let mut mine: HashMap<&str, &str> = HashMap::new();
-    for (name, node) in &doc.nodes {
-        let Some(q) = node
-            .ingress
-            .as_ref()
-            .filter(|i| i.is_enabled())
-            .and_then(|i| i.declared_queue())
-        else {
-            continue;
-        };
-        if let Some(other) = mine.insert(q, name.as_str()) {
+    let mut reported: HashSet<&str> = HashSet::new();
+    for stage in &plan.stages {
+        let q = stage.source.as_str();
+        let name = stage.node.as_str();
+        if let Some(other) = mine.insert(q, name) {
+            if other == name || !reported.insert(q) {
+                continue;
+            }
             out.push(p(
                 "ingress-owner",
                 format!(
-                    "`{q}` is the ingress of both `{other}` and `{name}` in this graph. Two \
-                     consumers of one queue in different groups each get every message, which \
-                     doubles what leaves."
+                    "`{q}` is the source of both `{other}` and `{name}` in this graph. One queue \
+                     cannot be both a declared ingress and a Gate-owned interior stream: their \
+                     consumer groups would each receive and forward the same messages."
                 ),
             ));
         }
+    }
+
+    // The same source ownership rule across replicas. The facts include every
+    // source from the local registry; the caller separately checks the durable
+    // store for declarations this replica has not reconciled yet.
+    for (q, name) in &mine {
         if let Some((_, g, n)) = facts.ingress_owners.iter().find(|(oq, _, _)| oq == q) {
             out.push(p(
                 "ingress-owner",
                 format!(
-                    "`{q}` is already the ingress of node `{n}` in graph `{g}`. Two consumers of \
-                     one queue in different groups each get every message, which doubles what \
-                     leaves."
+                    "`{q}` is already the source of node `{n}` in graph `{g}`. Node `{name}` \
+                     would consume the same physical stream under a different group, so both \
+                     graphs would forward every message."
                 ),
             ));
+        }
+    }
+
+    // A terminal destination that is also one of this graph's sources is a
+    // physical cycle even when the node DAG is acyclic. The simplest case is a
+    // one-node target whose ingress and egress names are equal: each admitted
+    // message is atomically pushed back into the queue it was just acked from
+    // and circulates for ever, paying the budget on every turn.
+    let sources: HashSet<&str> = mine.keys().copied().collect();
+    let mut feedback: HashSet<&str> = HashSet::new();
+    for stage in &plan.stages {
+        for destination in &stage.destinations {
+            if destination.terminal
+                && sources.contains(destination.queue.as_str())
+                && feedback.insert(destination.queue.as_str())
+            {
+                out.push(p(
+                    "queue-cycle",
+                    format!(
+                        "`{}` is both an egress and a source in this graph. An admitted message \
+                         would be pushed back into a queue this graph consumes and circulate for \
+                         ever, paying its budgets on every turn. Use a distinct egress queue.",
+                        destination.queue
+                    ),
+                ));
+            }
         }
     }
 }
