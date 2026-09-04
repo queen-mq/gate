@@ -60,6 +60,62 @@ pub async fn save(queen: &Queen, doc: &GraphDoc) -> Result<()> {
     Ok(())
 }
 
+/// The declaration currently stored for one graph.
+///
+/// A caller's declare needs this exact read even when the replica has not
+/// reconciled yet. A prefix scan is the wrong primitive for that check: it can
+/// be paged, and a graph past the first page would look new and escape the
+/// version-bump rule.
+pub async fn load_one(queen: &Queen, app: &str, name: &str) -> Result<Option<GraphDoc>> {
+    let current = queen.kv().get(&ns(), &graph_key(app, name)).await?;
+    if current.found() {
+        let value = current.value.ok_or_else(|| {
+            queen_mq::Error::Decode(format!(
+                "stored graph `{app}/{name}` was found without a value"
+            ))
+        })?;
+        return decode_graph(value, app, name).map(Some);
+    }
+
+    // A v1 standalone target may not have been restored by this replica yet.
+    // It is still the stored predecessor of the one-node graph the caller is
+    // about to replace, so it participates in the same version check.
+    let legacy = queen.kv().get(&ns(), &v1_target_key(app, name)).await?;
+    if !legacy.found() {
+        return Ok(None);
+    }
+    let value = legacy.value.ok_or_else(|| {
+        queen_mq::Error::Decode(format!(
+            "stored v1 target `{app}/{name}` was found without a value"
+        ))
+    })?;
+    let old: v1::TargetSpec = serde_json::from_value(value).map_err(|e| {
+        queen_mq::Error::Decode(format!(
+            "stored v1 target `{app}/{name}` is unreadable: {e}"
+        ))
+    })?;
+    gate_core::migrate::from_v1_target(&old)
+        .map(|m| Some(m.doc))
+        .map_err(|e| queen_mq::Error::Decode(e.0))
+}
+
+fn decode_graph(value: serde_json::Value, app: &str, name: &str) -> Result<GraphDoc> {
+    match serde_json::from_value::<GraphDoc>(value.clone()) {
+        Ok(doc) => Ok(doc),
+        Err(v2_error) => {
+            let old: v1::GraphSpec = serde_json::from_value(value).map_err(|v1_error| {
+                queen_mq::Error::Decode(format!(
+                    "stored graph `{app}/{name}` is neither a readable v2 graph ({v2_error}) nor \
+                     a readable v1 graph ({v1_error})"
+                ))
+            })?;
+            gate_core::migrate::from_v1_graph(&old)
+                .map(|m| m.doc)
+                .map_err(|e| queen_mq::Error::Decode(e.0))
+        }
+    }
+}
+
 pub async fn forget(queen: &Queen, app: &str, name: &str) -> Result<()> {
     queen
         .kv()

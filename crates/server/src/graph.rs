@@ -97,21 +97,28 @@ pub async fn declare_locked(
     let old = app.registry.get(&doc.application, &doc.graph);
     if from_caller {
         if let Some(old) = &old {
-            if gate_core::needs_version_bump(&old.doc, &doc) && doc.version <= old.doc.version {
-                return Err(Refusal::Conflict(format!(
-                    "this change re-founds a counter or strands a queue (a new key starts at zero \
-                     while the old one counts down its TTL, and work already in an interior queue \
-                     has no consumer in the new plan): bump version above {}. Drain first — stop \
-                     pushing, wait for `waitingForBudget` to reach zero on every node, then \
-                     declare.",
-                    old.doc.version
-                )));
+            require_version_bump(&old.doc, &doc)?;
+        }
+
+        // Ask the STORE the same question, because a declare lands on ONE
+        // replica: a graph declared a second ago on another pod is not in this
+        // registry yet. This is an exact key read rather than the fleet-wide
+        // prefix scan below, so pagination cannot make an existing graph look
+        // new. A failed read refuses the mutation: without the predecessor Gate
+        // cannot prove that replacing it at this version is safe.
+        match crate::store::load_one(&app.queen, &doc.application, &doc.graph).await {
+            Ok(Some(stored)) => require_version_bump(&stored, &doc)?,
+            Ok(None) => {}
+            Err(e) => {
+                return Err(Refusal::Gateway(format!(
+                    "`{key}` was not declared: its stored predecessor could not be read ({e}), so \
+                     Gate cannot safely decide whether this change needs a version bump"
+                )))
             }
         }
-        // The same question of the STORE, because a declare lands on ONE
-        // replica: a graph declared a second ago on another pod is not in this
-        // registry yet. A store that will not answer is not a reason to refuse —
-        // the local check still stands.
+
+        // The fleet-wide read catches physical ingress ownership on replicas
+        // that have not reconciled those other graphs yet.
         if let Ok(stored) = crate::store::try_load_all(&app.queen).await {
             for other in stored.items.iter().filter(|d| d.key() != key) {
                 let mine = gate_core::compile(other);
@@ -254,6 +261,19 @@ fn join(problems: &[Problem]) -> String {
         .map(|p| p.to_string())
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+fn require_version_bump(old: &GraphDoc, new: &GraphDoc) -> Result<(), Refusal> {
+    if gate_core::needs_version_bump(old, new) && new.version <= old.version {
+        return Err(Refusal::Conflict(format!(
+            "this change re-founds a counter or strands a queue (a new key starts at zero while \
+             the old one counts down its TTL, and work already in an interior queue has no \
+             consumer in the new plan): bump version above {}. Drain first — stop pushing, wait \
+             for `waitingForBudget` to reach zero on every node, then declare.",
+            old.version
+        )));
+    }
+    Ok(())
 }
 
 /// What the declare answers: the whole compiled plan, so a caller never has to
