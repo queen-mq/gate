@@ -407,6 +407,24 @@ fn classify(st: &StageRuntime, message: &Message) -> Kind {
     if st.stage.check_foreign && !owns(&st.stage, &message.data) {
         return Kind::Foreign;
     }
+    // A shared interior queue has one consumer group per path. Those groups
+    // can tell their frames apart only from `_gate.path`, and a JSON scalar or
+    // array cannot carry that stamp. Forwarding one anyway makes the compiler's
+    // arbitrary unstamped owner charge and route every copy as its own path.
+    // Refuse it at the last unambiguous stage instead. Linear and terminal
+    // routes remain shape-preserving because neither needs path provenance.
+    if !message.data.is_object()
+        && st
+            .stage
+            .destinations
+            .iter()
+            .any(|destination| destination.requires_stamp)
+    {
+        return Kind::Poison(format!(
+            "gate: node `{}`: payload must be a JSON object before a shared interior queue",
+            st.node.name
+        ));
+    }
     if let Err(error) = cost_of(&st.node.cost, &message.data) {
         return Kind::Poison(format!("gate: node `{}`: {error}", st.node.name));
     }
@@ -1572,6 +1590,34 @@ mod tests {
         // the same way.
         assert!(owns(&owner, &json!({})));
         assert!(!owns(&other, &json!({})));
+    }
+
+    #[test]
+    fn an_unstampable_payload_never_enters_a_shared_interior_queue() {
+        let mut st = runtime(vec![budget("b", 10)], 1.0);
+        st.stage.destinations.push(gate_core::Destination {
+            node: "next".into(),
+            queue: "shared.in".into(),
+            label: "app/g/p/next".into(),
+            derive_id: true,
+            requires_stamp: true,
+            terminal: false,
+        });
+
+        match classify(&st, &msg("scalar", json!("cannot carry _gate"))) {
+            Kind::Poison(reason) => assert!(reason.contains("JSON object"), "{reason}"),
+            _ => panic!("an unstampable payload was allowed into a shared queue"),
+        }
+        assert!(matches!(
+            classify(&st, &msg("object", json!({ "w": 1 }))),
+            Kind::Work
+        ));
+
+        st.stage.destinations[0].requires_stamp = false;
+        assert!(matches!(
+            classify(&st, &msg("linear", json!("shape is preserved"))),
+            Kind::Work
+        ));
     }
 
     #[test]

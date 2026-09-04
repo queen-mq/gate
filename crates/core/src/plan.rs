@@ -297,6 +297,12 @@ pub struct Destination {
     /// egress queue, which is why this is recorded in §7 rather than done
     /// quietly.
     pub derive_id: bool,
+    /// Whether the queue this push enters is read by more than one stage.
+    /// Such a queue needs `_gate.path` on every frame so each consumer group
+    /// can distinguish its own copy from the other paths' copies. A scalar or
+    /// array cannot carry that stamp and must be rejected before it reaches
+    /// this destination rather than being charged and routed as another path.
+    pub requires_stamp: bool,
     pub terminal: bool,
 }
 
@@ -640,6 +646,7 @@ pub fn compile_with(doc: &GraphDoc, opts: &PlanOpts) -> Plan {
                             label: egress_label(app, graph, &p.name, node_name),
                             // ALWAYS at a terminal. See the note on `derive_id`.
                             derive_id: true,
+                            requires_stamp: false,
                             terminal: true,
                         }],
                         None => Vec::new(),
@@ -654,6 +661,7 @@ pub fn compile_with(doc: &GraphDoc, opts: &PlanOpts) -> Plan {
                                 queue: dn.interior_queue.clone(),
                                 label: label(app, graph, &p.name, d),
                                 derive_id: false,
+                                requires_stamp: false,
                                 terminal: false,
                             })
                         })
@@ -726,6 +734,7 @@ pub fn compile_with(doc: &GraphDoc, opts: &PlanOpts) -> Plan {
         s.owns_unstamped = claimed.insert(s.source.clone());
         let fanout = s.destinations.len() > 1;
         for d in &mut s.destinations {
+            d.requires_stamp = readers.get(&d.queue).copied().unwrap_or(1) > 1;
             d.derive_id =
                 d.terminal || fanout || converging.get(&d.queue).copied().unwrap_or(1) > 1;
         }
