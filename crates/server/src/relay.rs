@@ -40,7 +40,7 @@
 //! rotation cursor and `MAX_IN_FLIGHT` all existed to do, badly, what the broker
 //! does here for free.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -228,6 +228,7 @@ pub fn spawn(
     budgets: Budgets,
     st: Arc<StageRuntime>,
     traces: Arc<Traces>,
+    graph_stopped: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
     let k = knobs();
     let q = queen.clone();
@@ -276,10 +277,16 @@ pub fn spawn(
                 }
             })
             .await;
+        // A consumer normally returns only because its graph was deliberately
+        // cancelled. Any other return leaves this stage's source without a
+        // reader, so fail the whole runtime closed and stop its siblings. The
+        // reconcile loop can then see `is_running() == false` and replace it.
+        let unexpected = stop_graph_after_stage_exit(&graph_stopped, &st.cancel);
         match res {
             Ok(summary) => tracing::info!(
                 stage = %st.key(), queue = %st.stage.source,
                 processed = summary.processed, reason = ?summary.stopped_by,
+                unexpected,
                 "stage stopped"
             ),
             // A stage that exits is a stopped graph, which is the failure v1's
@@ -294,6 +301,17 @@ pub fn spawn(
             ),
         }
     })
+}
+
+/// Mark a runtime unhealthy when a stage returns without a graph cancellation.
+/// Returns whether this exit initiated the stop, for the terminal log line.
+fn stop_graph_after_stage_exit(stopped: &AtomicBool, cancel: &queen_mq::Cancel) -> bool {
+    if cancel.is_cancelled() {
+        return false;
+    }
+    stopped.store(true, Ordering::Relaxed);
+    cancel.cancel();
+    true
 }
 
 struct Ctx {
@@ -1301,6 +1319,26 @@ fn jitter_ms(wait_ms: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unexpected_stage_exit_stops_the_graph_and_its_siblings() {
+        let stopped = AtomicBool::new(false);
+        let cancel = Cancel::new();
+
+        assert!(stop_graph_after_stage_exit(&stopped, &cancel));
+        assert!(stopped.load(Ordering::Relaxed));
+        assert!(cancel.is_cancelled());
+    }
+
+    #[test]
+    fn a_planned_stage_exit_does_not_reclassify_the_stop() {
+        let stopped = AtomicBool::new(false);
+        let cancel = Cancel::new();
+        cancel.cancel();
+
+        assert!(!stop_graph_after_stage_exit(&stopped, &cancel));
+        assert!(!stopped.load(Ordering::Relaxed));
+    }
 
     fn budget(id: &str, count_sub: i64) -> gate_core::CompiledBudget {
         gate_core::CompiledBudget {
