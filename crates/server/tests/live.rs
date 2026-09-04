@@ -2895,6 +2895,20 @@ async fn an_eta_answers_from_the_declared_schedule_when_the_window_is_spent() {
         "the answer is a bound and must read as one: {eta}"
     );
 
+    let (_, targets) = h.send(reqwest::Method::GET, "/api/targets", None).await;
+    let mine = targets
+        .as_array()
+        .and_then(|rows| {
+            rows.iter()
+                .find(|t| t["application"] == h.application && t["name"] == "g")
+        })
+        .expect("graph missing from target index");
+    assert_eq!(
+        mine["state"], "pacing",
+        "current backlog must drive state: {mine}"
+    );
+    assert!(mine["backlog"].as_u64().unwrap_or(0) > 0, "{mine}");
+
     h.cleanup("g").await;
 }
 
@@ -2954,6 +2968,19 @@ async fn an_eta_tells_a_budget_backlog_from_a_worker_one() {
     assert!(
         node["waiting_for_workers"].as_u64().unwrap_or(0) as usize >= N,
         "the graph must show the worker backlog instead of a fallback zero: {view}"
+    );
+
+    let (_, targets) = h.send(reqwest::Method::GET, "/api/targets", None).await;
+    let mine = targets
+        .as_array()
+        .and_then(|rows| {
+            rows.iter()
+                .find(|t| t["application"] == h.application && t["name"] == "g")
+        })
+        .expect("graph missing from target index");
+    assert_eq!(
+        mine["state"], "flowing",
+        "worker backlog is not budget pacing: {mine}"
     );
 
     h.cleanup("g").await;
