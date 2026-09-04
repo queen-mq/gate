@@ -117,16 +117,9 @@ pub async fn try_load_all(queen: &Queen) -> Result<Stored> {
     let mut items = Vec::new();
     let mut migrated = Vec::new();
     let mut unreadable = 0usize;
-    let mut truncated = false;
 
-    let res = queen
-        .kv()
-        .get_prefix(&ns(), GRAPH_PREFIX)
-        .limit(1000)
-        .send()
-        .await?;
-    truncated |= res.truncated();
-    for row in res.rows.unwrap_or_default() {
+    let (rows, graphs_complete) = scan_prefix(queen, GRAPH_PREFIX).await?;
+    for row in rows {
         let Some(value) = row.value else {
             unreadable += 1;
             continue;
@@ -161,14 +154,8 @@ pub async fn try_load_all(queen: &Queen) -> Result<Stored> {
     }
 
     // v1 standalone targets. Each becomes a one-node graph named for itself.
-    let res = queen
-        .kv()
-        .get_prefix(&ns(), V1_TARGET_PREFIX)
-        .limit(1000)
-        .send()
-        .await?;
-    truncated |= res.truncated();
-    for row in res.rows.unwrap_or_default() {
+    let (rows, targets_complete) = scan_prefix(queen, V1_TARGET_PREFIX).await?;
+    for row in rows {
         let Some(value) = row.value else {
             unreadable += 1;
             continue;
@@ -202,7 +189,141 @@ pub async fn try_load_all(queen: &Queen) -> Result<Stored> {
     }
     Ok(Stored {
         items,
-        complete: !truncated && unreadable == 0,
+        complete: graphs_complete && targets_complete && unreadable == 0,
         migrated,
     })
+}
+
+/// Read every page under one store prefix.
+///
+/// The broker caps a page by both rows and bytes. `truncated` therefore does
+/// not mean merely "there may be more than 1,000 documents": one large value
+/// can make even a short page incomplete. The exclusive `nextAfter` cursor is
+/// the only correct way to resume it.
+///
+/// A malformed truncated response is returned as incomplete rather than spun
+/// on forever. Reconcile may still add/change the documents it did see, but its
+/// `complete` guard will not interpret an unseen one as deleted.
+async fn scan_prefix(queen: &Queen, prefix: &str) -> Result<(Vec<queen_mq::KvRow>, bool)> {
+    let namespace = ns();
+    let mut rows = Vec::new();
+    let mut after: Option<String> = None;
+
+    loop {
+        let mut query = queen.kv().get_prefix(&namespace, prefix).limit(1000);
+        if let Some(cursor) = &after {
+            query = query.after(cursor);
+        }
+        let page = query.send().await?;
+        let truncated = page.truncated();
+        let next = page.next_after.clone();
+        rows.extend(page.rows.unwrap_or_default());
+
+        if !truncated {
+            return Ok((rows, true));
+        }
+        match next {
+            Some(cursor) if after.as_ref().is_none_or(|previous| cursor > *previous) => {
+                after = Some(cursor);
+            }
+            _ => return Ok((rows, false)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::extract::State;
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use parking_lot::Mutex;
+    use queen_mq::{Config, Queen};
+    use serde_json::{json, Value};
+
+    use super::*;
+
+    fn document(name: &str) -> Value {
+        json!({
+            "application": "paging",
+            "graph": name,
+            "version": 1,
+            "nodes": {
+                "n": {
+                    "budgets": [{ "id": "b", "count": 10, "timeMs": 1000 }],
+                    "ingress": true,
+                    "egress": "paging.out"
+                }
+            },
+            "paths": [{ "name": "main", "nodes": ["n"] }]
+        })
+    }
+
+    async fn kv_page(
+        State(seen): State<Arc<Mutex<Vec<Value>>>>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        seen.lock().push(body.clone());
+        let op = &body["operations"][0];
+        let prefix = op["prefix"].as_str().unwrap_or_default();
+        let after = op.get("after").and_then(Value::as_str);
+        let result = match (prefix, after) {
+            (GRAPH_PREFIX, None) => json!({
+                "index": 0,
+                "op": "getPrefix",
+                "rows": [{ "key": "graph:paging:a", "value": document("a"), "version": 1 }],
+                "truncated": true,
+                "nextAfter": "graph:paging:a"
+            }),
+            (GRAPH_PREFIX, Some("graph:paging:a")) => json!({
+                "index": 0,
+                "op": "getPrefix",
+                "rows": [{ "key": "graph:paging:b", "value": document("b"), "version": 1 }],
+                "truncated": false
+            }),
+            (V1_TARGET_PREFIX, None) => json!({
+                "index": 0,
+                "op": "getPrefix",
+                "rows": [],
+                "truncated": false
+            }),
+            _ => panic!("unexpected prefix page: {op}"),
+        };
+        Json(json!({ "results": [result] }))
+    }
+
+    #[tokio::test]
+    async fn a_truncated_store_scan_resumes_from_the_brokers_cursor() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake broker");
+        let url = format!("http://{}", listener.local_addr().expect("address"));
+        let router = Router::new()
+            .route("/api/v1/kv", post(kv_page))
+            .with_state(seen.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("serve fake broker")
+        });
+        let queen = Queen::connect(Config::new(url)).expect("client");
+
+        let stored = try_load_all(&queen).await.expect("scan store");
+        server.abort();
+
+        assert!(stored.complete, "both prefixes reached their final page");
+        assert_eq!(
+            stored.items.iter().map(GraphDoc::key).collect::<Vec<_>>(),
+            ["paging/a", "paging/b"]
+        );
+        let requests = seen.lock();
+        assert_eq!(requests.len(), 3, "two graph pages and one target page");
+        assert_eq!(
+            requests[1]["operations"][0]["after"],
+            json!("graph:paging:a"),
+            "the second page must use the broker's exclusive cursor"
+        );
+    }
 }
