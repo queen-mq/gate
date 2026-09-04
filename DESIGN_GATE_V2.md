@@ -1089,9 +1089,10 @@ should now be near `batch` rather than near 1.
 
 ### 10.3 The optional counters stream
 
-`"counters": { "windowSeconds": 60 }` on the graph turns on **one** streams job per graph: a
-tumbling-window aggregate over the egress queue producing `{ path, node, count, cost }` per
-window, written to `gate.rollups`. This is opt-in, per graph, and off by default — the point
+`"counters": { "windowSeconds": 60 }` on the graph turns on durable one-minute roll-ups. The
+storage schema and history API are minute-keyed, so `60` is currently the only accepted value.
+The runtime snapshots each replica's in-process stage counters and writes their deltas to
+`gate.rollups`. This is opt-in, per graph, and off by default — the point
 of the architecture is that observability is a thing you switch on, not a thing that runs
 whether or not anyone is looking. It is the source for `avgCost`, `/api/flow`, `/api/rollups`
 and the console's charts.
@@ -1131,6 +1132,7 @@ Rule names are asserted on in tests, so they are API.
 |---|---|---|
 | `nodes` | empty | `a graph with no nodes limits nothing.` |
 | `paths` | empty | `` a graph with no paths has no way in and no way out: declare at least one path naming the nodes a message visits, in order. `` |
+| `counters-window` | `counters.windowSeconds != 60` | `` counters.windowSeconds is {n}, but Gate currently stores and serves fixed one-minute roll-ups. Set windowSeconds to 60, or omit counters to leave durable roll-ups off. `` |
 | `path-node` | a path names an undeclared node | `` path `{p}` visits `{n}`, which is not a declared node. Declared nodes are: {list}. `` |
 | `path-length` | a path has fewer than 1 element | `` path `{p}` is empty. `` |
 | `acyclic` | the union of all path edges has a cycle | `` these nodes form a cycle: {a} -> {b} -> {a}. An item would traverse it for ever, re-paying every budget on the way round. `` |

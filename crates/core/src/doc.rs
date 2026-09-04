@@ -100,6 +100,11 @@ pub struct Counters {
     pub window_seconds: u32,
 }
 
+/// Roll-ups are stored in minute-keyed rows and every history endpoint reads
+/// those rows as minutes. Keep the one supported value named in one place so a
+/// declaration cannot promise a window the runtime does not actually emit.
+pub const COUNTERS_WINDOW_SECONDS: u32 = 60;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Node {

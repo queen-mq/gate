@@ -23,8 +23,8 @@ pub mod validate;
 pub use cost::{cost_of, ok_payload_path, op_matches, op_of, resolve, scope_value, TooExpensive};
 pub use doc::{
     default_application, ok_name, ok_target_name, Budget, Confidence, Cost, CostPath, Counters,
-    Egress, EgressSpec, GraphDoc, Ingress, IngressSpec, Node, Path, PathElem, GATE_META,
-    PAYLOAD_ROOT,
+    Egress, EgressSpec, GraphDoc, Ingress, IngressSpec, Node, Path, PathElem,
+    COUNTERS_WINDOW_SECONDS, GATE_META, PAYLOAD_ROOT,
 };
 pub use ids::derive;
 pub use plan::{
