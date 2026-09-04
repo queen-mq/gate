@@ -50,7 +50,7 @@ use queen_mq::{Cancel, Message, Queen, SubscriptionMode, TxnPushItem};
 use serde_json::{json, Value};
 
 use gate_core::plan::{NodePlan, Stage};
-use gate_core::{cost_of, op_matches, op_of, scope_value, GATE_META};
+use gate_core::{cost_of, missing_scope, op_matches, op_of, scope_value, GATE_META};
 
 use crate::budget::{Budgets, Charge, Ledger};
 use crate::knobs::knobs;
@@ -361,21 +361,7 @@ async fn handle(ctx: &Ctx, msgs: Vec<Message>) {
         return;
     }
 
-    let kinds: Vec<Kind> = msgs
-        .iter()
-        .map(|m| {
-            // §6.7. Three groups read `ip.in` in the flagship graph and each sees
-            // every message; only the one whose `_gate.path` matches forwards it.
-            // The others must SETTLE it or their cursor never advances.
-            if st.stage.check_foreign && !owns(&st.stage, &m.data) {
-                return Kind::Foreign;
-            }
-            match cost_of(&st.node.cost, &m.data) {
-                Ok(_) => Kind::Work,
-                Err(e) => Kind::Poison(format!("gate: node `{}`: {e}", st.node.name)),
-            }
-        })
-        .collect();
+    let kinds: Vec<Kind> = msgs.iter().map(|m| classify(st, m)).collect();
 
     // A poison message at the HEAD is nacked on its own, because a nack and an
     // ack in one transaction contradict each other: the nack releases the lease
@@ -411,6 +397,26 @@ async fn handle(ctx: &Ctx, msgs: Vec<Message>) {
         .position(|k| matches!(k, Kind::Poison(_)))
         .unwrap_or(kinds.len());
     admit(ctx, &msgs[..cut], &kinds[..cut]).await;
+}
+
+fn classify(st: &StageRuntime, message: &Message) -> Kind {
+    // §6.7. Three groups read `ip.in` in the flagship graph and each sees every
+    // message; only the one whose `_gate.path` matches forwards it. The others
+    // must SETTLE it or their cursor never advances, even when its payload would
+    // be invalid for this other path.
+    if st.stage.check_foreign && !owns(&st.stage, &message.data) {
+        return Kind::Foreign;
+    }
+    if let Err(error) = cost_of(&st.node.cost, &message.data) {
+        return Kind::Poison(format!("gate: node `{}`: {error}", st.node.name));
+    }
+    if let Some((budget, path)) = missing_scope(&st.node.budgets, &message.data) {
+        return Kind::Poison(format!(
+            "gate: node `{}`: budget `{budget}` counts per `{path}` and this item carries none",
+            st.node.name
+        ));
+    }
+    Kind::Work
 }
 
 /// §6.1 – §6.5. `window` is in offset order and all from one source partition.
@@ -796,12 +802,9 @@ fn group(st: &StageRuntime, msgs: &[Message]) -> Grouped {
             let key = match &b.scope_by {
                 Some(path) => match scope_value(&m.data, path) {
                     Some(v) => b.key_for(Some(&v)),
-                    // A counter keyed on an absent value measures the wrong
-                    // thing. The HTTP front door refuses this with a 422; an
-                    // item that arrived on a user-owned ingress queue without it
-                    // is charged against the node's other budgets and skips this
-                    // one, because dropping the item would be a limiter losing
-                    // work it was asked to pace.
+                    // `classify` makes an applicable missing scope poison before
+                    // grouping. Keep this defensive branch for recomputed
+                    // refunds, which must never invent a scope key.
                     None => continue,
                 },
                 None => b.key.clone(),
@@ -1510,6 +1513,26 @@ mod tests {
             .find(|c| c.key.ends_with(":l1"))
             .expect("one key per listing");
         assert_eq!(l1.delta, 2);
+    }
+
+    #[test]
+    fn an_applicable_missing_scope_is_poison_on_direct_ingress() {
+        let mut scoped = budget("per-listing", 100);
+        scoped.scope_by = Some("payload.listingId".into());
+        scoped.when_op = Some(vec!["photo.delete".into()]);
+        let st = runtime(vec![budget("all", 100), scoped], 1.0);
+
+        let missing = msg("t0", json!({ "w": 1, "op": "photo.delete" }));
+        match classify(&st, &missing) {
+            Kind::Poison(reason) => {
+                assert!(reason.contains("per-listing"), "{reason}");
+                assert!(reason.contains("payload.listingId"), "{reason}");
+            }
+            _ => panic!("a missing applicable scope was allowed through"),
+        }
+
+        let unrelated = msg("t1", json!({ "w": 1, "op": "photo.upload" }));
+        assert!(matches!(classify(&st, &unrelated), Kind::Work));
     }
 
     fn stage_named(path: &str, owns_unstamped: bool) -> Stage {
