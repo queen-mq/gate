@@ -193,25 +193,27 @@ async fn sweep(queen: &Queen) {
     if ONCE.set(()).is_err() {
         return;
     }
-    let Ok(res) = queen
-        .kv()
-        .get_prefix("gate", "graph:it")
-        .limit(1000)
-        .keys_only()
-        .send()
-        .await
-    else {
-        return;
-    };
-    let rows = res.rows.unwrap_or_default();
-    for row in &rows {
-        let _ = queen.kv().delete("gate", &row.key).send().await;
-    }
-    if !rows.is_empty() {
-        eprintln!(
-            "swept {} leftover graph document(s) from an earlier run",
-            rows.len()
-        );
+    for prefix in ["graph:it", "spec:it"] {
+        let Ok(res) = queen
+            .kv()
+            .get_prefix("gate", prefix)
+            .limit(1000)
+            .keys_only()
+            .send()
+            .await
+        else {
+            return;
+        };
+        let rows = res.rows.unwrap_or_default();
+        for row in &rows {
+            let _ = queen.kv().delete("gate", &row.key).send().await;
+        }
+        if !rows.is_empty() {
+            eprintln!(
+                "swept {} leftover {prefix} document(s) from an earlier run",
+                rows.len()
+            );
+        }
     }
 }
 
@@ -2644,6 +2646,60 @@ async fn deleting_a_graph_that_was_never_declared_is_a_success() {
         .await;
     assert_eq!(status, 200, "{res}");
     assert_eq!(res["registered"], json!(false), "{res}");
+}
+
+/// A v1 target may be qualified as `graph.node`, while its v2 graph identity is
+/// the final segment. Deleting that migrated graph must remove the qualified
+/// source row too, or the next restore brings it back from the dead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn deleting_a_migrated_dotted_target_removes_its_v1_source() {
+    let Some(h) = harness("delete-v1-dotted").await else {
+        return;
+    };
+    let old_key = format!("spec:{}:legacy.ip", h.application);
+    let old = json!({
+        "application": h.application,
+        "name": "legacy.ip",
+        "version": 1,
+        "budgets": [{
+            "id": "api", "cap": 1000, "periodSeconds": 60,
+            "alignment": "rolling", "confidence": "inferred"
+        }],
+        "cost": { "field": "cost", "default": 1, "max": 1 }
+    });
+    h.queen
+        .kv()
+        .put("gate", &old_key, old, queen_mq::Expiry::forever())
+        .send()
+        .await
+        .expect("seed the v1 target row");
+
+    gate_server::restore(&h.app).await;
+    assert!(
+        h.app.registry.get(&h.application, "ip").is_some(),
+        "the qualified v1 target must migrate to its leaf graph"
+    );
+
+    let (status, body) = h
+        .send(
+            reqwest::Method::DELETE,
+            &format!("/v1/apps/{}/targets/ip", h.application),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "delete the migrated target: {body}");
+
+    let stored = gate_server::store::try_load_all(&h.queen)
+        .await
+        .expect("read the store after delete");
+    assert!(
+        stored
+            .items
+            .iter()
+            .all(|doc| doc.key() != format!("{}/ip", h.application)),
+        "the legacy source survived and would restore the deleted graph"
+    );
 }
 
 /// A second replica converges on the stored document.
