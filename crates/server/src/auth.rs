@@ -316,17 +316,22 @@ fn now() -> i64 {
     crate::now_ms() / 1000
 }
 
-/// A nonce with no dependency on a random crate: the session secret is already
-/// the thing whose secrecy everything here rests on, so a keyed hash of it plus
-/// a monotonic instant is as unguessable as the secret itself.
-fn nonce(secret: &[u8]) -> String {
-    let t = crate::now_ms();
-    let mut h: u64 = 1469598103934665603;
-    for b in secret.iter().chain(t.to_le_bytes().iter()) {
-        h ^= *b as u64;
-        h = h.wrapping_mul(1099511628211);
+/// A fresh 128-bit OpenID Connect nonce from the operating system.
+///
+/// This value is public in the authorization URL, so deriving it from the
+/// session secret with a non-cryptographic hash does not make it unpredictable:
+/// FNV-1a is reversible once its timestamp suffix is known. Entropy is the
+/// property the nonce needs, not secrecy of its input.
+fn nonce() -> Result<String, getrandom::Error> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes)?;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[usize::from(b >> 4)] as char);
+        out.push(HEX[usize::from(b & 0x0f)] as char);
     }
-    format!("{h:016x}{:x}", t)
+    Ok(out)
 }
 
 /// A post-login destination is always local to this console. The state is
@@ -354,7 +359,13 @@ pub async fn login(
     let Some(auth) = app.auth.as_ref() else {
         return (StatusCode::NOT_FOUND, "sign-in is not configured").into_response();
     };
-    let n = nonce(&auth.cfg.secret);
+    let n = match nonce() {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!(error = %e, "could not generate OAuth nonce");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "could not start sign-in").into_response();
+        }
+    };
     let state = match auth.sign(&StateClaims {
         nonce: n.clone(),
         next: safe_next(q.get("next").map(String::as_str)),
@@ -677,7 +688,16 @@ fn urlencode(s: &str) -> String {
 mod tests {
     use axum::http::{header, HeaderMap, HeaderValue};
 
-    use super::{cookie_value, oauth_state_cookie, safe_next, OAUTH_STATE_COOKIE};
+    use super::{cookie_value, nonce, oauth_state_cookie, safe_next, OAUTH_STATE_COOKIE};
+
+    #[test]
+    fn oauth_nonces_are_fresh_128_bit_hex_values() {
+        let first = nonce().expect("the operating system provides randomness");
+        let second = nonce().expect("the operating system provides randomness");
+        assert_eq!(first.len(), 32);
+        assert!(first.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(first, second);
+    }
 
     #[test]
     fn oauth_next_accepts_only_local_absolute_paths() {
