@@ -38,6 +38,10 @@ const graph = ref(null)
 const error = ref('')
 /* `?path=` selects one path, which is what a `/lanes/:lane` link becomes. */
 const selected = ref(String(route.query.path ?? ''))
+watch(
+  () => route.query.path,
+  (path) => { selected.value = String(path ?? '') },
+)
 
 async function load() {
   try {
