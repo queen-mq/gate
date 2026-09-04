@@ -1423,6 +1423,90 @@ async fn an_item_that_can_never_be_admitted_is_dead_lettered() {
     h.cleanup("g").await;
 }
 
+/// A non-object payload cannot carry `_gate.path`. Letting one enter an
+/// interior queue read by several path groups makes the compiler's arbitrary
+/// unstamped owner route and charge it as the wrong path. It must be
+/// dead-lettered while its path is still unambiguous, without blocking valid
+/// work behind it. A scalar remains legal on linear and terminal routes; this
+/// test exercises only the shared destination that needs provenance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn an_unstampable_item_never_enters_a_shared_interior_queue() {
+    let Some(h) = harness("unstampable").await else {
+        return;
+    };
+    let out = egress_of("unstampable", &h.application);
+    let left = format!("app.unstampable.{}.left", h.application);
+    let right = format!("app.unstampable.{}.right", h.application);
+    h.queen.queue(&left).create().await.ok();
+    h.queen.queue(&right).create().await.ok();
+
+    let doc = json!({
+      "version": 1,
+      "nodes": {
+        "left": {
+          "ingress": { "queue": left, "http": false },
+          "budgets": [wide("left")]
+        },
+        "right": {
+          "ingress": { "queue": right, "http": false },
+          "budgets": [wide("right")]
+        },
+        "join": { "budgets": [wide("join")], "egress": out }
+      },
+      "paths": [
+        { "name": "left", "nodes": ["left", "join"] },
+        { "name": "right", "nodes": ["right", "join"] }
+      ]
+    });
+    let (status, body) = h.put_graph("g", doc).await;
+    assert_eq!(status, 200, "declare: {body}");
+
+    h.queen
+        .queue(&left)
+        .push_items(vec![
+            queen_mq::PushItem {
+                queue: left.clone(),
+                partition: Some("p0".into()),
+                payload: json!("cannot carry a path stamp"),
+                transaction_id: None,
+            },
+            queen_mq::PushItem {
+                queue: left.clone(),
+                partition: Some("p0".into()),
+                payload: json!({ "n": 1 }),
+                transaction_id: None,
+            },
+        ])
+        .await
+        .expect("push");
+
+    let got = h.drain(&out, 1, Duration::from_secs(40)).await;
+    assert_eq!(got.len(), 1, "valid work behind the poison never arrived");
+    assert_eq!(got[0].data["n"], 1, "the unstampable item was forwarded");
+    assert!(
+        h.drain_for(&out, Duration::from_secs(2)).await.is_empty(),
+        "the shared queue emitted another copy"
+    );
+
+    let (_, view) = h.get_graph("g").await;
+    let dead = view["stages"]
+        .as_array()
+        .and_then(|stages| {
+            stages
+                .iter()
+                .find(|stage| stage["path"] == "left" && stage["node"] == "left")
+        })
+        .and_then(|stage| stage["counters"]["deadlettered"].as_u64())
+        .unwrap_or(0);
+    assert!(
+        dead >= 1,
+        "the rejected item was not visible as dead-lettered: {view}"
+    );
+
+    h.cleanup("g").await;
+}
+
 /// A KV route that refuses is NOT a refusal.
 ///
 /// Reading a failed charge as a refusal would park the graph; reading it as an

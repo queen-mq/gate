@@ -333,6 +333,7 @@ fn stage_view(s: &gate_core::plan::Stage) -> Value {
             "node": d.node,
             "queue": d.queue,
             "derivesTransactionId": d.derive_id,
+            "requiresPathStamp": d.requires_stamp,
             "terminal": d.terminal,
         })).collect::<Vec<_>>(),
     })
