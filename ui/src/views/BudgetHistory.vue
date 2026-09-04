@@ -201,7 +201,7 @@ const tone = computed(() => (peak.value > 1 ? 'text-bad' : peak.value >= 0.85 ? 
             {{ spec.confidence }} cap
           </span>
         </div>
-        <BudgetBar :used="spec.value ?? 0" :cap="ceilingOf(spec)"
+        <BudgetBar :used="spec.value" :cap="ceilingOf(spec)"
                    :assumed="spec.confidence === 'assumed'" :height="8" />
       </section>
 

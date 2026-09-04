@@ -193,10 +193,12 @@ export function pct(x) {
   ones that can render "we cannot say" do.
 */
 export function utilisation(b) {
-  if (!b) return 0
-  if (b.utilisation !== null && b.utilisation !== undefined) return b.utilisation
+  if (!b) return null
+  if (b.utilisation !== undefined) return b.utilisation
+  const used = b.value ?? b.used
+  if (used === null || used === undefined) return null
   const ceiling = ceilingOf(b)
-  return ceiling > 0 ? (b.value ?? b.used ?? 0) / ceiling : 0
+  return ceiling > 0 ? used / ceiling : null
 }
 
 /* The widest path's ceiling on this budget, which is what the bar is drawn
