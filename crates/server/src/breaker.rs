@@ -73,9 +73,9 @@ pub struct Record {
 
 /// Trip the breaker on one node.
 ///
-/// The ordering is not arbitrary: **refund first**. After the window is spent
-/// the counter is at its ceiling, and a refund arriving then would open a hole
-/// in the very window we are about to close.
+/// The counter writes and the record are one KV batch, hence one PostgreSQL
+/// transaction. A caller must never be told the trip failed while an invisible
+/// breaker was nevertheless left holding the node.
 pub async fn trip(
     budgets: &Budgets,
     application: &str,
@@ -107,32 +107,17 @@ pub async fn trip(
         }));
     }
 
-    if let Some(refund) = body.refund_cost.filter(|c| *c > 0) {
-        // A CREDIT and not a refund: there is no charge of ours to identify, so
-        // there is no window to prove and `min: 0` is the only available guard.
-        // It is safe here and nowhere else, because the spend below overwrites
-        // whatever this credited a few microseconds later.
-        let charges: Vec<crate::budget::Charge> = first_by_key(node)
-            .into_iter()
-            .map(|b| crate::budget::Charge {
-                key: b.key.clone(),
-                max: b.max_for(node.widest_share()),
-                ttl: b.window_sub_seconds,
-                delta: refund,
-                budget_id: b.id.clone(),
-            })
-            .collect();
-        budgets.credit(&charges).await;
-    }
-
     // The WIDEST path's ceiling, so no path can slip under it: a path at
     // share 0.5 refuses itself at half the counter, and writing half would leave
-    // it admitting.
+    // it admitting. Replacing the old counter also gives back `refundCost`:
+    // none of the old window survives this write, and after the breaker expires
+    // the next charge starts a fresh window at zero. A separate decrement before
+    // this replacement was a no-op on success and leaked capacity if the trip
+    // subsequently failed.
     let spend: Vec<(String, i64)> = first_by_key(node)
         .into_iter()
         .map(|b| (b.key.clone(), b.max_for(node.widest_share())))
         .collect();
-    budgets.spend(&spend, seconds).await?;
 
     let rec = Record {
         at: crate::now_ms(),
@@ -142,10 +127,12 @@ pub async fn trip(
         graph: graph.to_string(),
         node: node.name.clone(),
     };
-    // Fleet-wide, and that is the point: v1's breach ring was per-replica, and a
-    // breach seen only by the pod nobody is looking at is a breach nobody sees.
+    // Fleet-wide and atomic with the counters. v1's breach ring was per-replica,
+    // and a breach seen only by the pod nobody is looking at is a breach nobody
+    // sees; a counter spent without this record is the same operationally.
     budgets
-        .put_json(
+        .spend_with_record(
+            &spend,
             &node.breaker_key,
             serde_json::to_value(&rec).unwrap_or(json!({})),
             seconds,
@@ -164,7 +151,7 @@ pub async fn trip(
         "retryAfterSeconds": seconds,
         "until": rec.at + seconds * 1000,
         "keys": keys,
-        "refunded": body.refund_cost.unwrap_or(0),
+        "refunded": body.refund_cost.filter(|c| *c > 0).unwrap_or(0),
     }))
 }
 
