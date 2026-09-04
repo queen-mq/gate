@@ -299,6 +299,15 @@ impl From<crate::graph::Refusal> for Fail {
     }
 }
 
+impl From<queen_mq::Error> for Fail {
+    fn from(error: queen_mq::Error) -> Self {
+        Fail(
+            StatusCode::BAD_GATEWAY,
+            format!("could not read live broker state: {error}"),
+        )
+    }
+}
+
 /// Find a graph, by application and name.
 pub fn find(
     st: &Shared,

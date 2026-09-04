@@ -169,7 +169,7 @@ pub async fn list_targets(State(app): State<Shared>) -> ApiResult {
         let mut worst = (String::new(), 0.0f64, 0i64, 0i64, false, 0i64);
         for np in g.plan.nodes.values() {
             let keys: Vec<String> = np.unscoped().map(|b| b.key.clone()).collect();
-            let states = app.budgets.read(&keys).await.unwrap_or_default();
+            let states = app.budgets.read(&keys).await?;
             for b in np.unscoped() {
                 let ceiling = b.max_for(np.widest_share());
                 if ceiling <= 0 {
@@ -473,7 +473,7 @@ pub struct LimitQuery {
 /// replica can read.
 pub async fn recent_breaches(State(app): State<Shared>, Query(q): Query<LimitQuery>) -> ApiResult {
     ok(json!(
-        crate::breaker::recent(&app.budgets, q.limit.unwrap_or(10) as u32).await
+        crate::breaker::recent(&app.budgets, q.limit.unwrap_or(10) as u32).await?
     ))
 }
 
@@ -506,8 +506,7 @@ pub async fn shared_budgets(State(app): State<Shared>) -> ApiResult {
         let state = app
             .budgets
             .read(std::slice::from_ref(&first.key))
-            .await
-            .unwrap_or_default()
+            .await?
             .into_iter()
             .next();
         let conflicts: Vec<Value> = members
@@ -618,7 +617,7 @@ pub async fn app_metrics(
             }
 
             let keys: Vec<String> = np.unscoped().map(|b| b.key.clone()).collect();
-            let states = app.budgets.read(&keys).await.unwrap_or_default();
+            let states = app.budgets.read(&keys).await?;
             let binding = np
                 .unscoped()
                 .map(|b| {
@@ -635,7 +634,7 @@ pub async fn app_metrics(
                     _ => Some(x),
                 });
 
-            let breaker = crate::breaker::held(&app.budgets, np).await;
+            let breaker = crate::breaker::held(&app.budgets, np).await?;
             let state = if breaker.is_some() {
                 "breached"
             } else if waiting_budget > 0 {

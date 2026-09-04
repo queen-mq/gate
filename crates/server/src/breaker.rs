@@ -226,49 +226,43 @@ fn unique_keys(node: &NodePlan) -> Vec<String> {
 }
 
 /// Every breaker currently holding a node, fleet-wide.
-pub async fn recent(budgets: &Budgets, limit: u32) -> Vec<Value> {
-    match budgets.get_prefix("brk:", limit).await {
-        Ok(rows) => {
-            let mut out: Vec<Record> = rows
-                .into_iter()
-                .filter_map(|r| r.value.and_then(decode_record))
-                .collect();
-            out.sort_by_key(|r| std::cmp::Reverse(r.at));
-            out.iter()
-                .map(|r| {
-                    json!({
-                        "at": r.at,
-                        "application": r.application,
-                        "target": format!("{}.{}", r.graph, r.node),
-                        "graph": r.graph,
-                        "node": r.node,
-                        "retryAfterSeconds": r.retry_after_seconds,
-                        "until": r.until_ms(),
-                        "by": r.by,
-                    })
-                })
-                .collect()
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "could not read the breaker records");
-            Vec::new()
-        }
-    }
+pub async fn recent(budgets: &Budgets, limit: u32) -> queen_mq::Result<Vec<Value>> {
+    let rows = budgets.get_prefix("brk:", limit).await?;
+    let mut out: Vec<Record> = rows
+        .into_iter()
+        .filter_map(|r| r.value.and_then(decode_record))
+        .collect();
+    out.sort_by_key(|r| std::cmp::Reverse(r.at));
+    Ok(out
+        .iter()
+        .map(|r| {
+            json!({
+                "at": r.at,
+                "application": r.application,
+                "target": format!("{}.{}", r.graph, r.node),
+                "graph": r.graph,
+                "node": r.node,
+                "retryAfterSeconds": r.retry_after_seconds,
+                "until": r.until_ms(),
+                "by": r.by,
+            })
+        })
+        .collect())
 }
 
 /// One node's breaker record, if it is currently held.
 ///
 /// The record's own TTL is the answer: a key that has expired is a breaker that
 /// has lifted, and there is nothing to sweep and nothing to clear.
-pub async fn held(budgets: &Budgets, node: &NodePlan) -> Option<Record> {
+pub async fn held(budgets: &Budgets, node: &NodePlan) -> queen_mq::Result<Option<Record>> {
     let rows = budgets
         .get_raw(std::slice::from_ref(&node.breaker_key))
-        .await
-        .ok()?;
-    rows.into_iter()
+        .await?;
+    Ok(rows
+        .into_iter()
         .next()
         .and_then(|r| r.value)
-        .and_then(decode_record)
+        .and_then(decode_record))
 }
 
 #[cfg(test)]
