@@ -289,7 +289,7 @@ fn assumes(
     if let Some(r) = held {
         parts.push(format!(
             "a breaker is holding this node until {} ({}s from {}{}), so the window is spent on              purpose and this number is that deadline rather than a backlog",
-            r.at.saturating_add(r.retry_after_seconds.saturating_mul(1000)),
+            r.until_ms(),
             r.retry_after_seconds,
             r.at,
             match &r.by {

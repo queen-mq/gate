@@ -71,6 +71,24 @@ pub struct Record {
     pub node: String,
 }
 
+impl Record {
+    /// The wall-clock deadline, safe even when a broker record was written by
+    /// a broken or newer producer. Display code must not be able to overflow a
+    /// request merely by reading shared state.
+    pub fn until_ms(&self) -> i64 {
+        self.at
+            .saturating_add(self.retry_after_seconds.saturating_mul(1000))
+    }
+
+    fn valid(&self) -> bool {
+        self.at >= 0 && (MIN_SECONDS..=MAX_SECONDS).contains(&self.retry_after_seconds)
+    }
+}
+
+fn decode_record(value: Value) -> Option<Record> {
+    serde_json::from_value(value).ok().filter(Record::valid)
+}
+
 /// Trip the breaker on one node.
 ///
 /// The ordering is not arbitrary: **refund first**. After the window is spent
@@ -162,7 +180,7 @@ pub async fn trip(
         "ok": true,
         "node": node.name,
         "retryAfterSeconds": seconds,
-        "until": rec.at + seconds * 1000,
+        "until": rec.until_ms(),
         "keys": keys,
         "refunded": body.refund_cost.unwrap_or(0),
     }))
@@ -213,7 +231,7 @@ pub async fn recent(budgets: &Budgets, limit: u32) -> Vec<Value> {
         Ok(rows) => {
             let mut out: Vec<Record> = rows
                 .into_iter()
-                .filter_map(|r| r.value.and_then(|v| serde_json::from_value(v).ok()))
+                .filter_map(|r| r.value.and_then(decode_record))
                 .collect();
             out.sort_by_key(|r| std::cmp::Reverse(r.at));
             out.iter()
@@ -225,7 +243,7 @@ pub async fn recent(budgets: &Budgets, limit: u32) -> Vec<Value> {
                         "graph": r.graph,
                         "node": r.node,
                         "retryAfterSeconds": r.retry_after_seconds,
-                        "until": r.at + r.retry_after_seconds * 1000,
+                        "until": r.until_ms(),
                         "by": r.by,
                     })
                 })
@@ -250,5 +268,50 @@ pub async fn held(budgets: &Budgets, node: &NodePlan) -> Option<Record> {
     rows.into_iter()
         .next()
         .and_then(|r| r.value)
-        .and_then(|v| serde_json::from_value(v).ok())
+        .and_then(decode_record)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{decode_record, Record, MAX_SECONDS};
+
+    #[test]
+    fn a_breaker_deadline_saturates_instead_of_overflowing() {
+        let record = Record {
+            at: i64::MAX - 500,
+            retry_after_seconds: 1,
+            by: None,
+            application: "a".into(),
+            graph: "g".into(),
+            node: "n".into(),
+        };
+        assert_eq!(record.until_ms(), i64::MAX);
+    }
+
+    #[test]
+    fn malformed_shared_breaker_records_are_not_reported_as_live() {
+        let record = |seconds| {
+            json!({
+                "at": 1,
+                "retryAfterSeconds": seconds,
+                "application": "a",
+                "graph": "g",
+                "node": "n"
+            })
+        };
+
+        assert!(decode_record(record(1)).is_some());
+        assert!(decode_record(record(0)).is_none());
+        assert!(decode_record(record(MAX_SECONDS + 1)).is_none());
+        assert!(decode_record(json!({
+            "at": -1,
+            "retryAfterSeconds": 1,
+            "application": "a",
+            "graph": "g",
+            "node": "n"
+        }))
+        .is_none());
+    }
 }
