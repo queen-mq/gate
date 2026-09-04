@@ -210,14 +210,19 @@ pub fn spawn_reconcile(
 /// a race: they saw different halves of the traffic and the row is the sum.
 type CounterSnapshot = (u64, u64, u64);
 type CounterCheckpoint = (String, CounterSnapshot);
+const MINUTE_MS: i64 = 60_000;
 
 pub fn spawn_counters(app: api::Shared) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut last: HashMap<String, CounterSnapshot> = HashMap::new();
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            let now = now_ms();
-            let minute = now / 60_000 * 60_000;
+            // Anchor samples to wall-clock minute boundaries. Sleeping a fixed
+            // minute from process start makes every bucket span, for example,
+            // 12:00:37..12:01:37 while labelling it 12:01:00.
+            tokio::time::sleep(until_next_minute(now_ms())).await;
+            // The delta ends at this boundary, so it belongs to the minute that
+            // just completed, not to the empty minute that has just begun.
+            let minute = completed_minute(now_ms());
 
             if let Some(h) = app.history.as_ref() {
                 for g in app.registry.all() {
@@ -301,6 +306,15 @@ fn counter_delta(now: CounterSnapshot, previous: Option<CounterSnapshot>) -> Cou
         now.1.checked_sub(was.1).unwrap_or(now.1),
         now.2.checked_sub(was.2).unwrap_or(now.2),
     )
+}
+
+fn until_next_minute(now_ms: i64) -> std::time::Duration {
+    let elapsed = now_ms.rem_euclid(MINUTE_MS);
+    std::time::Duration::from_millis((MINUTE_MS - elapsed) as u64)
+}
+
+fn completed_minute(now_ms: i64) -> i64 {
+    now_ms.div_euclid(MINUTE_MS) * MINUTE_MS - MINUTE_MS
 }
 
 /// Bring back everything that was declared, at boot.
@@ -400,7 +414,7 @@ pub async fn reconcile(app: &api::Shared) {
 
 #[cfg(test)]
 mod tests {
-    use super::counter_delta;
+    use super::{completed_minute, counter_delta, until_next_minute};
 
     #[test]
     fn a_restarted_counter_counts_from_its_new_zero() {
@@ -413,5 +427,20 @@ mod tests {
             counter_delta((107, 83, 911), Some((100, 80, 900))),
             (7, 3, 11)
         );
+    }
+
+    #[test]
+    fn counter_flush_waits_for_the_next_wall_clock_boundary() {
+        assert_eq!(until_next_minute(120_000).as_millis(), 60_000);
+        assert_eq!(until_next_minute(120_001).as_millis(), 59_999);
+        assert_eq!(until_next_minute(179_999).as_millis(), 1);
+    }
+
+    #[test]
+    fn counter_flush_labels_the_minute_that_just_completed() {
+        assert_eq!(completed_minute(120_000), 60_000);
+        assert_eq!(completed_minute(120_001), 60_000);
+        assert_eq!(completed_minute(179_999), 60_000);
+        assert_eq!(completed_minute(180_000), 120_000);
     }
 }
