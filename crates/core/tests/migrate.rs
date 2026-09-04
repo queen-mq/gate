@@ -129,6 +129,24 @@ fn a_class_node_with_no_budget_gets_a_passthrough_and_a_warning() {
     assert!(rules(&m.warnings).contains(&"node-budget"));
 }
 
+/// A v1 selector deliberately lets non-matching operations pass. Preserve that
+/// behavior, but add the unconditional lever v2's node-wide breaker requires.
+#[test]
+fn a_node_with_only_conditional_budgets_gets_a_passthrough() {
+    let mut spec: v1::TargetSpec = serde_json::from_str(V1_TARGET).unwrap();
+    spec.budgets[0].matcher = Some(v1::Match {
+        op: vec!["photo.delete".into()],
+    });
+
+    let m = migrate::from_v1_target(&spec).unwrap();
+    let budgets = &m.doc.nodes["airbnb"].budgets;
+    assert_eq!(budgets.len(), 2);
+    assert_eq!(budgets[1].id.as_deref(), Some("passthrough"));
+    assert!(budgets[1].when_op.is_none());
+    assert!(gate_core::validate(&m.doc).is_empty());
+    assert!(rules(&m.warnings).contains(&"node-budget"));
+}
+
 #[test]
 fn every_dropped_v1_field_is_named_in_a_warning() {
     let spec: v1::GraphSpec = serde_json::from_str(V1_GRAPH).unwrap();

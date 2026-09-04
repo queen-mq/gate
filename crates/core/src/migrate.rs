@@ -227,9 +227,9 @@ fn budget(b: &v1::Budget, cost_max: i64, out: &mut Vec<Problem>, node: &str) -> 
 /// Two v1 shapes land here. A **class node** with an out-edge was allowed to
 /// declare no budget at all: it existed to isolate a traffic class and carry a
 /// priority, and the limit it was checked against lived downstream. And a node
-/// with only SCOPED budgets was legal too — v1's ETA read the worst key and its
-/// breach ring was per-replica, so neither needed a node-level denominator; v2's
-/// ETA and its breaker both do.
+/// with only SCOPED or CONDITIONAL budgets was legal too — v1's ETA read the
+/// worst key and its breach ring was per-replica, so neither needed a counter
+/// every item meets; v2's ETA and its breaker both do.
 ///
 /// Either way the mapping declares a pass-through — which limits nothing,
 /// exactly as before — and says so loudly, rather than inventing a ceiling
@@ -238,11 +238,12 @@ fn passthrough_budget(node: &str, out: &mut Vec<Problem>) -> Budget {
     out.push(w(
         "node-budget",
         format!(
-            "node `{node}` declared no budget on the node itself (v1 allowed that for a class \
-             node, and for a node carrying only per-key budgets). v2 requires one — it is what \
-             the ETA measures a rate against and what the breaker spends when a vendor says 429 \
-             — so a pass-through of 1000000 per second has been declared for it: it limits \
-             nothing, exactly as before. Replace it with the real limit."
+            "node `{node}` declared no unconditional budget on the node itself (v1 allowed that \
+             for a class node, and for a node carrying only per-key or conditional budgets). v2 \
+             requires one — it is what the ETA measures a rate against and what the breaker \
+             spends when a vendor says 429 — so a pass-through of 1000000 per second has been \
+             declared for it: it limits nothing, exactly as before. Replace it with the real \
+             limit."
         ),
     ));
     Budget {
@@ -392,7 +393,11 @@ pub fn from_v1_target(spec: &v1::TargetSpec) -> Result<Migrated, Refused> {
         // NOT mapped — see `lane_concurrency_warning`.
         concurrency: None,
     };
-    if node.budgets.iter().all(|b| b.scope_by.is_some()) {
+    if node
+        .budgets
+        .iter()
+        .all(|b| b.scope_by.is_some() || b.when_op.is_some())
+    {
         node.budgets.push(passthrough_budget(&node_name, &mut out));
     }
     lane_concurrency_warning(&lanes, &node_name, &mut out);
@@ -480,7 +485,11 @@ pub fn from_v1_graph(spec: &v1::GraphSpec) -> Result<Migrated, Refused> {
             // NOT mapped — see `lane_concurrency_warning`.
             concurrency: None,
         };
-        if node.budgets.iter().all(|b| b.scope_by.is_some()) {
+        if node
+            .budgets
+            .iter()
+            .all(|b| b.scope_by.is_some() || b.when_op.is_some())
+        {
             node.budgets.push(passthrough_budget(name, &mut out));
         }
         if node.egress.is_some() {

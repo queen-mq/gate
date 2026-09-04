@@ -103,8 +103,8 @@ pub struct Counters {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Node {
-    /// At least one, and at least one of them unscoped — see `node-budget` and
-    /// `node-unscoped-budget`.
+    /// At least one, and at least one of them unconditional and unscoped — see
+    /// `node-budget` and `node-unscoped-budget`.
     #[serde(default)]
     pub budgets: Vec<Budget>,
 
