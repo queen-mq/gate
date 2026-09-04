@@ -208,9 +208,12 @@ pub fn spawn_reconcile(
 /// It reads the stages' own `AtomicU64`s and writes the DELTA since the last
 /// pass, so two replicas writing the same minute is the normal case rather than
 /// a race: they saw different halves of the traffic and the row is the sum.
+type CounterSnapshot = (u64, u64, u64);
+type CounterCheckpoint = (String, CounterSnapshot);
+
 pub fn spawn_counters(app: api::Shared) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut last: HashMap<String, (u64, u64, u64)> = HashMap::new();
+        let mut last: HashMap<String, CounterSnapshot> = HashMap::new();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             let now = now_ms();
@@ -223,51 +226,81 @@ pub fn spawn_counters(app: api::Shared) -> tokio::task::JoinHandle<()> {
                     }
                     let mut per_target: HashMap<String, HashMap<String, history::Bucket>> =
                         HashMap::new();
+                    let mut checkpoints: HashMap<String, Vec<CounterCheckpoint>> = HashMap::new();
                     for s in &g.stages {
                         let key = format!("{}/{}", g.key(), s.key());
+                        let target = format!("{}.{}", g.doc.graph, s.stage.node);
                         let c = &s.counters;
                         let o = std::sync::atomic::Ordering::Relaxed;
                         let now3 = (
                             c.admitted.load(o),
-                            c.deferred.load(o) + c.released.load(o),
+                            c.deferred.load(o).saturating_add(c.released.load(o)),
                             c.cost.load(o),
                         );
-                        let was = last.insert(key, now3).unwrap_or((0, 0, 0));
-                        let d = (
-                            now3.0.saturating_sub(was.0),
-                            now3.1.saturating_sub(was.1),
-                            now3.2.saturating_sub(was.2),
-                        );
+                        let d = counter_delta(now3, last.get(&key).copied());
+                        checkpoints
+                            .entry(target.clone())
+                            .or_default()
+                            .push((key, now3));
                         if d == (0, 0, 0) {
                             continue;
                         }
-                        per_target
-                            .entry(format!("{}.{}", g.doc.graph, s.stage.node))
-                            .or_default()
-                            .insert(
-                                s.stage.path.clone(),
-                                history::Bucket {
-                                    admitted: d.0,
-                                    denied: d.1,
-                                    cost_estimated: d.2 as f64,
-                                    ..Default::default()
-                                },
-                            );
+                        per_target.entry(target).or_default().insert(
+                            s.stage.path.clone(),
+                            history::Bucket {
+                                admitted: d.0,
+                                denied: d.1,
+                                cost_estimated: d.2 as f64,
+                                ..Default::default()
+                            },
+                        );
                     }
-                    for (target, paths) in per_target {
-                        h.add(&g.doc.application, &target, minute, &paths).await;
+                    for (target, samples) in checkpoints {
+                        let written = match per_target.remove(&target) {
+                            Some(paths) => h.add(&g.doc.application, &target, minute, &paths).await,
+                            None => true,
+                        };
+                        if written {
+                            for (key, value) in samples {
+                                last.insert(key, value);
+                            }
+                        } else {
+                            tracing::warn!(
+                                application = %g.doc.application,
+                                %target,
+                                "could not persist counter rollup; retaining the previous checkpoint"
+                            );
+                        }
                     }
                 }
                 // The refusal ring, on the same cadence. Bounded and
                 // drop-oldest, so a flush that misses a pass loses the oldest
                 // denials and never blocks the hot path.
                 let traces = app.traces.drain();
-                if !traces.is_empty() {
-                    h.add_traces(&traces).await;
+                if !traces.is_empty() && !h.add_traces(&traces).await {
+                    tracing::warn!(
+                        count = traces.len(),
+                        "could not persist traces; returning them to the ring"
+                    );
+                    app.traces.restore(traces);
                 }
             }
         }
     })
+}
+
+/// Delta of a lifetime counter tuple. A lower value means the stage runtime was
+/// replaced and its atomics restarted at zero, so the new value is itself the
+/// entire increment since that reset.
+fn counter_delta(now: CounterSnapshot, previous: Option<CounterSnapshot>) -> CounterSnapshot {
+    let Some(was) = previous else {
+        return now;
+    };
+    (
+        now.0.checked_sub(was.0).unwrap_or(now.0),
+        now.1.checked_sub(was.1).unwrap_or(now.1),
+        now.2.checked_sub(was.2).unwrap_or(now.2),
+    )
 }
 
 /// Bring back everything that was declared, at boot.
@@ -362,5 +395,23 @@ pub async fn reconcile(app: &api::Shared) {
         if let Err(e) = graph::declare_from_store(app, doc).await {
             tracing::warn!(graph = %key, error = %e.message(), "reconcile: could not declare");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::counter_delta;
+
+    #[test]
+    fn a_restarted_counter_counts_from_its_new_zero() {
+        assert_eq!(counter_delta((7, 3, 11), Some((100, 80, 900))), (7, 3, 11));
+    }
+
+    #[test]
+    fn a_running_counter_reports_only_its_increment() {
+        assert_eq!(
+            counter_delta((107, 83, 911), Some((100, 80, 900))),
+            (7, 3, 11)
+        );
     }
 }
