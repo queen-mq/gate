@@ -221,7 +221,7 @@ function toneOf(u) {
                  would read as a limit of zero, which is the opposite of idle. -->
             <span class="ml-auto text-[12px] text-fg-3 tabular-nums hidden sm:inline">
               <template v-if="r.point.ceiling">
-                {{ rate((r.point.admitted ?? 0) / 60) }}/s of {{ rate(r.point.ceiling / 60) }}/s
+                {{ rate((r.point.cost ?? 0) / 60) }} cost/s of {{ rate(r.point.ceiling / 60) }} cost/s
               </template>
               <template v-else>idle</template>
             </span>

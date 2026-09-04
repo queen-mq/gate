@@ -61,6 +61,9 @@ watch([() => props.app, () => props.name, () => props.node, () => props.budget, 
 const node = computed(() => (target.value?.nodes ?? []).find((n) => n.node === props.node) ?? null)
 const spec = computed(() => (node.value?.budgets ?? []).find((b) => b.id === props.budget) ?? null)
 
+const historicalComparable = computed(
+  () => !spec.value?.scopeBy && !(spec.value?.whenOp?.length)
+)
 const points = computed(() => (spec.value ? budgetSeries(rows.value, spec.value) ?? [] : []))
 const peak = computed(() => points.value.reduce((a, w) => Math.max(a, w.utilisation ?? 0), 0))
 const totals = computed(() =>
@@ -221,6 +224,15 @@ const tone = computed(() => (peak.value > 1 ? 'text-bad' : peak.value >= 0.85 ? 
 
         <div v-else-if="rows === undefined" class="card px-6 py-12">
           <div class="skeleton h-[140px] w-full" />
+        </div>
+
+        <div v-else-if="!historicalComparable" class="card px-6 py-12 text-center">
+          <p class="text-[13.5px] text-fg-2">Historical utilisation is not attributable.</p>
+          <p class="text-[12.5px] text-fg-3 mt-1 max-w-[58ch] mx-auto leading-relaxed">
+            This budget selects a scope value or operation, while roll-ups aggregate the whole node.
+            The live gauge remains authoritative; drawing a percentage from unrelated admissions would
+            be misleading.
+          </p>
         </div>
 
         <div v-else-if="!points.length" class="card px-6 py-12 text-center">
