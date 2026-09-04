@@ -28,8 +28,9 @@ const targets = ref([])
 const error = ref('')
 
 async function load() {
+  const selectedOutcome = outcome.value
   const qs = new URLSearchParams({ limit: '200' })
-  if (outcome.value !== 'all') qs.set('outcome', outcome.value)
+  if (selectedOutcome !== 'all') qs.set('outcome', selectedOutcome)
   try {
     const [tr, ts] = await Promise.all([
       // A build with no trace log is not a broken console; it is a console
@@ -37,15 +38,20 @@ async function load() {
       api.get(`/api/traces?${qs.toString()}`).catch(() => null),
       api.get('/api/targets').catch(() => []),
     ])
+    if (selectedOutcome !== outcome.value) return
     raw.value = tr === null ? null : (Array.isArray(tr) ? tr : (tr?.traces ?? []))
     targets.value = ts ?? []
     error.value = ''
   } catch (e) {
+    if (selectedOutcome !== outcome.value) return
     error.value = e.message
   }
 }
-usePoll(load, 6000)
-watch(outcome, load)
+const refresh = usePoll(load, 6000)
+watch(outcome, () => {
+  raw.value = undefined
+  refresh()
+})
 
 /* The endpoint narrows by outcome and nothing else, so the target filter is
    applied here. It costs nothing at the sizes this log is capped to, and a
