@@ -370,7 +370,7 @@ pub async fn view(st: &Shared, rt: &Arc<GraphRuntime>) -> Value {
             "breaker": breaker.map(|b| json!({
                 "at": b.at,
                 "retryAfterSeconds": b.retry_after_seconds,
-                "until": b.at + b.retry_after_seconds * 1000,
+                "until": b.until_ms(),
                 "by": b.by,
             })),
         }));
