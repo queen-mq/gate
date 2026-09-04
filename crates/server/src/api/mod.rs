@@ -23,7 +23,7 @@ pub mod reenter;
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
@@ -137,6 +137,21 @@ pub fn public_router(app: Shared) -> Router {
         .with_state(app)
 }
 
+/// The body limit the four push routes carry, and only they.
+///
+/// A push is a BATCH: one request stands for as many items as the caller managed
+/// to group, and the honest bound on it is memory. Everything else on this
+/// surface takes a document — a graph declaration, a breaker poke, a console
+/// read — and keeps axum's 2 MiB, which no document has ever come near.
+///
+/// Applied per route rather than as one `.layer()` on the Router for exactly
+/// that reason: a limit on the whole surface would raise the ceiling on
+/// endpoints that have no batch to justify it, and this service holds every
+/// buffered body in a 512 MiB pod.
+fn push_body_limit() -> DefaultBodyLimit {
+    DefaultBodyLimit::max(crate::knobs::knobs().max_push_body)
+}
+
 fn routes() -> Router<Shared> {
     Router::new()
         // ---- graphs: the one document type.
@@ -154,11 +169,11 @@ fn routes() -> Router<Shared> {
         )
         .route(
             "/v1/apps/:app/graphs/:graph/nodes/:node/push",
-            post(data::graph_push),
+            post(data::graph_push).layer(push_body_limit()),
         )
         .route(
             "/v1/graphs/:graph/nodes/:node/push",
-            post(data::graph_push_default),
+            post(data::graph_push_default).layer(push_body_limit()),
         )
         .route(
             "/v1/apps/:app/graphs/:graph/nodes/:node/eta",
@@ -206,11 +221,11 @@ fn routes() -> Router<Shared> {
         )
         .route(
             "/v1/apps/:app/targets/:name/lanes/:lane/push",
-            post(data::target_push),
+            post(data::target_push).layer(push_body_limit()),
         )
         .route(
             "/v1/targets/:name/lanes/:lane/push",
-            post(data::target_push_default),
+            post(data::target_push_default).layer(push_body_limit()),
         )
         .route("/v1/apps/:app/targets/:name/eta", get(eta::target_eta))
         .route("/v1/targets/:name/eta", get(eta::target_eta_default))

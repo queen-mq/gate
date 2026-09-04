@@ -122,6 +122,30 @@ pub struct Knobs {
     /// (`004_log_pop.sql`), so an explicit failed ack is reserved for real
     /// poison and a retry budget means what it says.
     pub retry_limit: i32,
+    /// The largest body a PUSH route will buffer, in bytes.
+    ///
+    /// axum's own default is 2 MiB and nothing here ever overrode it, so that
+    /// number was the real ceiling on everything a caller can hand this service
+    /// — silently, because the refusal it produces says
+    /// `Failed to buffer the request body: length limit exceeded` and names
+    /// neither the limit nor the fact that it is ours.
+    ///
+    /// It was measured from prod on 2026-09-04, from both sides of the wall, by
+    /// a caller that had spent a week failing against it: pushes of 11,408 /
+    /// 10,387 / 8,976 records went through, and pushes of 12,000 and 16,096 did
+    /// not. Divide, and 2 MiB is exactly where those cross — the payloads run
+    /// about 130 to 175 bytes a record depending on the vendor.
+    ///
+    /// 8 MiB, and the ceiling on the ceiling is memory rather than taste: the
+    /// service runs with a 512 MiB limit, and a body limit is a per-request
+    /// buffer. Four times the old value keeps a large caller comfortably inside
+    /// it while a burst of ten concurrent pushes still costs under a sixth of
+    /// the pod.
+    ///
+    /// PUSH ROUTES ONLY. Declaring a graph or reading the console has no reason
+    /// to accept megabytes, and axum's default is the right answer everywhere
+    /// the body is a document rather than a batch.
+    pub max_push_body: usize,
 }
 
 impl Default for Knobs {
@@ -140,9 +164,15 @@ impl Default for Knobs {
             max_prefix_retries: 2,
             interior_seed_skew: crate::relay::INTERIOR_SEED_SKEW,
             retry_limit: 3,
+            max_push_body: 8 * 1024 * 1024,
         }
     }
 }
+
+/// axum's own `DefaultBodyLimit`, which applied to every route here until
+/// 2026-09-04 because nothing set one. Named so the floor below says why it is
+/// where it is.
+pub const AXUM_DEFAULT_BODY_LIMIT: usize = 2 * 1024 * 1024;
 
 fn env_u32(name: &str) -> Option<u32> {
     std::env::var(name).ok().and_then(|v| v.parse().ok())
@@ -182,6 +212,12 @@ pub fn knobs() -> &'static Knobs {
             retry_limit: env_u32("GATE_RETRY_LIMIT")
                 .map(|n| n as i32)
                 .unwrap_or(d.retry_limit),
+            // Floored at axum's own default rather than at zero: a typo in the
+            // environment must not be able to make this service refuse bodies it
+            // accepted before anybody set the variable.
+            max_push_body: env_u32("GATE_MAX_PUSH_BODY_BYTES")
+                .map(|n| (n as usize).max(AXUM_DEFAULT_BODY_LIMIT))
+                .unwrap_or(d.max_push_body),
         }
     })
 }
