@@ -8,6 +8,7 @@
 use serde_json::Value;
 
 use crate::doc::{Cost, PAYLOAD_ROOT};
+use crate::plan::CompiledBudget;
 
 /// Walk a dotted payload path. The first segment must be `payload`, which names
 /// the message's own `data`; `payload.a.b` is `data["a"]["b"]`.
@@ -52,6 +53,32 @@ pub fn scope_value(data: &Value, path: &str) -> Option<String> {
         Value::Bool(b) => Some(b.to_string()),
         _ => None,
     }
+}
+
+/// The first applicable scoped budget whose key cannot be resolved.
+///
+/// Applicability comes first: a `photo.delete` per-listing budget has no reason
+/// to require `listingId` from a `photo.upload`. Both the HTTP door and the
+/// relay use this one answer so direct queue ingress cannot enforce a different
+/// contract from HTTP ingress.
+pub fn missing_scope<'a>(
+    budgets: &'a [CompiledBudget],
+    data: &Value,
+) -> Option<(&'a str, &'a str)> {
+    let op = op_of(data);
+    budgets.iter().find_map(|budget| {
+        if budget
+            .when_op
+            .as_ref()
+            .is_some_and(|patterns| !op_matches(patterns, op))
+        {
+            return None;
+        }
+        let path = budget.scope_by.as_deref()?;
+        scope_value(data, path)
+            .is_none()
+            .then_some((budget.id.as_str(), path))
+    })
 }
 
 /// What this item costs, or the reason it can never be admitted.

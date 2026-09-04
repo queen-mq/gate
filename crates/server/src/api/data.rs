@@ -223,19 +223,17 @@ async fn push_into(
     // because a lease that expires charges no retry budget.
     let cost = gate_core::cost_of(&np.cost, &item)
         .map_err(|e| Fail(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
-    // And a counter keyed on an absent value measures the wrong thing.
-    for b in np.budgets.iter().filter(|b| b.is_scoped()) {
-        let path = b.scope_by.as_deref().unwrap_or_default();
-        if gate_core::scope_value(&item, path).is_none() {
-            return Err(Fail(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                format!(
-                    "budget `{}` of node `{node}` counts per `{path}` and this push carries none: \
-                     a counter keyed on an absent value measures the wrong thing.",
-                    b.id
-                ),
-            ));
-        }
+    // And a counter keyed on an absent value measures the wrong thing. Only an
+    // applicable budget requires its scope: a `whenOp` that does not match this
+    // item charges nothing and needs no key.
+    if let Some((budget, path)) = gate_core::missing_scope(&np.budgets, &item) {
+        return Err(Fail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "budget `{budget}` of node `{node}` counts per `{path}` and this push carries none: \
+                 a counter keyed on an absent value measures the wrong thing."
+            ),
+        ));
     }
 
     // ---- shed load, if and only if the declaration asked for it.
