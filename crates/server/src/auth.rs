@@ -327,6 +327,24 @@ fn nonce(secret: &[u8]) -> String {
     format!("{h:016x}{:x}", t)
 }
 
+/// A post-login destination is always local to this console. The state is
+/// signed against tampering, but the caller chooses the value before it is
+/// signed, so signature verification alone does not prevent an open redirect.
+fn safe_next(candidate: Option<&str>) -> String {
+    let Some(path) = candidate else {
+        return "/".into();
+    };
+    if path.starts_with('/')
+        && !path.starts_with("//")
+        && !path.contains('\\')
+        && !path.chars().any(char::is_control)
+    {
+        path.to_string()
+    } else {
+        "/".into()
+    }
+}
+
 pub async fn login(
     State(app): State<crate::api::Shared>,
     Query(q): Query<HashMap<String, String>>,
@@ -337,7 +355,7 @@ pub async fn login(
     let n = nonce(&auth.cfg.secret);
     let state = match auth.sign(&StateClaims {
         nonce: n.clone(),
-        next: q.get("next").cloned().unwrap_or_else(|| "/".into()),
+        next: safe_next(q.get("next").map(String::as_str)),
         exp: now() + STATE_TTL_S,
     }) {
         Ok(s) => s,
@@ -448,6 +466,9 @@ pub async fn callback(
     };
 
     let secure = auth.cfg.public_url.starts_with("https://");
+    // Validate again after state verification so a state minted by an older
+    // version cannot retain an unsafe destination through a rolling deploy.
+    let next = safe_next(Some(&st.next));
     let cookie = format!(
         "{COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}{}",
         8 * 3600,
@@ -455,7 +476,7 @@ pub async fn callback(
     );
     (
         StatusCode::SEE_OTHER,
-        [(header::SET_COOKIE, cookie), (header::LOCATION, st.next)],
+        [(header::SET_COOKIE, cookie), (header::LOCATION, next)],
     )
         .into_response()
 }
@@ -606,4 +627,27 @@ fn urlencode(s: &str) -> String {
             _ => format!("%{b:02X}"),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_next;
+
+    #[test]
+    fn oauth_next_accepts_only_local_absolute_paths() {
+        for path in ["/", "/graphs", "/#/apps/a/graphs/g?path=main"] {
+            assert_eq!(safe_next(Some(path)), path);
+        }
+        for path in [
+            "https://evil.example",
+            "//evil.example/path",
+            "/\\evil.example/path",
+            "graphs",
+            "",
+            "/graphs\r\nLocation: https://evil.example",
+        ] {
+            assert_eq!(safe_next(Some(path)), "/", "accepted {path:?}");
+        }
+        assert_eq!(safe_next(None), "/");
+    }
 }
