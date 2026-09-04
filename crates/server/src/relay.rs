@@ -818,7 +818,13 @@ fn group(st: &StageRuntime, msgs: &[Message]) -> Grouped {
                     keys.len() - 1
                 }
             };
-            here.push((idx, cost));
+            // A physical counter is charged once per message. Two budgets may
+            // legally name the same `sharedKey` when their parameters agree;
+            // overlapping `whenOp` selectors must not turn that one counter
+            // into two charges for the same item.
+            if !here.iter().any(|(seen, _)| *seen == idx) {
+                here.push((idx, cost));
+            }
         }
         per_msg.push(here);
     }
@@ -1489,6 +1495,31 @@ mod tests {
         let del = charges.iter().find(|c| c.budget_id == "del").unwrap();
         assert_eq!(all.delta, 2);
         assert_eq!(del.delta, 1);
+    }
+
+    /// Two selectors may intentionally share one counter. If they overlap,
+    /// the item still represents one unit of work on that physical counter.
+    #[test]
+    fn overlapping_selectors_charge_a_shared_key_once_per_message() {
+        let mut broad = budget("broad", 100);
+        broad.key = "b:app:shared:photos".into();
+        broad.shared_key = Some("photos".into());
+        broad.when_op = Some(vec!["photo.*".into()]);
+
+        let mut exact = budget("exact", 100);
+        exact.key = broad.key.clone();
+        exact.shared_key = broad.shared_key.clone();
+        exact.when_op = Some(vec!["photo.delete".into()]);
+
+        let st = runtime(vec![broad, exact], 1.0);
+        let msgs = vec![
+            msg("t0", json!({ "op": "photo.delete" })),
+            msg("t1", json!({ "op": "photo.upload" })),
+        ];
+        let charges = group(&st, &msgs).charges(2);
+
+        assert_eq!(charges.len(), 1);
+        assert_eq!(charges[0].delta, 2, "one charge per item, not per selector");
     }
 
     /// A scoped budget is one counter per value, and two values in one batch are
