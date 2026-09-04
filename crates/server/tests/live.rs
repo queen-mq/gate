@@ -2144,6 +2144,53 @@ async fn one_owner_per_ingress_queue() {
     h.cleanup("second").await;
 }
 
+/// A sync that rejects one document is not a complete inventory and may not
+/// delete an omitted target.
+///
+/// Returning `ok: false` after removing valid configuration is a destructive
+/// partial success: a typo in one replacement document would turn into an
+/// outage in an unrelated target before the caller could correct and retry it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn a_partially_refused_sync_reaps_nothing() {
+    let Some(h) = harness("sync-refusal").await else {
+        return;
+    };
+    let out = egress_of("sync-refusal", &h.application);
+    let (status, body) = h.put_graph("keep", one_node(&out, wide("b"))).await;
+    assert_eq!(status, 200, "initial declare: {body}");
+
+    let (status, result) = h
+        .send(
+            reqwest::Method::PUT,
+            &format!("/v1/apps/{}/targets", h.application),
+            Some(json!([{
+                "application": h.application,
+                "graph": "broken",
+                "version": 1,
+                "nodes": {},
+                "paths": []
+            }])),
+        )
+        .await;
+    assert_eq!(status, 200, "sync response: {result}");
+    assert_eq!(result["ok"], json!(false), "the invalid graph must fail");
+    assert_eq!(
+        result["removed"],
+        json!([]),
+        "a partial sync may reap nothing"
+    );
+
+    let (status, view) = h.get_graph("keep").await;
+    assert_eq!(
+        status, 200,
+        "the omitted valid target was deleted by a refused sync: {view}"
+    );
+    assert!(view["running"].as_bool().unwrap_or(false), "{view}");
+
+    h.cleanup("keep").await;
+}
+
 /// The routes that are gone say where to go instead.
 ///
 /// A 404 would read as "wrong URL" and send somebody hunting; a 410 with the
