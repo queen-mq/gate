@@ -1146,6 +1146,7 @@ Rule names are asserted on in tests, so they are API.
 |---|---|---|
 | `node-budget` | a node declares no budgets | `` node `{n}` declares no budget, so it limits nothing — it would admit everything straight through, which is a queue with extra steps. `` |
 | `node-unscoped-budget` | every budget of a node has `scopeBy` | `` node `{n}` has only per-key budgets. It needs at least one budget on the node itself: it is what the ETA measures a rate against and what the breaker spends when a vendor says 429. `` |
+| `breaker-width` | a node compiles to more than 255 distinct unscoped counter keys | `` node `{n}` compiles to {k} distinct node-wide counters. A breaker must spend them and write its audit record atomically, but the broker accepts at most 256 operations in one call. Keep at most 255 distinct unscoped counters; budgets with the same sharedKey count once. `` |
 | `budget-count` | `count < 1` | `` budget `{b}` of node `{n}` has count {c}. A budget that cannot admit anything never will — no schedule refills it. `` |
 | `budget-window` | `timeMs < 100` | `` budget `{b}` of node `{n}` declares timeMs {t}. The floor is 100. `` |
 | `budget-window-floor` | `timeMs < 1000` | **WARNING, not a refusal** — see `window-sub-second` below. |
