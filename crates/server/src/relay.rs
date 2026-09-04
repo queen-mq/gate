@@ -721,18 +721,35 @@ impl Grouped {
     /// touches is dropped rather than charged zero.
     fn charges(&self, n: usize) -> Vec<Charge> {
         let mut deltas = vec![0i64; self.keys.len()];
+        let mut overflowed = vec![false; self.keys.len()];
         for contributions in self.per_msg.iter().take(n) {
             for (idx, cost) in contributions {
-                deltas[*idx] += cost;
+                match deltas[*idx].checked_add(*cost) {
+                    Some(total) => deltas[*idx] = total,
+                    None => {
+                        // The wire cannot express this batch's total. Ask for a
+                        // deliberately impossible increment so the ordinary
+                        // refusal path computes the largest representable
+                        // prefix instead of wrapping the delta and admitting it.
+                        deltas[*idx] = i64::MAX;
+                        overflowed[*idx] = true;
+                    }
+                }
             }
         }
         self.keys
             .iter()
-            .zip(deltas.iter())
-            .filter(|(_, d)| **d > 0)
-            .map(|(k, d)| Charge {
+            .zip(deltas.iter().zip(overflowed.iter()))
+            .filter(|(_, (d, _))| **d > 0)
+            .map(|(k, (d, overflowed))| Charge {
                 key: k.key.clone(),
-                max: k.max,
+                // With the largest legal ceiling, delta == max would otherwise
+                // apply even though the true (unrepresentable) sum is larger.
+                max: if *overflowed {
+                    k.max.min(i64::MAX - 1)
+                } else {
+                    k.max
+                },
                 ttl: k.ttl,
                 delta: *d,
                 budget_id: k.budget_id.clone(),
@@ -761,18 +778,19 @@ impl Grouped {
                 .map(|s| s.value)
                 .unwrap_or(0)
                 .saturating_sub(mine);
-            remaining[i] = (key.max - current).max(0);
+            remaining[i] = key.max.saturating_sub(current).max(0);
         }
 
         let mut used = vec![0i64; self.keys.len()];
         for (n, contributions) in self.per_msg.iter().enumerate() {
             for (idx, cost) in contributions {
-                if used[*idx] + cost > remaining[*idx] {
+                let Some(total) = used[*idx].checked_add(*cost) else {
+                    return n;
+                };
+                if total > remaining[*idx] {
                     return n;
                 }
-            }
-            for (idx, cost) in contributions {
-                used[*idx] += cost;
+                used[*idx] = total;
             }
         }
         self.per_msg.len()
@@ -1085,7 +1103,7 @@ async fn stage_and_commit(
             continue;
         }
         forwarded += 1;
-        cost += cost_of(&st.node.cost, &m.data).unwrap_or(1);
+        cost = cost.saturating_add(cost_of(&st.node.cost, &m.data).unwrap_or(1));
         for dest in &st.stage.destinations {
             match tx.push_item(push_for(st, m, dest)) {
                 Ok(next) => tx = next,
@@ -1106,9 +1124,13 @@ async fn stage_and_commit(
             st.counters.admitted.fetch_add(forwarded, Ordering::Relaxed);
             st.counters.foreign.fetch_add(foreign, Ordering::Relaxed);
             st.counters.commits.fetch_add(1, Ordering::Relaxed);
-            st.counters
+            let delta = cost.max(0) as u64;
+            let _ = st
+                .counters
                 .cost
-                .fetch_add(cost.max(0) as u64, Ordering::Relaxed);
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    Some(value.saturating_add(delta))
+                });
             // The cursor moved, so whatever was being counted at the old head is
             // over. The head comparison in `note_failed_settle` would notice on
             // its own; this keeps the count honest without waiting for a second
@@ -1416,6 +1438,42 @@ mod tests {
         let charges = group(&st, &msgs).charges(msgs.len());
         assert_eq!(charges.len(), 1, "one shared key must produce one incr");
         assert_eq!(charges[0].delta, 12, "the declarations doubled the cost");
+    }
+
+    /// `kv.incr` carries an i64 delta. A valid variable-cost declaration can
+    /// still put two individually legal values in one batch whose sum is above
+    /// that wire ceiling; it must take the refusal/prefix path, never wrap to a
+    /// small or negative charge.
+    #[test]
+    fn an_unrepresentable_batch_cost_fails_closed_to_a_prefix() {
+        let mut st = runtime(vec![budget("b", i64::MAX)], 1.0);
+        st.node.cost = gate_core::Cost::Path(gate_core::CostPath {
+            path: "payload.w".into(),
+            default: 1,
+            max: Some(i64::MAX),
+        });
+        let item_cost = i64::MAX / 2 + 1;
+        let msgs = vec![
+            msg("t0", json!({ "w": item_cost })),
+            msg("t1", json!({ "w": item_cost })),
+        ];
+        let grouped = group(&st, &msgs);
+        let charges = grouped.charges(2);
+
+        assert_eq!(charges[0].delta, i64::MAX);
+        assert_eq!(charges[0].max, i64::MAX - 1, "the overflow must refuse");
+
+        let attempt = crate::budget::Attempt {
+            applied: vec![false],
+            post: vec![None],
+            states: vec![crate::budget::State {
+                key: charges[0].key.clone(),
+                value: 0,
+                expires_at_ms: None,
+            }],
+        };
+        assert_eq!(grouped.prefix(&charges, &attempt), 1);
+        assert_eq!(grouped.charges(1)[0].delta, item_cost);
     }
 
     /// A path's share IS the ceiling it carries: `round(count_sub * share)`.
