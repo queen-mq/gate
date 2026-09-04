@@ -85,6 +85,13 @@ pub async fn graph_reenter_default(
 async fn reenter(st: &Shared, rt: &std::sync::Arc<GraphRuntime>, body: ReenterBody) -> ApiResult {
     refuse_if_stopped(rt)?;
 
+    validate_parent_txn(&body.txn).map_err(|why| {
+        Fail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("cannot re-enter an item: {why}"),
+        )
+    })?;
+
     let mut item = object_payload(body.payload.clone())?;
     let stamp = item.get(GATE_META);
     let path = body
@@ -144,11 +151,12 @@ async fn reenter(st: &Shared, rt: &std::sync::Arc<GraphRuntime>, body: ReenterBo
         ));
     };
 
-    let was = stamp
-        .and_then(|g| g.get("attempt"))
-        .and_then(|a| a.as_u64())
-        .unwrap_or(0) as u32;
-    let attempt = body.attempt.unwrap_or(was + 1);
+    let attempt = reentry_attempt(stamp, body.attempt).map_err(|why| {
+        Fail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("cannot re-enter an item in `{}`: {why}", rt.key()),
+        )
+    })?;
     let max = rt.plan.max_attempts;
     if attempt > max {
         return Err(Fail(
@@ -212,4 +220,72 @@ async fn reenter(st: &Shared, rt: &std::sync::Arc<GraphRuntime>, body: ReenterBo
         "transactionId": txn,
         "pushed": pushed.len(),
     }))
+}
+
+fn validate_parent_txn(txn: &str) -> Result<(), &'static str> {
+    if txn.trim().is_empty() {
+        return Err("`txn` must not be empty; it is the identity used to deduplicate reports");
+    }
+    Ok(())
+}
+
+/// Pick a strictly later attempt without truncating an untrusted JSON number.
+/// A caller may skip forward, but it may never reset the attempt carried by the
+/// item: doing so would turn a bounded re-entry into a livelock.
+fn reentry_attempt(stamp: Option<&Value>, requested: Option<u32>) -> Result<u32, String> {
+    let was = match stamp.and_then(|g| g.get("attempt")) {
+        None => 0,
+        Some(raw) => {
+            let n = raw.as_u64().ok_or_else(|| {
+                "`_gate.attempt` must be a non-negative integer when it is present".to_string()
+            })?;
+            u32::try_from(n)
+                .map_err(|_| format!("`_gate.attempt` of {n} is too large to be a valid attempt"))?
+        }
+    };
+
+    let attempt = match requested {
+        Some(n) => n,
+        None => was
+            .checked_add(1)
+            .ok_or_else(|| format!("`_gate.attempt` of {was} cannot be incremented any further"))?,
+    };
+    if attempt <= was {
+        return Err(format!(
+            "attempt {attempt} does not advance the payload's existing attempt {was}"
+        ));
+    }
+    Ok(attempt)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{reentry_attempt, validate_parent_txn};
+    use serde_json::json;
+
+    #[test]
+    fn a_reentry_attempt_must_move_forward() {
+        let stamp = json!({ "attempt": 2 });
+        assert_eq!(reentry_attempt(Some(&stamp), None), Ok(3));
+        assert_eq!(reentry_attempt(Some(&stamp), Some(4)), Ok(4));
+        assert!(reentry_attempt(Some(&stamp), Some(2)).is_err());
+        assert!(reentry_attempt(Some(&stamp), Some(0)).is_err());
+    }
+
+    #[test]
+    fn an_untrusted_attempt_neither_truncates_nor_overflows() {
+        let too_large = json!({ "attempt": u64::from(u32::MAX) + 1 });
+        let at_limit = json!({ "attempt": u32::MAX });
+        let malformed = json!({ "attempt": "many" });
+        assert!(reentry_attempt(Some(&too_large), None).is_err());
+        assert!(reentry_attempt(Some(&at_limit), None).is_err());
+        assert!(reentry_attempt(Some(&malformed), None).is_err());
+    }
+
+    #[test]
+    fn a_reentry_needs_a_real_parent_transaction() {
+        assert!(validate_parent_txn("").is_err());
+        assert!(validate_parent_txn("  \n").is_err());
+        assert!(validate_parent_txn("parent-42").is_ok());
+    }
 }
