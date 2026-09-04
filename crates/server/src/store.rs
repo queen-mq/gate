@@ -61,21 +61,53 @@ pub async fn save(queen: &Queen, doc: &GraphDoc) -> Result<()> {
 }
 
 pub async fn forget(queen: &Queen, app: &str, name: &str) -> Result<()> {
+    // Remove legacy target rows first. A v1 graph-node target named
+    // `airbnb.ip` migrates to the one-node graph `ip`; deleting only
+    // `spec:{app}:ip` leaves `spec:{app}:airbnb.ip` behind and the next boot
+    // restores the graph that the caller just deleted.
+    queen
+        .kv()
+        .delete(&ns(), &v1_target_key(app, name))
+        .send()
+        .await?;
+    forget_dotted_v1_targets(queen, app, name).await?;
+
     queen
         .kv()
         .delete(&ns(), &graph_key(app, name))
         .send()
         .await?;
-    // A graph that came across from a v1 standalone target keeps its old row
-    // until it is deleted too, or the next boot restores it and the delete looks
-    // like it did not take.
-    queen
-        .kv()
-        .delete(&ns(), &v1_target_key(app, name))
-        .send()
-        .await
-        .ok();
     Ok(())
+}
+
+async fn forget_dotted_v1_targets(queen: &Queen, app: &str, graph: &str) -> Result<()> {
+    let prefix = format!("{V1_TARGET_PREFIX}{app}:");
+    let found = queen
+        .kv()
+        .get_prefix(&ns(), &prefix)
+        .limit(1000)
+        .send()
+        .await?;
+    if found.truncated() {
+        return Err(queen_mq::Error::Invalid(format!(
+            "cannot safely delete `{app}/{graph}`: more than 1000 legacy target rows share this application"
+        )));
+    }
+
+    for row in found.rows.unwrap_or_default() {
+        let belongs = row
+            .value
+            .and_then(|value| serde_json::from_value::<v1::TargetSpec>(value).ok())
+            .is_some_and(|old| legacy_graph_name(&old.name) == graph);
+        if belongs {
+            queen.kv().delete(&ns(), &row.key).send().await?;
+        }
+    }
+    Ok(())
+}
+
+fn legacy_graph_name(target: &str) -> &str {
+    target.rsplit('.').next().unwrap_or(target)
 }
 
 /// What a prefix read found, and whether it found everything.
@@ -205,4 +237,15 @@ pub async fn try_load_all(queen: &Queen) -> Result<Stored> {
         complete: !truncated && unreadable == 0,
         migrated,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::legacy_graph_name;
+
+    #[test]
+    fn a_dotted_v1_target_maps_to_its_leaf_graph() {
+        assert_eq!(legacy_graph_name("airbnb.ip"), "ip");
+        assert_eq!(legacy_graph_name("standalone"), "standalone");
+    }
 }
