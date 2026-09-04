@@ -336,13 +336,14 @@ fn budgets(doc: &GraphDoc, plan: &Plan, out: &mut Vec<Problem>) {
             ));
             continue;
         }
-        if np.unscoped().next().is_none() {
+        if !np.unscoped().any(|b| b.when_op.is_none()) {
             out.push(p(
                 "node-unscoped-budget",
                 format!(
-                    "node `{name}` has only per-key budgets. It needs at least one budget on the \
-                     node itself: it is what the ETA measures a rate against and what the breaker \
-                     spends when a vendor says 429."
+                    "node `{name}` has no unconditional budget on the node itself. It needs at \
+                     least one budget without scopeBy or whenOp: every item must meet that \
+                     counter, so the ETA has a node-wide rate and the breaker can stop every \
+                     operation when a vendor says 429."
                 ),
             ));
         }

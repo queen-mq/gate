@@ -112,7 +112,7 @@ be unreadable by an older one, because that is what makes the store's `complete:
 
   "nodes": {
     "<node>": {
-      "budgets": [ <Budget>, ... ],   // >= 1, and >= 1 of them unscoped
+      "budgets": [ <Budget>, ... ],   // >= 1; >= 1 unconditional and unscoped
       "cost":    <Cost>,              // default: 1
       "ingress": <Ingress>,           // optional; absent = fed only by paths
       "egress":  <Egress>             // optional; required on a terminal node
@@ -1145,7 +1145,7 @@ Rule names are asserted on in tests, so they are API.
 | rule | when | detail |
 |---|---|---|
 | `node-budget` | a node declares no budgets | `` node `{n}` declares no budget, so it limits nothing — it would admit everything straight through, which is a queue with extra steps. `` |
-| `node-unscoped-budget` | every budget of a node has `scopeBy` | `` node `{n}` has only per-key budgets. It needs at least one budget on the node itself: it is what the ETA measures a rate against and what the breaker spends when a vendor says 429. `` |
+| `node-unscoped-budget` | every budget of a node has `scopeBy` or `whenOp` | `` node `{n}` has no unconditional budget on the node itself. It needs at least one budget without scopeBy or whenOp: every item must meet that counter, so the ETA has a node-wide rate and the breaker can stop every operation when a vendor says 429. `` |
 | `budget-count` | `count < 1` | `` budget `{b}` of node `{n}` has count {c}. A budget that cannot admit anything never will — no schedule refills it. `` |
 | `budget-window` | `timeMs < 100` | `` budget `{b}` of node `{n}` declares timeMs {t}. The floor is 100. `` |
 | `budget-window-floor` | `timeMs < 1000` | **WARNING, not a refusal** — see `window-sub-second` below. |

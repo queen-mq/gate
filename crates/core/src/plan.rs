@@ -1020,9 +1020,9 @@ impl Plan {
 impl NodePlan {
     /// The budgets that live on the node itself, rather than one per key.
     ///
-    /// The ETA measures a rate against these and the breaker spends them, which
-    /// is why `node-unscoped-budget` requires at least one: a node with only
-    /// per-key budgets has no lever and no denominator.
+    /// The breaker spends these. ETA and other node-wide calculations must
+    /// additionally exclude budgets with `whenOp`: a conditional counter is
+    /// not a rate every item meets.
     pub fn unscoped(&self) -> impl Iterator<Item = &CompiledBudget> {
         self.budgets.iter().filter(|b| !b.is_scoped())
     }
