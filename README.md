@@ -183,7 +183,10 @@ reaches it — and `GATE_PUBLIC_BIND` requires a Google session on every route. 
 the local sign-in bypass and Gate refuses to boot with it set on an `https` public URL;
 `GATE_ADMIN_EMAILS` is what makes that identity able to write rather than only read.
 
+Building from source requires Node.js 24 for the embedded console; the root `.nvmrc` selects it.
+
 ```bash
+nvm use                                     # Node.js 24, from the root .nvmrc
 cd ui && npm ci && npm run build && cd ..   # the console is compiled into the binary
 cargo build --release --workspace
 cargo test --workspace                      # the live suite reports as ignored
