@@ -2249,6 +2249,8 @@ async fn the_console_can_draw_what_is_running() {
     let out = egress_of("console", &h.application);
     let mut doc = chain_doc();
     doc["nodes"]["ip"]["egress"] = json!(out);
+    doc["nodes"]["ip"]["budgets"][0]["source"] = json!("vendor limits page");
+    doc["nodes"]["ip"]["budgets"][0]["asOf"] = json!("2026-08-20");
     let (status, body) = h.put_graph("g", doc).await;
     assert_eq!(status, 200, "declare: {body}");
 
@@ -2263,6 +2265,15 @@ async fn the_console_can_draw_what_is_running() {
     assert_eq!(topo["edges"][0]["from"], "messages");
     assert_eq!(topo["edges"][0]["to"], "ip");
     assert_eq!(topo["paths"][0]["name"], "main");
+
+    let (status, detail) = h.get_graph("g").await;
+    assert_eq!(status, 200, "{detail}");
+    let budget = &detail["nodes"]
+        .as_array()
+        .and_then(|nodes| nodes.iter().find(|n| n["node"] == "ip"))
+        .expect("ip node missing")["budgets"][0];
+    assert_eq!(budget["source"], "vendor limits page", "{detail}");
+    assert_eq!(budget["asOf"], "2026-08-20", "{detail}");
 
     let (status, graphs) = h.send(reqwest::Method::GET, "/api/graphs", None).await;
     assert_eq!(status, 200, "{graphs}");

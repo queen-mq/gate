@@ -328,9 +328,9 @@ const tone = computed(() => (peak.value > 1 ? 'text-bad' : peak.value >= 0.85 ? 
           <p :class="spec.confidence === 'documented' ? 'text-fg-2' : 'text-warn'">
             {{ spec.confidence }}<template v-if="spec.source"> — {{ spec.source }}</template>
           </p>
-          <p v-if="spec.as_of" class="text-fg-3 text-[12.5px]">as of {{ spec.as_of }}</p>
-          <p v-if="spec.scope?.length" class="text-fg-3 text-[12.5px]">
-            counted per {{ spec.scope.join(' + ') }}
+          <p v-if="spec.asOf" class="text-fg-3 text-[12.5px]">as of {{ spec.asOf }}</p>
+          <p v-if="spec.scopeBy" class="text-fg-3 text-[12.5px]">
+            counted per {{ spec.scopeBy }}
           </p>
         </div>
       </section>
