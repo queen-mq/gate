@@ -183,11 +183,54 @@ impl Traces {
             .collect()
     }
 
+    /// Put a failed durable flush back before anything recorded while the write
+    /// was in flight. The ring remains bounded and drops its oldest entries.
+    pub fn restore(&self, rows: Vec<Trace>) {
+        let mut ring = self.ring.write();
+        for row in rows.into_iter().rev() {
+            ring.push_front(row);
+        }
+        while ring.len() > TRACE_RING {
+            ring.pop_front();
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.ring.read().len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn trace(at: i64) -> Trace {
+        Trace {
+            at,
+            application: "a".into(),
+            graph: "g".into(),
+            node: "n".into(),
+            path: "p".into(),
+            op: String::new(),
+            outcome: "denied",
+            budget_id: Some("b".into()),
+        }
+    }
+
+    #[test]
+    fn a_failed_trace_flush_returns_before_newer_rows() {
+        let traces = Traces::default();
+        traces.push(trace(1));
+        traces.push(trace(2));
+        let failed = traces.drain();
+        traces.push(trace(3));
+
+        traces.restore(failed);
+        let recent: Vec<i64> = traces.recent(None, 3).iter().map(|t| t.at).collect();
+        assert_eq!(recent, vec![3, 2, 1]);
     }
 }
