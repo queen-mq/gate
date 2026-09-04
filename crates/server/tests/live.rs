@@ -2483,6 +2483,60 @@ async fn a_declare_that_cannot_be_stored_is_not_acknowledged() {
     h.cleanup("g").await;
 }
 
+/// An ambiguous store write cannot make a later delete resurrect the graph.
+///
+/// A broker can commit a PUT and lose only its response. The caller correctly
+/// gets an error in that case, but the local runtime cannot know that the
+/// document is already durable and keeps its `persisted` marker false. A
+/// reconcile that observes the exact document is the missing proof: if it does
+/// not repair the marker, a subsequent delete from another replica is read as
+/// "my first save never landed" and the deleted graph is written back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn reconcile_confirms_an_ambiguous_save_before_honouring_a_remote_delete() {
+    let Some(h) = harness("persisted-proof").await else {
+        return;
+    };
+    let out = egress_of("persisted-proof", &h.application);
+    let (status, body) = h.put_graph("g", one_node(&out, wide("b"))).await;
+    assert_eq!(status, 200, "declare: {body}");
+
+    // Model the only unknowable part of a lost response: the store has the
+    // exact document, while this replica believes its PUT failed.
+    let rt = h.app.registry.get(&h.application, "g").expect("serving");
+    rt.persisted
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+
+    gate_server::reconcile(&h.app).await;
+    let rt = h.app.registry.get(&h.application, "g").expect("serving");
+    assert!(
+        rt.persisted.load(std::sync::atomic::Ordering::Relaxed),
+        "observing the exact stored document must confirm persistence"
+    );
+
+    // A different replica deletes the durable document. This replica must now
+    // honour the deletion; with the stale marker it would save the graph again.
+    gate_server::store::forget(&h.queen, &h.application, "g")
+        .await
+        .expect("remote delete");
+    gate_server::reconcile(&h.app).await;
+    assert!(
+        h.app.registry.get(&h.application, "g").is_none(),
+        "the deleted graph was resurrected"
+    );
+
+    let stored = gate_server::store::try_load_all(&h.queen)
+        .await
+        .expect("read store");
+    assert!(
+        stored
+            .items
+            .iter()
+            .all(|doc| { doc.application != h.application || doc.graph != "g" }),
+        "the reconcile pass wrote the remotely deleted document back"
+    );
+}
+
 /// A declare that cannot be RESTORED leaves nothing registered.
 ///
 /// The other half of the provisioning contract, and the failure the whole
