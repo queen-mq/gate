@@ -67,7 +67,7 @@ pub fn admits(
     now_ms: i64,
 ) -> Schedule {
     let window_seconds = window_seconds.max(1);
-    let resets_at = now_ms + resets_in_ms.max(0);
+    let resets_at = now_ms.saturating_add(resets_in_ms.max(0));
 
     // A cap that cannot admit anything never will — no schedule refills it — so
     // "we cannot say" is the only answer that is not a lie.
@@ -89,8 +89,11 @@ pub fn admits(
     // capful after the first. This is what makes "nothing until it rotates, then
     // 150 per second" expressible at all.
     let windows_after_this = ((need / cap as f64).ceil() as i64 - 1).max(0);
+    // Multiply after widening to f64. Both operands are valid i64 values, but
+    // a very deep backlog can span enough windows for their integer product to
+    // overflow before it ever reaches this display-only estimate.
     let seconds =
-        resets_in_ms.max(0) as f64 / 1000.0 + (windows_after_this * window_seconds) as f64;
+        resets_in_ms.max(0) as f64 / 1000.0 + windows_after_this as f64 * window_seconds as f64;
     Schedule {
         seconds: Some(seconds),
         resets_at,
@@ -159,7 +162,7 @@ pub async fn view(app: &Shared, rt: &Arc<GraphRuntime>, node: &str, path: &str) 
             b.window_sub_seconds,
             s.map(|s| s.value).unwrap_or(0),
             s.and_then(|s| s.expires_at_ms)
-                .map(|e| e - now)
+                .map(|e| e.saturating_sub(now))
                 .unwrap_or(0),
             want,
             now,
@@ -286,7 +289,7 @@ fn assumes(
     if let Some(r) = held {
         parts.push(format!(
             "a breaker is holding this node until {} ({}s from {}{}), so the window is spent on              purpose and this number is that deadline rather than a backlog",
-            r.at + r.retry_after_seconds * 1000,
+            r.at.saturating_add(r.retry_after_seconds.saturating_mul(1000)),
             r.retry_after_seconds,
             r.at,
             match &r.by {
@@ -386,5 +389,15 @@ mod tests {
     fn a_spent_window_still_answers_from_the_declared_schedule() {
         let s = admits(150, 10, 150, 9_500, 150.0, 0);
         assert_eq!(s.seconds, Some(9.5));
+    }
+
+    #[test]
+    fn an_extreme_schedule_remains_an_estimate_instead_of_overflowing() {
+        let s = admits(1, i64::MAX, 1, 10, 3.0, i64::MAX - 5);
+        assert_eq!(s.resets_at, i64::MAX);
+        assert!(
+            s.seconds.is_some_and(|seconds| seconds > i64::MAX as f64),
+            "the two post-edge windows should be represented without integer overflow: {s:?}"
+        );
     }
 }
