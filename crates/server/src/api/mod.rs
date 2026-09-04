@@ -315,7 +315,14 @@ pub fn find(
 /// The one case the server refuses to guess: two applications with a graph of
 /// one name. Picking either would run somebody else's declaration.
 pub fn resolve(st: &Shared, name: &str) -> Result<Arc<crate::registry::GraphRuntime>, Fail> {
-    match st.registry.resolve(name) {
+    resolve_found(name, st.registry.resolve(name))
+}
+
+pub(crate) fn resolve_found(
+    name: &str,
+    found: crate::registry::Resolved,
+) -> Result<Arc<crate::registry::GraphRuntime>, Fail> {
+    match found {
         crate::registry::Resolved::One(g) => Ok(g),
         crate::registry::Resolved::None => {
             Err(Fail(StatusCode::NOT_FOUND, format!("no graph `{name}`")))
