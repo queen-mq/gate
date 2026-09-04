@@ -21,7 +21,7 @@
   "this document is wrong" and "this document is right but re-founds a counter"
   need different words above the same box.
 */
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import PageHeader from '../components/PageHeader.vue'
 import Icon from '../components/Icon.vue'
@@ -52,24 +52,45 @@ const STARTER = {
   paths: [{ name: 'main', nodes: ['providerx'] }],
 }
 
-onMounted(async () => {
-  if (!editing.value) {
+let loadToken = 0
+
+async function loadDocument() {
+  const token = ++loadToken
+  const app = application.value
+  const name = props.name
+  loading.value = true
+  error.value = ''
+  conflict.value = ''
+  warnings.value = []
+  migration.value = []
+
+  if (!name) {
     text.value = JSON.stringify(STARTER, null, 2)
     loading.value = false
     return
   }
   try {
-    const live = await api.get(graphApi(application.value, props.name))
+    const live = await api.get(graphApi(app, name))
+    // Vue Router reuses this component when only route params change. An older
+    // response must never replace the document belonging to the new URL.
+    if (token !== loadToken) return
     /* `spec` is the stored document verbatim. Editing the VIEW instead would
        hand the server back its own computed fields, and `deny_unknown_fields`
        would refuse every one of them. */
     const doc = live?.spec ?? {}
     text.value = JSON.stringify(doc, null, 2)
   } catch (e) {
+    if (token !== loadToken) return
     error.value = e.message
+  } finally {
+    if (token === loadToken) loading.value = false
   }
-  loading.value = false
-})
+}
+
+// `onMounted` alone leaves the previous graph in the editor when navigating
+// between two URLs backed by the same route record. Watching the identity also
+// covers `/graphs/new` if RouterView elects to reuse the component instance.
+watch(() => [props.app, props.name], loadDocument, { immediate: true })
 
 const parsed = computed(() => {
   try {
