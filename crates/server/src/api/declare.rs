@@ -324,7 +324,17 @@ pub async fn view(st: &Shared, rt: &Arc<GraphRuntime>) -> Value {
         let budgets: Vec<Value> = np
             .budgets
             .iter()
-            .map(|b| {
+            .enumerate()
+            .map(|(index, b)| {
+                // Enforcement uses the compiled budget, while provenance is
+                // intentionally documentation-only and remains on the source
+                // document. The compiler preserves budget order.
+                let declared = rt
+                    .doc
+                    .nodes
+                    .get(name)
+                    .and_then(|node| node.budgets.get(index))
+                    .filter(|source| source.id_or(index) == b.id);
                 let s = states.iter().find(|s| s.key == b.key);
                 let ceiling = b.max_for(np.widest_share());
                 let value = s.map(|s| s.value).unwrap_or(0);
@@ -339,6 +349,8 @@ pub async fn view(st: &Shared, rt: &Arc<GraphRuntime>) -> Value {
                     "countSub": b.count_sub,
                     "windowSubSeconds": b.window_sub_seconds,
                     "confidence": b.confidence,
+                    "source": declared.and_then(|source| source.source.as_ref()),
+                    "asOf": declared.and_then(|source| source.as_of.as_ref()),
                     // A per-key budget has no single counter to report: the
                     // number that matters is the worst live key, and finding it
                     // means enumerating a namespace. `null` says so rather than
