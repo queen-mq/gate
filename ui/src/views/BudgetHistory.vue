@@ -41,22 +41,40 @@ const RANGES = [
 const range = ref(RANGES[1])
 
 async function load() {
+  const app = application.value
+  const name = props.name
+  const node = props.node
+  const budget = props.budget
+  const key = rollupKey.value
+  const minutes = range.value.minutes
   try {
     const [d, r] = await Promise.all([
-      api.get(graphApi(application.value, props.name)),
-      fetchRollups(application.value, rollupKey.value, range.value.minutes),
+      api.get(graphApi(app, name)),
+      fetchRollups(app, key, minutes),
     ])
+    if (
+      app !== application.value || name !== props.name || node !== props.node ||
+      budget !== props.budget || key !== rollupKey.value || minutes !== range.value.minutes
+    ) return
     target.value = d
     rows.value = r === null ? null : perMinute(r)
     error.value = ''
   } catch (e) {
+    if (
+      app !== application.value || name !== props.name || node !== props.node ||
+      budget !== props.budget || key !== rollupKey.value || minutes !== range.value.minutes
+    ) return
     error.value = e.message
   }
 }
 // Slower than the gauges: the series is one point per minute, and it does not
 // change between two four-second polls.
-usePoll(load, 15000)
-watch([() => props.app, () => props.name, () => props.node, () => props.budget, range], load)
+const refresh = usePoll(load, 15000)
+watch([() => props.app, () => props.name, () => props.node, () => props.budget, range], () => {
+  target.value = null
+  rows.value = undefined
+  refresh()
+})
 
 const node = computed(() => (target.value?.nodes ?? []).find((n) => n.node === props.node) ?? null)
 const spec = computed(() => (node.value?.budgets ?? []).find((b) => b.id === props.budget) ?? null)
