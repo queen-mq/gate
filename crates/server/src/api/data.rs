@@ -250,7 +250,7 @@ async fn push_into(
     // for work that has not moved. What it buys is a caller who can back off
     // instead of filling a queue — 429 with the deadline read off the counter's
     // own TTL.
-    if let Some(retry_after) = shed(st, np, cost).await {
+    if let Some(retry_after) = shed(st, np, &item, cost).await {
         return Err(Fail(
             StatusCode::TOO_MANY_REQUESTS,
             format!(
@@ -342,36 +342,80 @@ fn spread(partitions: Option<u32>) -> Option<String> {
     Some(format!("p{i}"))
 }
 
-/// `Some(seconds)` when every unscoped counter of this node is already full.
+/// `Some(seconds)` when any counter applicable to this item is already full.
 ///
 /// Read-only, and best-effort: a broker that will not answer means the push goes
 /// through and the relay decides, which is the right way round — the door must
 /// never be the thing that stops work when the limiter itself is fine.
-async fn shed(st: &Shared, np: &NodePlan, cost: i64) -> Option<i64> {
+async fn shed(st: &Shared, np: &NodePlan, item: &Value, cost: i64) -> Option<i64> {
     if !np.ingress_shed {
         return None;
     }
-    let keys: Vec<String> = np.unscoped().map(|b| b.key.clone()).collect();
-    if keys.is_empty() {
+    let applicable = shed_budgets(np, item);
+    if applicable.is_empty() {
         return None;
     }
+    let keys: Vec<String> = applicable.iter().map(|b| b.key.clone()).collect();
     let states = st.budgets.read(&keys).await.ok()?;
-    let now = crate::now_ms();
-    let mut worst: Option<i64> = None;
-    for b in np.unscoped() {
-        let ceiling = b.max_for(np.widest_share());
-        let s = states.iter().find(|s| s.key == b.key)?;
-        if s.value + cost <= ceiling {
-            return None;
+    shed_wait(&applicable, &states, cost, crate::now_ms())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ShedBudget {
+    key: String,
+    ceiling: i64,
+}
+
+/// Resolve the exact counters the relay would charge for this payload.
+fn shed_budgets(np: &NodePlan, item: &Value) -> Vec<ShedBudget> {
+    let op = gate_core::op_of(item);
+    let mut out = Vec::new();
+    for b in &np.budgets {
+        if b.when_op
+            .as_ref()
+            .is_some_and(|patterns| !gate_core::op_matches(patterns, op))
+        {
+            continue;
         }
-        let wait = s
-            .expires_at_ms
-            .map(|e| ((e - now) as f64 / 1000.0).ceil() as i64)
-            .unwrap_or(1)
-            .max(1);
-        worst = Some(worst.map_or(wait, |w: i64| w.max(wait)));
+        let key = match &b.scope_by {
+            Some(path) => match gate_core::scope_value(item, path) {
+                Some(value) => b.key_for(Some(&value)),
+                None => continue,
+            },
+            None => b.key.clone(),
+        };
+        if out.iter().any(|seen: &ShedBudget| seen.key == key) {
+            continue;
+        }
+        out.push(ShedBudget {
+            key,
+            ceiling: b.max_for(np.widest_share()),
+        });
     }
-    worst
+    out
+}
+
+fn shed_wait(
+    budgets: &[ShedBudget],
+    states: &[crate::budget::State],
+    cost: i64,
+    now: i64,
+) -> Option<i64> {
+    budgets
+        .iter()
+        .filter_map(|b| {
+            let s = states.iter().find(|s| s.key == b.key)?;
+            if s.value <= b.ceiling.saturating_sub(cost) {
+                return None;
+            }
+            let wait = s
+                .expires_at_ms
+                .map(|e| ((e - now) as f64 / 1000.0).ceil() as i64)
+                .unwrap_or(1)
+                .max(1);
+            Some(wait)
+        })
+        .max()
 }
 
 // ------------------------------------------------------------------- gone
@@ -464,5 +508,96 @@ fn egress_hint(st: &Shared, application: &str, graph: &str, node: &str) -> Strin
             "`{node}` declares no egress queue; name one in the declaration and consume it \
              directly."
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn budget(id: &str) -> gate_core::CompiledBudget {
+        gate_core::CompiledBudget {
+            id: id.into(),
+            key: format!("key:{id}"),
+            scope_by: None,
+            shared_key: None,
+            when_op: None,
+            count: 10,
+            time_ms: 1000,
+            sub_windows: 1,
+            count_sub: 10,
+            window_sub_seconds: 1,
+            confidence: gate_core::Confidence::Inferred,
+        }
+    }
+
+    fn node(budgets: Vec<gate_core::CompiledBudget>) -> NodePlan {
+        NodePlan {
+            name: "n".into(),
+            budgets,
+            cost: gate_core::Cost::Fixed(1),
+            ingress_queue: Some("in".into()),
+            ingress_owned: true,
+            ingress_http: true,
+            ingress_shed: true,
+            interior_queue: "interior".into(),
+            egress_queue: Some("out".into()),
+            egress_group: None,
+            breaker_key: "breaker".into(),
+            shares: Default::default(),
+        }
+    }
+
+    #[test]
+    fn one_full_budget_is_enough_to_shed() {
+        let budgets = vec![
+            ShedBudget {
+                key: "full".into(),
+                ceiling: 10,
+            },
+            ShedBudget {
+                key: "room".into(),
+                ceiling: 10,
+            },
+        ];
+        let states = vec![
+            crate::budget::State {
+                key: "full".into(),
+                value: 10,
+                expires_at_ms: Some(12_000),
+            },
+            crate::budget::State {
+                key: "room".into(),
+                value: 0,
+                expires_at_ms: Some(20_000),
+            },
+        ];
+
+        assert_eq!(shed_wait(&budgets, &states, 1, 10_000), Some(2));
+    }
+
+    #[test]
+    fn shed_resolves_when_op_and_scoped_keys_for_this_item() {
+        let global = budget("global");
+        let mut writes = budget("writes");
+        writes.when_op = Some(vec!["listing.write".into()]);
+        let mut customer = budget("customer");
+        customer.scope_by = Some("payload.customerId".into());
+        let np = node(vec![global, writes, customer]);
+
+        let got = shed_budgets(&np, &json!({ "op": "listing.read", "customerId": "c-7" }));
+        assert_eq!(
+            got,
+            vec![
+                ShedBudget {
+                    key: "key:global".into(),
+                    ceiling: 10,
+                },
+                ShedBudget {
+                    key: "key:customer:c-7".into(),
+                    ceiling: 10,
+                },
+            ]
+        );
     }
 }
