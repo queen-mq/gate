@@ -426,37 +426,6 @@ impl Budgets {
         }
     }
 
-    /// Credit a counter that this process never charged — the breaker giving
-    /// back the token a reporter spent on the call a vendor refused.
-    ///
-    /// `min: 0` and nothing else, because there is no charge of ours to identify
-    /// and therefore no window to prove. It is safe where [`Budgets::refund`] is
-    /// not because the only caller spends the whole window immediately
-    /// afterwards, which overwrites whatever this credited.
-    pub async fn credit(&self, charges: &[Charge]) {
-        let mut ops = Vec::with_capacity(charges.len());
-        for c in charges {
-            match self
-                .queen
-                .kv()
-                .incr(&self.ns, &c.key, -c.delta, Expiry::seconds(c.ttl.max(1)))
-                .min(0)
-                .operation()
-            {
-                Ok(op) => ops.push(op),
-                Err(e) => {
-                    tracing::warn!(key = %c.key, error = %e, "budget: could not stage a credit")
-                }
-            }
-        }
-        if ops.is_empty() {
-            return;
-        }
-        if let Err(e) = self.queen.kv().batch(ops).await {
-            tracing::warn!(error = %e, keys = charges.len(), "budget: the credit call failed");
-        }
-    }
-
     /// Read counters without touching them. The ETA, the console and the
     /// breaker's report; never the hot path.
     pub async fn read(&self, keys: &[String]) -> Result<Vec<State>> {
@@ -476,14 +445,22 @@ impl Budgets {
             .collect())
     }
 
-    /// Spend a window outright — the breaker.
+    /// Spend a window outright and publish the breaker record atomically.
     ///
     /// `put`'s TTL is **not** create-only (only `incr`'s is), so this rewrites
     /// both the value and the expiry in one call. That is what makes every
     /// parked consumer's `expiresAt` the vendor's own `Retry-After` deadline
-    /// without anybody being told it.
-    pub async fn spend(&self, keys: &[(String, i64)], ttl_seconds: i64) -> Result<()> {
-        let mut ops = Vec::with_capacity(keys.len());
+    /// without anybody being told it. The record belongs in the same KV batch:
+    /// `kv_apply_v1` applies a batch in one database transaction, so either the
+    /// node is both held and visible, or neither write happened.
+    pub async fn spend_with_record(
+        &self,
+        keys: &[(String, i64)],
+        record_key: &str,
+        record: serde_json::Value,
+        ttl_seconds: i64,
+    ) -> Result<()> {
+        let mut ops = Vec::with_capacity(keys.len() + 1);
         for (key, value) in keys {
             ops.push(
                 self.queen
@@ -497,6 +474,17 @@ impl Budgets {
                     .operation()?,
             );
         }
+        ops.push(
+            self.queen
+                .kv()
+                .put(
+                    &self.ns,
+                    record_key,
+                    record,
+                    Expiry::seconds(ttl_seconds.max(1)),
+                )
+                .operation()?,
+        );
         self.queen.kv().batch(ops).await?;
         Ok(())
     }
@@ -524,20 +512,6 @@ impl Budgets {
         }
         let res = self.queen.kv().get_many(&self.ns, keys.to_vec()).await?;
         Ok(res.rows.unwrap_or_default())
-    }
-
-    pub async fn put_json(
-        &self,
-        key: &str,
-        value: serde_json::Value,
-        ttl_seconds: i64,
-    ) -> Result<()> {
-        self.queen
-            .kv()
-            .put(&self.ns, key, value, Expiry::seconds(ttl_seconds.max(1)))
-            .send()
-            .await?;
-        Ok(())
     }
 
     pub async fn get_prefix(&self, prefix: &str, limit: u32) -> Result<Vec<queen_mq::KvRow>> {

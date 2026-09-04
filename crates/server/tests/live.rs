@@ -1979,6 +1979,58 @@ async fn a_path_added_to_a_running_graph_starts_at_the_tail() {
 
 // ============================================================== the breaker
 
+/// A failed trip changes neither half of breaker state.
+///
+/// The counter spend and the visible record used to be separate broker calls.
+/// If the latter failed, the endpoint returned 502 while leaving a node held
+/// until the TTL, with no breaker in the graph view to explain the outage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn a_failed_breaker_trip_leaves_no_invisible_hold() {
+    let Some((h, faulty)) = faulty_harness("atomic-trip").await else {
+        assert!(std::env::var("GATE_TEST_REQUIRE_LIVE").is_err());
+        return;
+    };
+    let out = egress_of("atomic-trip", &h.application);
+    let (status, body) = h
+        .put_graph(
+            "g",
+            one_node(&out, json!({ "id": "b", "count": 1000, "timeMs": 1000 })),
+        )
+        .await;
+    assert_eq!(status, 200, "declare: {body}");
+
+    let key = h.key("g", "n", "b");
+    assert_eq!(h.counter(&key).await, 0, "the counter starts empty");
+
+    // `brk` occurs only in the breaker record key. Before the fix this lets the
+    // preceding counter-only call through and refuses the second, record-only
+    // call. With one batch it refuses the whole state transition.
+    faulty.refuse("brk");
+    let (status, res) = h
+        .backoff("g", "n", json!({ "retryAfterSeconds": 30, "by": "test" }))
+        .await;
+    assert_eq!(
+        status, 502,
+        "the injected broker failure must surface: {res}"
+    );
+    faulty.allow();
+
+    assert_eq!(
+        h.counter(&key).await,
+        0,
+        "a failed trip must not leave the budget counter spent"
+    );
+    let (status, view) = h.get_graph("g").await;
+    assert_eq!(status, 200, "{view}");
+    assert!(
+        view["nodes"][0]["breaker"].is_null(),
+        "a failed trip must not publish a breaker either: {view}"
+    );
+
+    h.cleanup("g").await;
+}
+
 /// The breaker stops every path within one batch, and lifts on its own.
 ///
 /// A vendor's 429 becomes `POST .../backoff`, which SPENDS the node's window: the
