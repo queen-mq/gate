@@ -2340,6 +2340,57 @@ async fn the_console_can_draw_what_is_running() {
 
 // ============================================================== lifecycle
 
+/// Declaring a graph must not reconfigure the application's egress queue.
+///
+/// Queen's `create()` is implemented as `/configure` with an empty option bag,
+/// and `/configure` is a full replace rather than a patch. Calling it merely to
+/// ensure the queue exists resets every setting the application chose. An absent
+/// egress needs no eager setup: Queen creates it atomically on Gate's first push.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn declaring_a_graph_preserves_its_egress_queue_configuration() {
+    let Some(h) = harness("egress-config").await else {
+        return;
+    };
+    let out = egress_of("egress-config", &h.application);
+    h.queen
+        .queue(&out)
+        .configure(queen_mq::QueueOptions {
+            lease_time: Some(127),
+            retry_limit: Some(41),
+            ..Default::default()
+        })
+        .await
+        .expect("configure application-owned egress");
+
+    let (status, body) = h.put_graph("g", one_node(&out, wide("b"))).await;
+    assert_eq!(status, 200, "declare: {body}");
+
+    let detail = h
+        .queen
+        .admin()
+        .queue_detail(&out, &[])
+        .await
+        .expect("read egress configuration");
+    assert_eq!(
+        detail["queue"]["config"]["leaseTime"],
+        json!(127),
+        "Gate replaced the application's lease setting: {detail}"
+    );
+    assert_eq!(
+        detail["queue"]["config"]["retryLimit"],
+        json!(41),
+        "Gate replaced the application's retry setting: {detail}"
+    );
+
+    h.cleanup("g").await;
+    h.queen
+        .queue(&out)
+        .delete()
+        .await
+        .expect("delete application-owned egress");
+}
+
 /// A failed provisioning leaves the old document serving.
 ///
 /// Without the restore the graph is left stopped and still registered: it accepts
