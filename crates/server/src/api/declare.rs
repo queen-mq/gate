@@ -271,31 +271,34 @@ async fn do_sync(st: &Shared, application: &str, bodies: Vec<Value>) -> ApiResul
 
     // Reap, and ONLY inside this application. The flat version of this reaped
     // everything the cell held, so two teams syncing against one deployment
-    // would delete each other's graphs — including from the durable store. Done
-    // AFTER the declares, so a sync that fails half way removes nothing.
+    // would delete each other's graphs — including from the durable store. A
+    // refused document makes the submitted set incomplete, so it must never be
+    // interpreted as authority to delete anything omitted from it.
     let mut removed = Vec::new();
-    for rt in st.registry.of_app(application) {
-        if declared.contains(&rt.doc.graph) {
-            continue;
+    if refused.is_empty() {
+        for rt in st.registry.of_app(application) {
+            if declared.contains(&rt.doc.graph) {
+                continue;
+            }
+            // A sync reaps what it could have DECLARED, and nothing else. v1
+            // exempted graph nodes from a target sync because a target list does not
+            // name them and reaping one would tear down half a topology; there are
+            // no node-targets any more, so the same rule is spelt as "a sync of
+            // targets does not delete a graph". A one-node graph IS a target and is
+            // fair game.
+            if rt.plan.nodes.len() > 1 {
+                continue;
+            }
+            let name = rt.doc.graph.clone();
+            if let Err(e) = crate::store::forget(&st.queen, application, &name).await {
+                tracing::warn!(graph = %name, error = %e, "sync: not reaped, the stored document could not be removed");
+                refused.push(json!({ "target": name, "error": format!("not reaped: {e}") }));
+                continue;
+            }
+            crate::supervisor::stop(&rt).await;
+            st.registry.remove(application, &name);
+            removed.push(name);
         }
-        // A sync reaps what it could have DECLARED, and nothing else. v1
-        // exempted graph nodes from a target sync because a target list does not
-        // name them and reaping one would tear down half a topology; there are
-        // no node-targets any more, so the same rule is spelt as "a sync of
-        // targets does not delete a graph". A one-node graph IS a target and is
-        // fair game.
-        if rt.plan.nodes.len() > 1 {
-            continue;
-        }
-        let name = rt.doc.graph.clone();
-        if let Err(e) = crate::store::forget(&st.queen, application, &name).await {
-            tracing::warn!(graph = %name, error = %e, "sync: not reaped, the stored document could not be removed");
-            refused.push(json!({ "target": name, "error": format!("not reaped: {e}") }));
-            continue;
-        }
-        crate::supervisor::stop(&rt).await;
-        st.registry.remove(application, &name);
-        removed.push(name);
     }
 
     ok(json!({

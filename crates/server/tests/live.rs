@@ -2238,6 +2238,44 @@ async fn a_v1_target_is_accepted_and_mapped() {
     h.cleanup("legacy").await;
 }
 
+/// A sync body that contains a refused document is not a complete declaration
+/// of desired state. In particular, an existing target omitted from that body
+/// must not be mistaken for a requested deletion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn a_partly_refused_sync_reaps_nothing() {
+    let Some(h) = harness("sync-refused").await else {
+        return;
+    };
+    let mut keep = one_node(&egress_of("sync-keep", &h.application), wide("b"));
+    let drop = one_node(&egress_of("sync-drop", &h.application), wide("b"));
+    assert_eq!(h.put_graph("keep", keep.clone()).await.0, 200);
+    assert_eq!(h.put_graph("drop", drop).await.0, 200);
+
+    keep["graph"] = json!("keep");
+    let (status, body) = h
+        .send(
+            reqwest::Method::PUT,
+            &format!("/v1/apps/{}/targets", h.application),
+            Some(json!([
+                keep,
+                { "graph": "broken", "version": 1, "nodes": "not an object" }
+            ])),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["ok"], json!(false), "{body}");
+    assert_eq!(body["removed"], json!([]), "{body}");
+    assert_eq!(
+        h.get_graph("drop").await.0,
+        200,
+        "omitted target was reaped"
+    );
+
+    h.cleanup("keep").await;
+    h.cleanup("drop").await;
+}
+
 /// The console can draw what is running, from routes that need no broker round
 /// trip per node.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
