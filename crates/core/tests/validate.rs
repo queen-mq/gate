@@ -190,6 +190,31 @@ fn a_node_needs_at_least_one_unscoped_budget() {
 }
 
 #[test]
+fn a_breaker_must_fit_its_counters_and_record_in_one_atomic_call() {
+    let fill = |d: &mut GraphDoc, count: usize| {
+        let n = d.nodes.get_mut("audit").unwrap();
+        let template = n.budgets[0].clone();
+        n.budgets = (0..count)
+            .map(|i| {
+                let mut b = template.clone();
+                b.id = Some(format!("breaker-{i}"));
+                b
+            })
+            .collect();
+    };
+
+    let mut at_limit = airbnb();
+    fill(&mut at_limit, gate_core::MAX_BREAKER_COUNTERS);
+    assert!(
+        !rules(&validate(&at_limit)).contains(&"breaker-width"),
+        "255 counters plus the record must fit exactly"
+    );
+
+    let got = broken(|d| fill(d, gate_core::MAX_BREAKER_COUNTERS + 1));
+    assert!(got.contains(&"breaker-width"), "{got:?}");
+}
+
+#[test]
 fn a_budget_that_cannot_admit_anything_never_will() {
     assert!(
         broken(|d| d.nodes.get_mut("audit").unwrap().budgets[0].count = 0)

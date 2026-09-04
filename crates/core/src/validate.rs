@@ -26,6 +26,13 @@ use crate::plan::{self, Plan};
 /// enforced as a refusal.
 pub const MAX_BATCH: u32 = 1000;
 
+/// The most distinct node-wide counters one breaker can hold.
+///
+/// Queen accepts 256 operations in one KV batch and the final operation is the
+/// breaker record. Splitting that batch would make the hold and its audit record
+/// observably non-atomic.
+pub const MAX_BREAKER_COUNTERS: usize = 255;
+
 /// The most re-entries a document may allow one item (§16.6). v1's
 /// `breach-attempts` policed the same number for the same reason.
 pub const MAX_ATTEMPTS_CEILING: u32 = 20;
@@ -343,6 +350,19 @@ fn budgets(doc: &GraphDoc, plan: &Plan, out: &mut Vec<Problem>) {
                     "node `{name}` has only per-key budgets. It needs at least one budget on the \
                      node itself: it is what the ETA measures a rate against and what the breaker \
                      spends when a vendor says 429."
+                ),
+            ));
+        }
+        let breaker_keys: HashSet<&str> = np.unscoped().map(|b| b.key.as_str()).collect();
+        if breaker_keys.len() > MAX_BREAKER_COUNTERS {
+            out.push(p(
+                "breaker-width",
+                format!(
+                    "node `{name}` compiles to {} distinct node-wide counters. A breaker must \
+                     spend them and write its audit record atomically, but the broker accepts at \
+                     most 256 operations in one call. Keep at most {MAX_BREAKER_COUNTERS} \
+                     distinct unscoped counters; budgets with the same sharedKey count once.",
+                    breaker_keys.len()
                 ),
             ));
         }

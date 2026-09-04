@@ -77,7 +77,17 @@ async fn do_reset(st: &Shared, rt: &std::sync::Arc<GraphRuntime>, node: &str) ->
             format!("no node `{node}` in graph `{}`", rt.key()),
         )
     })?;
-    ok(crate::breaker::reset(&st.budgets, np)
+    let out = crate::breaker::reset(&st.budgets, np)
         .await
-        .map_err(|e| Fail(StatusCode::BAD_GATEWAY, e.to_string()))?)
+        .map_err(|e| Fail(StatusCode::BAD_GATEWAY, e.to_string()))?;
+    if out.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+        return Err(Fail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            out.get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("the breaker could not be reset")
+                .to_string(),
+        ));
+    }
+    ok(out)
 }

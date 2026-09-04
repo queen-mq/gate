@@ -106,6 +106,9 @@ pub async fn trip(
             ),
         }));
     }
+    if keys.len() > gate_core::MAX_BREAKER_COUNTERS {
+        return Ok(too_wide(node, keys.len()));
+    }
 
     // The WIDEST path's ceiling, so no path can slip under it: a path at
     // share 0.5 refuses itself at half the counter, and writing half would leave
@@ -164,6 +167,9 @@ pub async fn reset(budgets: &Budgets, node: &NodePlan) -> queen_mq::Result<Value
     // Deduplicated for the same reason as `trip`: one key twice in one call is
     // `kv_duplicate_key_in_call`, and a reset that errors leaves the node held.
     let mut keys: Vec<String> = unique_keys(node);
+    if keys.len() > gate_core::MAX_BREAKER_COUNTERS {
+        return Ok(too_wide(node, keys.len()));
+    }
     keys.push(node.breaker_key.clone());
     budgets.clear(&keys).await?;
     tracing::info!(node = %node.name, "breaker reset");
@@ -192,6 +198,19 @@ fn unique_keys(node: &NodePlan) -> Vec<String> {
         .into_iter()
         .map(|b| b.key.clone())
         .collect()
+}
+
+fn too_wide(node: &NodePlan, keys: usize) -> Value {
+    json!({
+        "ok": false,
+        "error": format!(
+            "node `{}` has {keys} distinct node-wide counters; its breaker needs one additional \
+             operation for the audit record, but the broker accepts at most 256 operations in one \
+             atomic call. Redeclare it with at most {} distinct unscoped counters.",
+            node.name,
+            gate_core::MAX_BREAKER_COUNTERS
+        ),
+    })
 }
 
 /// Every breaker currently holding a node, fleet-wide.
