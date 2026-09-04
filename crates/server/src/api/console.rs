@@ -18,6 +18,17 @@ use serde_json::{json, Value};
 
 use crate::api::{ok, ApiResult, Shared};
 
+/// Console reads are interactive views, not an unbounded export surface.
+/// Keeping the bounds here also makes every `usize -> i64/u32` conversion
+/// below safe on both 32- and 64-bit builds.
+const MAX_HISTORY_MINUTES: usize = 24 * 60;
+const MAX_TRACE_ROWS: usize = crate::obs::TRACE_RING;
+const MAX_BREACH_ROWS: usize = 500;
+
+fn bounded(value: Option<usize>, default: usize, max: usize) -> usize {
+    value.unwrap_or(default).clamp(1, max)
+}
+
 // ------------------------------------------------------------------ overview
 
 pub async fn overview(State(app): State<Shared>) -> ApiResult {
@@ -310,7 +321,7 @@ pub struct FlowQuery {
 /// much did we send" but "how close are we to being refused".
 pub async fn flow(State(app): State<Shared>, Query(q): Query<FlowQuery>) -> ApiResult {
     let now = crate::now_ms();
-    let minutes = q.minutes.unwrap_or(120).clamp(1, 1440) as i64;
+    let minutes = bounded(q.minutes, 120, MAX_HISTORY_MINUTES) as i64;
 
     let Some(h) = app.history.as_ref() else {
         return ok(json!({ "minutes": [], "applications": [], "durable": false }));
@@ -423,9 +434,8 @@ pub async fn rollups(State(app): State<Shared>, Query(q): Query<RollupQuery>) ->
             q.target.clone(),
         ),
     };
-    ok(json!(
-        h.rollups(&a, &t, q.minutes.unwrap_or(120) as i64).await
-    ))
+    let minutes = bounded(q.minutes, 120, MAX_HISTORY_MINUTES) as i64;
+    ok(json!(h.rollups(&a, &t, minutes).await))
 }
 
 #[derive(Deserialize)]
@@ -443,7 +453,7 @@ pub struct TraceQuery {
 /// inherit and no `cost_actual` to compare — see the design's §16.5. What is
 /// kept is the interesting event: the denial.
 pub async fn traces(State(app): State<Shared>, Query(q): Query<TraceQuery>) -> ApiResult {
-    let limit = q.limit.unwrap_or(100);
+    let limit = bounded(q.limit, 100, MAX_TRACE_ROWS);
     let mut out: Vec<Value> = app
         .traces
         .recent(q.outcome.as_deref(), limit)
@@ -472,9 +482,8 @@ pub struct LimitQuery {
 /// sees. These are the `brk:` records, which every replica writes and every
 /// replica can read.
 pub async fn recent_breaches(State(app): State<Shared>, Query(q): Query<LimitQuery>) -> ApiResult {
-    ok(json!(
-        crate::breaker::recent(&app.budgets, q.limit.unwrap_or(10) as u32).await
-    ))
+    let limit = bounded(q.limit, 10, MAX_BREACH_ROWS) as u32;
+    ok(json!(crate::breaker::recent(&app.budgets, limit).await))
 }
 
 /// One row per `(application, sharedKey)`, read live.
@@ -709,4 +718,21 @@ pub async fn me(
         "role": if crate::auth::is_admin(&s.email) { "admin" } else { "viewer" },
         "expires_at": s.exp,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bounded, MAX_BREACH_ROWS, MAX_HISTORY_MINUTES, MAX_TRACE_ROWS};
+
+    #[test]
+    fn console_query_sizes_are_never_zero_or_unrepresentably_large() {
+        assert_eq!(bounded(None, 120, MAX_HISTORY_MINUTES), 120);
+        assert_eq!(bounded(Some(0), 120, MAX_HISTORY_MINUTES), 1);
+        assert_eq!(
+            bounded(Some(usize::MAX), 120, MAX_HISTORY_MINUTES),
+            MAX_HISTORY_MINUTES
+        );
+        assert_eq!(bounded(Some(usize::MAX), 100, MAX_TRACE_ROWS), 500);
+        assert_eq!(bounded(Some(usize::MAX), 10, MAX_BREACH_ROWS), 500);
+    }
 }
