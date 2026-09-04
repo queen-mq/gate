@@ -1260,7 +1260,9 @@ up to one old window to land, and the declare response says so.
 
 The rule is enforced for a **caller's** declare only, never for one applied from the store —
 enforcing it against a replica-local runtime is how a replica wedges on a legal
-delete-and-redeclare at the same version. That asymmetry is v1's and it is kept verbatim.
+delete-and-redeclare at the same version. A caller's declare compares both the local runtime and
+the exact stored document, so reaching a replica before its reconcile pass cannot make an existing
+graph look new and bypass the bump. That asymmetry is v1's and it is kept verbatim.
 
 ### 12.4 Drain and redeclare
 

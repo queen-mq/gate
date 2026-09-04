@@ -2697,6 +2697,42 @@ async fn a_second_replica_converges_on_the_stored_document() {
     );
 }
 
+/// A caller cannot evade the version-bump rule by reaching a replica before
+/// that replica's reconcile loop has loaded the graph.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn a_fresh_replica_checks_the_stored_version_before_redeclaring() {
+    let Some(h) = harness("remote-version").await else {
+        return;
+    };
+    let out = egress_of("remote-version", &h.application);
+    let (status, body) = h.put_graph("g", one_node(&out, wide("b"))).await;
+    assert_eq!(status, 200, "declare: {body}");
+
+    // This replica deliberately has no local runtime. Renaming the budget
+    // re-founds its counter and therefore needs a bump above the stored v1.
+    let second = serve(&h.app.queen_url).await;
+    assert!(second.registry.all().is_empty());
+    let second_base = spawn_server(second).await;
+    let mut changed = one_node(&out, wide("renamed"));
+    changed["version"] = json!(1);
+    let res = reqwest::Client::new()
+        .put(format!("{second_base}/v1/apps/{}/graphs/g", h.application))
+        .json(&changed)
+        .send()
+        .await
+        .expect("declare on the fresh replica");
+    let status = res.status().as_u16();
+    let body: Value = res.json().await.unwrap_or(Value::Null);
+    assert_eq!(status, 409, "the stored predecessor was ignored: {body}");
+    assert!(
+        body.to_string().contains("bump version above 1"),
+        "the refusal should identify the required version: {body}"
+    );
+
+    h.cleanup("g").await;
+}
+
 /// A replica converges on a redeclared graph instead of wedging.
 ///
 /// The version-bump rule is enforced for a CALLER's declare only, never for one
