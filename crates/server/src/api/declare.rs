@@ -317,6 +317,36 @@ async fn do_sync(st: &Shared, application: &str, bodies: Vec<Value>) -> ApiResul
 pub async fn view(st: &Shared, rt: &Arc<GraphRuntime>) -> Value {
     let mut nodes = Vec::new();
     for (name, np) in &rt.plan.nodes {
+        // Keep the two owners of backlog separate in the graph view, just as
+        // the metrics and ETA endpoints do. The first number is work each
+        // stage has not admitted yet; the second is work Gate has relayed to a
+        // terminal queue and the application's consumers have not picked up.
+        let mut waiting_for_budget = 0u64;
+        for s in rt.stages_of_node(name) {
+            waiting_for_budget += st
+                .depths
+                .pending_of_group(&st.queen, &s.stage.source, &s.stage.group)
+                .await
+                .values()
+                .sum::<u64>();
+        }
+
+        let waiting_for_workers = match (&np.egress_queue, &np.egress_group) {
+            (Some(queue), Some(group)) => st
+                .depths
+                .pending_of_group(&st.queen, queue, group)
+                .await
+                .values()
+                .sum::<u64>(),
+            (Some(queue), None) => st
+                .depths
+                .pending(&st.queen, queue)
+                .await
+                .values()
+                .sum::<u64>(),
+            (None, _) => 0,
+        };
+
         let keys: Vec<String> = np.unscoped().map(|b| b.key.clone()).collect();
         let states = st.budgets.read(&keys).await.unwrap_or_default();
         let breaker = crate::breaker::held(&st.budgets, np).await;
@@ -367,6 +397,8 @@ pub async fn view(st: &Shared, rt: &Arc<GraphRuntime>) -> Value {
             "paths": gate_core::plan::paths_through(&rt.plan, name),
             "shares": np.shares,
             "budgets": budgets,
+            "waiting_for_budget": waiting_for_budget,
+            "waiting_for_workers": waiting_for_workers,
             "breaker": breaker.map(|b| json!({
                 "at": b.at,
                 "retryAfterSeconds": b.retry_after_seconds,
