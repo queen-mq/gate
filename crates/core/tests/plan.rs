@@ -521,6 +521,38 @@ fn cost_is_a_payload_path() {
 }
 
 #[test]
+fn a_cost_outside_the_brokers_integer_range_is_refused_instead_of_saturated() {
+    let cost = gate_core::Cost::Path(gate_core::CostPath {
+        path: "payload.rooms".into(),
+        default: 1,
+        max: Some(i64::MAX),
+    });
+
+    assert_eq!(
+        gate_core::cost_of(&cost, &serde_json::json!({ "rooms": i64::MAX })).unwrap(),
+        i64::MAX,
+        "the actual wire boundary remains valid"
+    );
+
+    for value in [serde_json::json!(u64::MAX), serde_json::json!(1.0e100)] {
+        let error = gate_core::cost_of(&cost, &serde_json::json!({ "rooms": value }))
+            .expect_err("an unrepresentable cost must not be charged as i64::MAX");
+        assert!(
+            error
+                .to_string()
+                .contains("outside the signed 64-bit range"),
+            "{error}"
+        );
+    }
+
+    assert_eq!(
+        gate_core::cost_of(&cost, &serde_json::json!({ "rooms": -1.0e100 })).unwrap(),
+        1,
+        "negative costs retain the documented fallback-to-default behaviour"
+    );
+}
+
+#[test]
 fn a_payload_path_must_start_at_the_payload_root() {
     assert!(gate_core::ok_payload_path("payload.a"));
     assert!(gate_core::ok_payload_path("payload.a.b"));
