@@ -42,7 +42,7 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use queen_mq::{Config, Queen};
@@ -225,6 +225,7 @@ pub fn spawn_counters(app: api::Shared) -> tokio::task::JoinHandle<()> {
             let minute = completed_minute(now_ms());
 
             if let Some(h) = app.history.as_ref() {
+                let mut active = HashSet::new();
                 for g in app.registry.all() {
                     if g.plan.counters_window_seconds.is_none() {
                         continue;
@@ -234,6 +235,7 @@ pub fn spawn_counters(app: api::Shared) -> tokio::task::JoinHandle<()> {
                     let mut checkpoints: HashMap<String, Vec<CounterCheckpoint>> = HashMap::new();
                     for s in &g.stages {
                         let key = format!("{}/{}", g.key(), s.key());
+                        active.insert(key.clone());
                         let target = format!("{}.{}", g.doc.graph, s.stage.node);
                         let c = &s.counters;
                         let o = std::sync::atomic::Ordering::Relaxed;
@@ -278,6 +280,13 @@ pub fn spawn_counters(app: api::Shared) -> tokio::task::JoinHandle<()> {
                         }
                     }
                 }
+                // A delete, or a redeclare that removes a path, must also
+                // remove its lifetime-counter baseline. Otherwise this map
+                // grows for the life of the process and a later stage reusing
+                // the same identity inherits a checkpoint from a runtime that
+                // no longer exists. Failed writes for ACTIVE stages remain in
+                // the set and deliberately retain their previous checkpoint.
+                retain_active_checkpoints(&mut last, &active);
                 // The refusal ring, on the same cadence. Bounded and
                 // drop-oldest, so a flush that misses a pass loses the oldest
                 // denials and never blocks the hot path.
@@ -292,6 +301,13 @@ pub fn spawn_counters(app: api::Shared) -> tokio::task::JoinHandle<()> {
             }
         }
     })
+}
+
+fn retain_active_checkpoints(
+    checkpoints: &mut HashMap<String, CounterSnapshot>,
+    active: &HashSet<String>,
+) {
+    checkpoints.retain(|key, _| active.contains(key));
 }
 
 /// Delta of a lifetime counter tuple. A lower value means the stage runtime was
@@ -414,7 +430,9 @@ pub async fn reconcile(app: &api::Shared) {
 
 #[cfg(test)]
 mod tests {
-    use super::{completed_minute, counter_delta, until_next_minute};
+    use std::collections::{HashMap, HashSet};
+
+    use super::{completed_minute, counter_delta, retain_active_checkpoints, until_next_minute};
 
     #[test]
     fn a_restarted_counter_counts_from_its_new_zero() {
@@ -442,5 +460,19 @@ mod tests {
         assert_eq!(completed_minute(120_001), 60_000);
         assert_eq!(completed_minute(179_999), 60_000);
         assert_eq!(completed_minute(180_000), 120_000);
+    }
+
+    #[test]
+    fn deleted_stages_do_not_leave_lifetime_checkpoints_behind() {
+        let mut checkpoints = HashMap::from([
+            ("app/graph/path/live".to_string(), (10, 20, 30)),
+            ("app/graph/path/deleted".to_string(), (40, 50, 60)),
+        ]);
+        let active = HashSet::from(["app/graph/path/live".to_string()]);
+
+        retain_active_checkpoints(&mut checkpoints, &active);
+
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints["app/graph/path/live"], (10, 20, 30));
     }
 }
