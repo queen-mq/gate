@@ -32,17 +32,23 @@ async function resolveApplication(to) {
     // Unreachable API: send it to `default`, which is where the flat control
     // route would have looked anyway, and let the page report the failure.
   }
-  return `/apps/${encodeURIComponent(application)}/graphs/${encodeURIComponent(name)}`
+  return graphLocation(application, name, to)
 }
 
 /* The target shapes, kept as addresses and answered by the graph pages. A
    `/lanes/:lane` link becomes the graph with that path selected, because a lane
    is a path now and the page can show it. */
-function toGraph(to) {
-  const { app, name, lane, path } = to.params
+function graphLocation(app, name, to) {
+  const { lane, path } = to.params
+  const base = `/apps/${encodeURIComponent(app)}/graphs/${encodeURIComponent(name)}`
   const p = lane || path
-  const q = p ? `?path=${encodeURIComponent(p)}` : ''
-  return `/apps/${encodeURIComponent(app)}/graphs/${encodeURIComponent(name)}${q}`
+  if (p) return `${base}?path=${encodeURIComponent(p)}`
+  if (to.path.endsWith('/edit')) return `${base}/edit`
+  return base
+}
+
+function toGraph(to) {
+  return graphLocation(to.params.app, to.params.name, to)
 }
 
 const router = createRouter({
@@ -65,7 +71,7 @@ const router = createRouter({
 
     // ---- the target addresses, answered by the graph pages.
     { path: '/apps/:app/targets/:name', component: NeverRendered, beforeEnter: toGraph, meta: { nav: 'targets' } },
-    { path: '/apps/:app/targets/:name/edit', component: NeverRendered, beforeEnter: (to) => `/apps/${to.params.app}/graphs/${to.params.name}/edit`, meta: { nav: 'targets' } },
+    { path: '/apps/:app/targets/:name/edit', component: NeverRendered, beforeEnter: toGraph, meta: { nav: 'targets' } },
     { path: '/apps/:app/targets/:name/lanes/:lane', component: NeverRendered, beforeEnter: toGraph, meta: { nav: 'targets' } },
     { path: '/apps/:app/targets/:name/budgets/:budget', component: NeverRendered, beforeEnter: toGraph, meta: { nav: 'targets' } },
 
