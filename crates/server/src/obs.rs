@@ -13,8 +13,9 @@
 //! Nothing was broken; that is what the observability of the old design cost
 //! while idle, and idle is most of the time.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 use serde_json::{json, Value};
@@ -112,6 +113,50 @@ impl StageCounters {
     }
 }
 
+/// Consecutive live backlog samples for the overview's `saturating` state.
+/// A growth observation is held across a few console polls so the state does
+/// not flicker between the depth cache's refreshes.
+const SATURATING_HOLD: Duration = Duration::from_secs(15);
+
+#[derive(Debug)]
+struct BacklogSample {
+    depth: u64,
+    growing_until: Option<Instant>,
+}
+
+#[derive(Default)]
+pub struct BacklogTrends {
+    samples: RwLock<HashMap<String, BacklogSample>>,
+}
+
+impl BacklogTrends {
+    pub fn sample(&self, graph: &str, depth: u64) -> bool {
+        self.sample_at(graph, depth, Instant::now())
+    }
+
+    fn sample_at(&self, graph: &str, depth: u64, now: Instant) -> bool {
+        let mut samples = self.samples.write();
+        let Some(previous) = samples.get_mut(graph) else {
+            samples.insert(
+                graph.to_string(),
+                BacklogSample {
+                    depth,
+                    growing_until: None,
+                },
+            );
+            return false;
+        };
+
+        if depth > previous.depth {
+            previous.growing_until = Some(now + SATURATING_HOLD);
+        } else if depth < previous.depth || depth == 0 {
+            previous.growing_until = None;
+        }
+        previous.depth = depth;
+        previous.growing_until.is_some_and(|until| until > now)
+    }
+}
+
 /// One refusal, kept.
 ///
 /// **Denials only.** An admission is counted and never traced: it is the common
@@ -189,5 +234,32 @@ impl Traces {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backlog_growth_is_held_but_drain_clears_it_immediately() {
+        let trends = BacklogTrends::default();
+        let now = Instant::now();
+
+        assert!(!trends.sample_at("app/g", 3, now));
+        assert!(trends.sample_at("app/g", 5, now + Duration::from_secs(1)));
+        assert!(trends.sample_at("app/g", 5, now + Duration::from_secs(5)));
+        assert!(!trends.sample_at("app/g", 4, now + Duration::from_secs(6)));
+        assert!(!trends.sample_at("app/g", 0, now + Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn a_growth_latch_expires_without_another_increase() {
+        let trends = BacklogTrends::default();
+        let now = Instant::now();
+
+        assert!(!trends.sample_at("app/g", 1, now));
+        assert!(trends.sample_at("app/g", 2, now + Duration::from_secs(1)));
+        assert!(!trends.sample_at("app/g", 2, now + Duration::from_secs(17)));
     }
 }
