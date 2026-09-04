@@ -460,6 +460,7 @@ dependencies = [
  "chrono",
  "deadpool-postgres",
  "gate-core",
+ "getrandom 0.4.3",
  "jsonwebtoken",
  "mime_guess",
  "parking_lot",
