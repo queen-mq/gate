@@ -2841,6 +2841,55 @@ async fn an_eta_against_an_older_broker_still_costs_one_probe_per_ttl() {
     faulty.allow();
 }
 
+/// Live state is either read from the broker or reported as unavailable. A KV
+/// outage used to become an empty vector at every call site, which made the
+/// same graph appear to have zero usage, no active breaker and an immediate ETA
+/// while the source of truth was unreachable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn live_state_endpoints_do_not_invent_zero_during_a_kv_outage() {
+    let Some((h, faulty)) = faulty_harness("stateread").await else {
+        assert!(std::env::var("GATE_TEST_REQUIRE_LIVE").is_err());
+        return;
+    };
+    let out = egress_of("stateread", &h.application);
+    let budget = json!({
+        "id": "b",
+        "sharedKey": "vendor",
+        "count": 1000,
+        "timeMs": 1000
+    });
+    let (status, body) = h.put_graph("g", one_node(&out, budget)).await;
+    assert_eq!(status, 200, "declare: {body}");
+
+    faulty.refuse("/api/v1/kv");
+    let paths = [
+        format!("/v1/apps/{}/graphs/g", h.application),
+        format!("/v1/apps/{}/graphs/g/nodes/n/eta", h.application),
+        "/api/targets".into(),
+        "/api/budgets".into(),
+        "/api/breaches/recent".into(),
+        format!("/v1/apps/{}/metrics", h.application),
+    ];
+    for path in paths {
+        let (status, body) = h.send(reqwest::Method::GET, &path, None).await;
+        assert_eq!(
+            status, 502,
+            "{path} invented live state while KV was unavailable: {body}"
+        );
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("live broker state"),
+            "{path}: {body}"
+        );
+    }
+
+    faulty.allow();
+    h.cleanup("g").await;
+}
+
 /// An ETA answers from the DECLARED schedule when the window is spent.
 ///
 /// A window with nothing left in it measures zero admissions per second, and zero

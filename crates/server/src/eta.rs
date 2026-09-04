@@ -101,9 +101,18 @@ pub fn admits(
 }
 
 /// The answer, for one path through one node.
-pub async fn view(app: &Shared, rt: &Arc<GraphRuntime>, node: &str, path: &str) -> Option<Value> {
-    let stage = rt.plan.stage(path, node)?;
-    let np = rt.plan.node(node)?;
+pub async fn view(
+    app: &Shared,
+    rt: &Arc<GraphRuntime>,
+    node: &str,
+    path: &str,
+) -> queen_mq::Result<Option<Value>> {
+    let Some(stage) = rt.plan.stage(path, node) else {
+        return Ok(None);
+    };
+    let Some(np) = rt.plan.node(node) else {
+        return Ok(None);
+    };
     let now = crate::now_ms();
 
     // ---- position.
@@ -146,13 +155,13 @@ pub async fn view(app: &Shared, rt: &Arc<GraphRuntime>, node: &str, path: &str) 
     // A breaker holding the node is the one caveat that explains the whole
     // answer rather than qualifying it: the window is spent on purpose and the
     // long `etaSeconds` below is a vendor's `Retry-After`, not a backlog.
-    let held = crate::breaker::held(&app.budgets, np).await;
+    let held = crate::breaker::held(&app.budgets, np).await?;
     let cost_per_item = measured.unwrap_or(np.cost.default_value() as f64);
     let want = waiting_for_budget as f64 * cost_per_item;
 
     // ---- rate.
     let keys: Vec<String> = np.unscoped().map(|b| b.key.clone()).collect();
-    let states = app.budgets.read(&keys).await.unwrap_or_default();
+    let states = app.budgets.read(&keys).await?;
 
     let mut bound: Option<(&CompiledBudget, Schedule)> = None;
     for b in np.unscoped() {
@@ -190,7 +199,7 @@ pub async fn view(app: &Shared, rt: &Arc<GraphRuntime>, node: &str, path: &str) 
         "waiting-workers"
     };
 
-    Some(json!({
+    Ok(Some(json!({
         "at": now,
         "application": rt.doc.application,
         "graph": rt.doc.graph,
@@ -206,7 +215,7 @@ pub async fn view(app: &Shared, rt: &Arc<GraphRuntime>, node: &str, path: &str) 
         "waitingForBudget": waiting_for_budget,
         "waitingForWorkers": waiting_for_workers,
         "assumes": assumes(rt, np, stage, measured, cost_per_item, worker_group_known, held.as_ref()),
-    }))
+    })))
 }
 
 /// What an item was measured costing, over the counters stream when it is on.

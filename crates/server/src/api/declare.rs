@@ -136,12 +136,12 @@ pub async fn get_graph(
     Path((application, name)): Path<(String, String)>,
 ) -> ApiResult {
     let rt = find(&st, &application, &name)?;
-    ok(view(&st, &rt).await)
+    ok(view(&st, &rt).await?)
 }
 
 pub async fn get_graph_default(State(st): State<Shared>, Path(name): Path<String>) -> ApiResult {
     let rt = resolve(&st, &name)?;
-    ok(view(&st, &rt).await)
+    ok(view(&st, &rt).await?)
 }
 
 pub async fn del_graph(
@@ -314,12 +314,12 @@ async fn do_sync(st: &Shared, application: &str, bodies: Vec<Value>) -> ApiResul
 /// The budget bars read the counter itself — value AND `expiresAt` — so the
 /// console can render the window's remaining time, which v1 could not: its
 /// mirror was a copy of a state document with no expiry in it.
-pub async fn view(st: &Shared, rt: &Arc<GraphRuntime>) -> Value {
+pub async fn view(st: &Shared, rt: &Arc<GraphRuntime>) -> queen_mq::Result<Value> {
     let mut nodes = Vec::new();
     for (name, np) in &rt.plan.nodes {
         let keys: Vec<String> = np.unscoped().map(|b| b.key.clone()).collect();
-        let states = st.budgets.read(&keys).await.unwrap_or_default();
-        let breaker = crate::breaker::held(&st.budgets, np).await;
+        let states = st.budgets.read(&keys).await?;
+        let breaker = crate::breaker::held(&st.budgets, np).await?;
 
         let budgets: Vec<Value> = np
             .budgets
@@ -408,7 +408,7 @@ pub async fn view(st: &Shared, rt: &Arc<GraphRuntime>) -> Value {
         }));
     }
 
-    json!({
+    Ok(json!({
         "application": rt.doc.application,
         "graph": rt.doc.graph,
         "name": rt.doc.graph,
@@ -426,9 +426,12 @@ pub async fn view(st: &Shared, rt: &Arc<GraphRuntime>) -> Value {
             "hops": gate_core::plan::hop_names(p),
         })).collect::<Vec<_>>(),
         "spec": rt.doc,
-    })
+    }))
 }
 
 pub async fn view_response(st: &Shared, rt: &Arc<GraphRuntime>) -> impl IntoResponse {
-    Json(view(st, rt).await)
+    match view(st, rt).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => Fail::from(error).into_response(),
+    }
 }
