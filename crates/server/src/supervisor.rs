@@ -59,13 +59,14 @@ pub async fn start(
         }));
     }
 
+    let stopped = Arc::new(AtomicBool::new(false));
     let rt = Arc::new(GraphRuntime {
         doc,
         plan,
         stages,
         handles: parking_lot::RwLock::new(Vec::new()),
         persisted: AtomicBool::new(false),
-        stopped: AtomicBool::new(false),
+        stopped: stopped.clone(),
         cancel,
     });
 
@@ -80,6 +81,7 @@ pub async fn start(
             budgets.clone(),
             st.clone(),
             traces.clone(),
+            stopped.clone(),
         ));
     }
     *rt.handles.write() = handles;
