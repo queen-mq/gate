@@ -818,7 +818,13 @@ fn group(st: &StageRuntime, msgs: &[Message]) -> Grouped {
                     keys.len() - 1
                 }
             };
-            here.push((idx, cost));
+            // A shared key is one counter even when more than one budget on
+            // this node names it. The validator permits identical declarations
+            // deliberately; charging the same key once per declaration would
+            // multiply this message's cost and enforce a smaller limit.
+            if !here.iter().any(|(seen, _)| *seen == idx) {
+                here.push((idx, cost));
+            }
         }
         per_msg.push(here);
     }
@@ -1391,6 +1397,25 @@ mod tests {
         assert_eq!(charges.len(), 1, "one key, one incr");
         assert_eq!(charges[0].delta, 12);
         assert_eq!(charges[0].max, 100);
+    }
+
+    /// Two identical declarations may intentionally share one counter. They
+    /// remain one spend per message, not one spend per declaration.
+    #[test]
+    fn duplicate_shared_budgets_charge_their_counter_once() {
+        let mut first = budget("first", 100);
+        first.shared_key = Some("vendor".into());
+        let mut second = budget("second", 100);
+        second.key = first.key.clone();
+        second.shared_key = first.shared_key.clone();
+        let st = runtime(vec![first, second], 1.0);
+        let msgs: Vec<Message> = (0..3)
+            .map(|i| msg(&format!("t{i}"), json!({ "w": 4 })))
+            .collect();
+
+        let charges = group(&st, &msgs).charges(msgs.len());
+        assert_eq!(charges.len(), 1, "one shared key must produce one incr");
+        assert_eq!(charges[0].delta, 12, "the declarations doubled the cost");
     }
 
     /// A path's share IS the ceiling it carries: `round(count_sub * share)`.
