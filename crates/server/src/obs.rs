@@ -143,6 +143,9 @@ impl Trace {
             "path": self.path,
             "op": self.op,
             "outcome": self.outcome,
+            // Durable traces have always used the schema/API spelling. Keep the
+            // former live-only camelCase alias for one compatibility window.
+            "budget_id": self.budget_id,
             "budgetId": self.budget_id,
         })
     }

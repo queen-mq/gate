@@ -25,6 +25,8 @@ const WORD = {
 function tone(t) {
   return t.outcome === 'throttled' ? 'text-bad' : t.outcome === 'ok' ? 'text-fg-3' : 'text-fg-2'
 }
+
+const traceBudget = (t) => t.budget_id ?? t.budgetId
 </script>
 
 <template>
@@ -53,7 +55,7 @@ function tone(t) {
 
       <span class="truncate flex-1" :class="tone(t)">
         {{ t.reason || WORD[t.outcome] || t.outcome }}
-        <span v-if="t.budget_id" class="font-mono text-fg-3">· {{ t.budget_id }}</span>
+        <span v-if="traceBudget(t)" class="font-mono text-fg-3">· {{ traceBudget(t) }}</span>
       </span>
 
       <!-- A decision taken against a cap nobody published is worth flagging on
