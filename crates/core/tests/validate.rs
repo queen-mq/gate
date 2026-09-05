@@ -596,3 +596,44 @@ fn ingress_true_is_a_queue_gate_owns() {
     assert!(doc.nodes["prices"].ingress.as_ref().unwrap().http());
     assert!(!doc.nodes["messages"].ingress.as_ref().unwrap().http());
 }
+
+/// A queue that is both an egress and a source is only a cycle when work put
+/// there can come back to it. Two paths chained through one queue — `in` to
+/// `mid`, then `mid` to `out` — is a legal linear topology, and rejecting it
+/// would also stop the graph from restarting on the next boot.
+#[test]
+fn a_chain_through_one_queue_is_not_a_cycle() {
+    let chain: GraphDoc = serde_json::from_str(
+        r#"{"application":"a","graph":"g","version":1,
+            "nodes":{
+              "first": {"ingress":{"queue":"app.in"},
+                        "budgets":[{"id":"b1","count":100,"timeMs":1000}],
+                        "egress":"app.mid"},
+              "second":{"ingress":{"queue":"app.mid"},
+                        "budgets":[{"id":"b2","count":100,"timeMs":1000}],
+                        "egress":"app.out"}},
+            "paths":[{"name":"p1","nodes":["first"]},
+                     {"name":"p2","nodes":["second"]}]}"#,
+    )
+    .unwrap();
+    assert!(
+        !rules(&validate(&chain)).contains(&"queue-cycle"),
+        "`app.mid` is a hop, not a loop: {:?}",
+        validate(&chain)
+    );
+
+    // The real thing: what a node admits goes straight back to what it reads.
+    let loop_doc: GraphDoc = serde_json::from_str(
+        r#"{"application":"a","graph":"g","version":1,
+            "nodes":{"n":{"ingress":{"queue":"app.in"},
+                          "budgets":[{"id":"b","count":100,"timeMs":1000}],
+                          "egress":"app.in"}},
+            "paths":[{"name":"main","nodes":["n"]}]}"#,
+    )
+    .unwrap();
+    assert!(
+        rules(&validate(&loop_doc)).contains(&"queue-cycle"),
+        "{:?}",
+        validate(&loop_doc)
+    );
+}

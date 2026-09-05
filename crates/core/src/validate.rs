@@ -16,7 +16,7 @@
 //! `max-keys`, `store-fits`, `kv-chunk`: cardinality is Postgres rows with a
 //! TTL, not entries in a document Gate re-reads whole every cycle).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use crate::cost::ok_payload_path;
 use crate::doc::{ok_name, Confidence, Cost, GraphDoc, PathElem};
@@ -660,12 +660,37 @@ fn ownership(plan: &Plan, facts: &ExternalFacts, out: &mut Vec<Problem>) {
     // one-node target whose ingress and egress names are equal: each admitted
     // message is atomically pushed back into the queue it was just acked from
     // and circulates for ever, paying the budget on every turn.
-    let sources: HashSet<&str> = mine.keys().copied().collect();
+    // Reachability, not membership. A queue that is both an egress and a source
+    // is only a cycle if work put there can come BACK to it: `in -> mid -> out`
+    // spread over two paths makes `mid` a terminal destination of one and the
+    // source of the other, and that is a chain, not a loop. Walk the queue graph
+    // forward from each terminal destination and look for the queue itself.
+    let mut forward: HashMap<&str, Vec<&str>> = HashMap::new();
+    for stage in &plan.stages {
+        forward
+            .entry(stage.source.as_str())
+            .or_default()
+            .extend(stage.destinations.iter().map(|d| d.queue.as_str()));
+    }
+    let returns_to = |start: &str| -> bool {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut queue: VecDeque<&str> = forward.get(start).into_iter().flatten().copied().collect();
+        while let Some(next) = queue.pop_front() {
+            if next == start {
+                return true;
+            }
+            if !seen.insert(next) {
+                continue;
+            }
+            queue.extend(forward.get(next).into_iter().flatten().copied());
+        }
+        false
+    };
     let mut feedback: HashSet<&str> = HashSet::new();
     for stage in &plan.stages {
         for destination in &stage.destinations {
             if destination.terminal
-                && sources.contains(destination.queue.as_str())
+                && returns_to(destination.queue.as_str())
                 && feedback.insert(destination.queue.as_str())
             {
                 out.push(p(
