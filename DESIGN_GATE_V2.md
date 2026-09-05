@@ -1404,7 +1404,7 @@ three hardcoded fields are fixed (§13.12).
 |---|---|---|
 | `PUT /v1/apps/:app/targets/:name` | R | Declares a one-node graph. Response keeps `resolved` (now: ingress queue, egress queue, stage groups, budget keys) and `warnings`. Still 502 on a store write failure — a 200 with a 15-second fuse is a lie. |
 | `PUT /v1/targets/:name` (flat) | R | Kept, **and the parity trap is fixed**: the flat form now pins `application` from the resolved default rather than letting a body declare into another team's namespace. |
-| `PUT /v1/apps/:app/targets` (sync, reap) | R | Kept verbatim, including reap-after-declare and application scoping. Graph-owned nodes are exempt. |
+| `PUT /v1/apps/:app/targets` (sync, reap) | R | Kept, including reap-after-declare and application scoping. The authoritative inventory is read from the durable store as well as the local registry, because a sync may reach a replica before reconcile. An incomplete/refused sync reaps nothing. Multi-node graphs are exempt. |
 | `GET` target view (4 routes) | R | Fields re-sourced: budgets carry `key`, `count`, `timeMs`, `subWindows`, `value`, `expiresAt`, `utilisation` read live from KV. `utilisation` is still the **worst** counter, now across shared/scoped keys instead of across shards. |
 | `DELETE` target | R | Store-first, verbatim, including `registered: false` being a success. |
 | 409 version-bump | R | §12.3, with a much shorter trigger list. |

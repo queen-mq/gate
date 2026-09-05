@@ -7,6 +7,7 @@
 
 #![allow(deprecated)]
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
@@ -242,6 +243,34 @@ async fn do_sync(st: &Shared, application: &str, bodies: Vec<Value>) -> ApiResul
     let mut refused = Vec::new();
     let mut declared: Vec<String> = Vec::new();
 
+    // A sync may land on a replica before its registry has reconciled. The
+    // durable store is therefore part of the inventory to reap, not merely a
+    // place each local runtime happens to be deleted from. Incomplete is not
+    // empty: if even one page or row is unreadable, applying submitted targets
+    // is safe but treating unseen targets as absent is not.
+    let stored_targets = match crate::store::try_load_all(&st.queen).await {
+        Ok(stored) if stored.complete => stored
+            .items
+            .into_iter()
+            .filter(|doc| doc.application == application && doc.nodes.len() == 1)
+            .map(|doc| doc.graph)
+            .collect::<Vec<_>>(),
+        Ok(_) => {
+            refused.push(json!({
+                "target": "",
+                "error": "the stored target inventory is incomplete; submitted declarations may apply, but nothing omitted can be removed safely"
+            }));
+            Vec::new()
+        }
+        Err(e) => {
+            refused.push(json!({
+                "target": "",
+                "error": format!("the stored target inventory could not be read ({e}); submitted declarations may apply, but nothing omitted can be removed safely")
+            }));
+            Vec::new()
+        }
+    };
+
     for body in bodies {
         // The name comes from the document here, because a sync body is a list
         // and there is no path segment to pin it from.
@@ -280,27 +309,38 @@ async fn do_sync(st: &Shared, application: &str, bodies: Vec<Value>) -> ApiResul
     // repair/retry the list without recovering deleted configuration first.
     let mut removed = Vec::new();
     if refused.is_empty() {
-        for rt in st.registry.of_app(application) {
-            if declared.contains(&rt.doc.graph) {
+        let mut candidates: BTreeSet<String> = stored_targets.into_iter().collect();
+        candidates.extend(
+            st.registry
+                .of_app(application)
+                .into_iter()
+                .filter(|rt| rt.plan.nodes.len() == 1)
+                .map(|rt| rt.doc.graph.clone()),
+        );
+        for name in candidates {
+            if declared.contains(&name) {
                 continue;
             }
-            // A sync reaps what it could have DECLARED, and nothing else. v1
-            // exempted graph nodes from a target sync because a target list does not
-            // name them and reaping one would tear down half a topology; there are
-            // no node-targets any more, so the same rule is spelt as "a sync of
-            // targets does not delete a graph". A one-node graph IS a target and is
-            // fair game.
-            if rt.plan.nodes.len() > 1 {
+            // The store's copy decided that a name was a target; the RUNTIME
+            // decides whether this replica may reap it. A redeclare registers
+            // before it saves, so a graph that grew nodes and then failed to
+            // persist reads as a one-node document here and is a multi-node
+            // graph in the registry — and a sync of targets does not delete a
+            // graph. Asked before the store write, so a graph that is exempt
+            // keeps its document too.
+            let live = st.registry.get(application, &name);
+            if live.as_ref().is_some_and(|rt| rt.plan.nodes.len() > 1) {
                 continue;
             }
-            let name = rt.doc.graph.clone();
             if let Err(e) = crate::store::forget(&st.queen, application, &name).await {
                 tracing::warn!(graph = %name, error = %e, "sync: not reaped, the stored document could not be removed");
                 refused.push(json!({ "target": name, "error": format!("not reaped: {e}") }));
                 continue;
             }
-            crate::supervisor::stop(&rt).await;
-            st.registry.remove(application, &name);
+            if let Some(rt) = live {
+                crate::supervisor::stop(&rt).await;
+                st.registry.remove(application, &name);
+            }
             removed.push(name);
         }
     }
