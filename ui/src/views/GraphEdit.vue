@@ -52,6 +52,10 @@ const STARTER = {
   paths: [{ name: 'main', nodes: ['providerx'] }],
 }
 
+/* A load that failed leaves nothing safe to declare. Kept apart from `error`,
+   which a REFUSED SAVE also sets and which must not disable the button that
+   would let the operator try again. */
+const loadFailed = ref(false)
 let loadToken = 0
 
 async function loadDocument() {
@@ -59,6 +63,7 @@ async function loadDocument() {
   const app = application.value
   const name = props.name
   loading.value = true
+  loadFailed.value = false
   error.value = ''
   conflict.value = ''
   warnings.value = []
@@ -81,6 +86,12 @@ async function loadDocument() {
     text.value = JSON.stringify(doc, null, 2)
   } catch (e) {
     if (token !== loadToken) return
+    /* Drop the previous graph's document with it. Leaving it in the textarea
+       would put A's nodes, paths and budgets under B's title with Declare still
+       enabled — and `as_graph` sets `doc.graph` from the URL, so the server
+       would accept that write and replace B. */
+    text.value = ''
+    loadFailed.value = true
     error.value = e.message
   } finally {
     if (token === loadToken) loading.value = false
@@ -150,7 +161,7 @@ async function save() {
       <template #actions>
         <RouterLink v-if="editing" :to="graphPath(application, name)" class="btn">Cancel</RouterLink>
         <RouterLink v-else to="/graphs" class="btn">Cancel</RouterLink>
-        <button class="btn btn-primary" :disabled="!isAdmin || busy || loading" @click="save">
+        <button class="btn btn-primary" :disabled="!isAdmin || busy || loading || loadFailed" @click="save">
           <Icon name="check" :size="14" /> {{ busy ? 'Declaring…' : 'Declare' }}
         </button>
       </template>
