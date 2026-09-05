@@ -72,7 +72,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use gate_server::api;
-use queen_mq::{Config, Message, Queen, SubscriptionMode};
+use queen_mq::{Config, Expiry, Message, Queen, SubscriptionMode};
 use serde_json::{json, Value};
 
 fn queen_url() -> Option<String> {
@@ -1045,7 +1045,7 @@ async fn a_failed_transaction_after_a_successful_charge_refunds() {
     }
     tokio::time::sleep(Duration::from_secs(6)).await;
 
-    let key = h.key("g", "n", "b");
+    let key = gate_core::plan::shared_budget_key(&h.application, "vendor");
     let spent = h.counter(&key).await;
     assert_eq!(
         spent, 0,
@@ -2887,6 +2887,151 @@ async fn live_state_endpoints_do_not_invent_zero_during_a_kv_outage() {
     }
 
     faulty.allow();
+    h.cleanup("g").await;
+}
+
+/// A present counter whose VALUE is not a number is corrupt state, not zero.
+///
+/// The two halves of a counter row fail differently, on purpose. A value that
+/// is not an integer cannot be reasoned about at all, so it is an error and the
+/// charge gives back anything it can prove it wrote first. A missing or
+/// unreadable EXPIRY costs only the park deadline, which degrades to "retry
+/// now" — failing the charge over it would stop every path on that counter for
+/// ever, because a failed charge is redelivered and fails again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn malformed_budget_state_is_reported_and_a_failed_decode_is_refunded() {
+    let Some(h) = harness("badbudgetstate").await else {
+        return;
+    };
+    let out = egress_of("badbudgetstate", &h.application);
+    let budget = json!({
+        "id": "b",
+        "sharedKey": "vendor",
+        "count": 100,
+        "timeMs": 1000
+    });
+    let (status, body) = h.put_graph("g", one_node(&out, budget)).await;
+    assert_eq!(status, 200, "declare: {body}");
+
+    let key = gate_core::plan::shared_budget_key(&h.application, "vendor");
+    h.queen
+        .kv()
+        .put(
+            h.app.budgets.ns(),
+            &key,
+            json!("three"),
+            Expiry::seconds(60),
+        )
+        .send()
+        .await
+        .expect("plant a counter whose value is not a number");
+
+    let paths = [
+        format!("/v1/apps/{}/graphs/g", h.application),
+        format!("/v1/apps/{}/graphs/g/nodes/n/eta", h.application),
+        "/api/targets".into(),
+        "/api/budgets".into(),
+        format!("/v1/apps/{}/metrics", h.application),
+    ];
+    for path in paths {
+        let (status, body) = h.send(reqwest::Method::GET, &path, None).await;
+        assert_eq!(
+            status, 502,
+            "{path} reported the corrupt counter as zero: {body}"
+        );
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("live broker state"),
+            "{path}: {body}"
+        );
+    }
+
+    let error = h
+        .app
+        .budgets
+        .charge(&[gate_server::budget::Charge {
+            key: key.clone(),
+            max: 100,
+            ttl: 1,
+            delta: 2,
+            budget_id: "b".into(),
+        }])
+        .await
+        .expect_err("a returned counter whose value is not an integer must fail decoding");
+    assert!(error.to_string().contains("not an integer"), "{error}");
+    let raw = h
+        .app
+        .budgets
+        .get_raw(std::slice::from_ref(&key))
+        .await
+        .expect("read counter after refund");
+    assert_eq!(
+        raw.first().and_then(|row| row.value.clone()),
+        Some(json!("three")),
+        "the applied increment must be refunded before the decode error escapes"
+    );
+
+    // The other half: a counter with a real value and no expiry is READABLE.
+    // It loses its deadline and nothing else, so the graph keeps admitting.
+    h.app
+        .budgets
+        .clear(std::slice::from_ref(&key))
+        .await
+        .expect("remove corrupt counter");
+    h.queen
+        .kv()
+        .put(h.app.budgets.ns(), &key, json!(3), Expiry::forever())
+        .send()
+        .await
+        .expect("plant a counter with no window expiry");
+
+    let states = h
+        .app
+        .budgets
+        .read(std::slice::from_ref(&key))
+        .await
+        .expect("a counter without an expiry is readable, not an error");
+    assert_eq!(states.first().map(|s| s.value), Some(3), "{states:?}");
+    assert_eq!(
+        states.first().and_then(|s| s.expires_at_ms),
+        None,
+        "an unreadable expiry degrades to `retry now`"
+    );
+
+    let attempt = h
+        .app
+        .budgets
+        .charge(&[gate_server::budget::Charge {
+            key: key.clone(),
+            max: 100,
+            ttl: 1,
+            delta: 2,
+            budget_id: "b".into(),
+        }])
+        .await
+        .expect("a missing expiry must not fail the charge and stall the node");
+    assert!(
+        attempt.all_applied(),
+        "the charge is decided by the counter, not by its deadline: {attempt:?}"
+    );
+
+    let (status, body) = h
+        .send(
+            reqwest::Method::GET,
+            &format!("/v1/apps/{}/graphs/g", h.application),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "a readable counter must not 502: {body}");
+
+    h.app
+        .budgets
+        .clear(std::slice::from_ref(&key))
+        .await
+        .expect("remove the expiryless counter");
     h.cleanup("g").await;
 }
 

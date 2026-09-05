@@ -38,6 +38,7 @@
 //! items/s the key sees 170 incr/s against that 33k/s ceiling: two orders of
 //! magnitude of headroom.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use queen_mq::{Expiry, KvOperation, Queen, Result};
@@ -68,9 +69,87 @@ pub struct Charge {
 pub struct State {
     pub key: String,
     pub value: i64,
-    /// Epoch millis. `None` where the key was absent — which reads as *retry
-    /// now*, not *wait for ever*.
+    /// Epoch millis, and `None` reads as *retry now* rather than *wait for
+    /// ever*: a batch response that omitted its trailing read, or a row whose
+    /// expiry the broker did not render in a shape `parse_instant` knows. Only
+    /// the deadline degrades, which is not worth failing a charge over — see
+    /// `decode_state`.
     pub expires_at_ms: Option<i64>,
+}
+
+fn decode_state(row: &queen_mq::KvRow) -> Result<State> {
+    let value = row
+        .value
+        .as_ref()
+        .and_then(|value| value.as_i64())
+        .ok_or_else(|| {
+            queen_mq::Error::Decode(format!(
+                "budget counter `{}` is present but is not an integer",
+                row.key
+            ))
+        })?;
+    // An expiry we cannot read costs the PARK DEADLINE and nothing else: the
+    // caller degrades to "retry now", which is what an omitted read has always
+    // meant here. Refusing the whole decode instead would fail the CHARGE, and a
+    // failed charge is not a refusal — the relay reads it as "the batch did not
+    // happen", releases the claim and is handed the identical batch back. One
+    // row with a missing or unrenderable expiry would then stop every path on
+    // that counter for ever, at twice the write volume, admitting nothing.
+    //
+    // The VALUE above is a different case and stays an error: a counter that is
+    // not an integer cannot be reasoned about at all.
+    let expires_at_ms = match row.expires_at.as_deref() {
+        None => {
+            tracing::warn!(
+                key = %row.key,
+                "budget: this counter is present without an expiry, so its wait deadline \
+                 degrades to `retry now`. A counter row is created by `incr` with a TTL; one \
+                 without a TTL never rotates and should be deleted"
+            );
+            None
+        }
+        Some(raw) => match parse_instant(raw) {
+            Some(ms) => Some(ms),
+            None => {
+                tracing::warn!(
+                    key = %row.key, expires_at = %raw,
+                    "budget: this counter's expiry cannot be read, so its wait deadline \
+                     degrades to `retry now`"
+                );
+                None
+            }
+        },
+    };
+    Ok(State {
+        key: row.key.clone(),
+        value,
+        expires_at_ms,
+    })
+}
+
+fn decode_states<'a>(
+    rows: &[queen_mq::KvRow],
+    expected: impl IntoIterator<Item = &'a str>,
+) -> Result<Vec<State>> {
+    let expected: HashSet<&str> = expected.into_iter().collect();
+    let mut seen: HashSet<&str> = HashSet::with_capacity(rows.len());
+    let mut states = Vec::with_capacity(rows.len());
+    for row in rows {
+        if !expected.contains(row.key.as_str()) {
+            return Err(queen_mq::Error::Decode(format!(
+                "budget read returned unexpected key `{}`",
+                row.key
+            )));
+        }
+        if !seen.insert(row.key.as_str()) {
+            return Err(queen_mq::Error::Decode(format!(
+                "budget read returned key `{}` more than once",
+                row.key
+            )));
+        }
+        states.push(decode_state(row)?);
+    }
+    Ok(states)
 }
 
 /// One charge attempt, index-aligned to the charges that produced it.
@@ -313,11 +392,26 @@ impl Budgets {
             // the same numbers, minus the expiry — so the prefix arithmetic
             // still works and only the park deadline degrades to "retry now".
             match results.last().and_then(|r| r.rows.as_ref()) {
-                Some(rows) => states.extend(rows.iter().map(|r| State {
-                    key: r.key.clone(),
-                    value: r.value.as_ref().and_then(|v| v.as_i64()).unwrap_or(0),
-                    expires_at_ms: r.expires_at.as_deref().and_then(parse_instant),
-                })),
+                Some(rows) => {
+                    let decoded = decode_states(rows, chunk.iter().map(|c| c.key.as_str()));
+                    match decoded {
+                        Ok(decoded) => states.extend(decoded),
+                        Err(error) => {
+                            // The writes in this chunk may already have landed.
+                            // A malformed read cannot return their Attempt to
+                            // the relay, so refund every applied charge whose
+                            // post-value proves which window it reached.
+                            let done = (n * MAX_WRITES_PER_CALL + chunk.len()).min(charges.len());
+                            let attempt = Attempt {
+                                applied: applied.clone(),
+                                post: post.clone(),
+                                states: Vec::new(),
+                            };
+                            self.refund(&attempt.refunds(&charges[..done])).await;
+                            return Err(error);
+                        }
+                    }
+                }
                 None => states.extend(chunk.iter().enumerate().map(|(i, c)| {
                     State {
                         key: c.key.clone(),
@@ -464,16 +558,10 @@ impl Budgets {
             return Ok(Vec::new());
         }
         let res = self.queen.kv().get_many(&self.ns, keys.to_vec()).await?;
-        Ok(res
-            .rows
-            .unwrap_or_default()
-            .iter()
-            .map(|r| State {
-                key: r.key.clone(),
-                value: r.value.as_ref().and_then(|v| v.as_i64()).unwrap_or(0),
-                expires_at_ms: r.expires_at.as_deref().and_then(parse_instant),
-            })
-            .collect())
+        decode_states(
+            res.rows.as_deref().unwrap_or_default(),
+            keys.iter().map(String::as_str),
+        )
     }
 
     /// Spend a window outright — the breaker.
@@ -579,6 +667,50 @@ pub fn parse_instant(s: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(value: serde_json::Value, expires_at: Option<&str>) -> queen_mq::KvRow {
+        queen_mq::KvRow {
+            key: "budget:a:g:n:b".into(),
+            value: Some(value),
+            version: 1,
+            expires_at: expires_at.map(str::to_string),
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn a_present_budget_counter_requires_an_integer_and_an_expiry() {
+        let state =
+            decode_state(&row(json!(7), Some("2025-08-21T08:00:00Z"))).expect("valid counter row");
+        assert_eq!(state.value, 7);
+        assert_eq!(state.expires_at_ms, Some(1_755_763_200_000));
+
+        assert!(decode_state(&row(json!("7"), Some("2025-08-21T08:00:00Z"))).is_err());
+        // The deadline, and only the deadline, degrades.
+        assert_eq!(
+            decode_state(&row(json!(7), None))
+                .expect("readable")
+                .expires_at_ms,
+            None
+        );
+        assert_eq!(
+            decode_state(&row(json!(7), Some("not-a-time")))
+                .expect("readable")
+                .expires_at_ms,
+            None
+        );
+    }
+
+    #[test]
+    fn a_budget_read_accepts_only_the_keys_it_asked_for_once() {
+        let valid = row(json!(7), Some("2025-08-21T08:00:00Z"));
+        assert!(decode_states(std::slice::from_ref(&valid), [valid.key.as_str()]).is_ok());
+        assert!(decode_states(&[valid.clone(), valid.clone()], [valid.key.as_str()]).is_err());
+
+        let mut unexpected = valid;
+        unexpected.key = "budget:somebody-else".into();
+        assert!(decode_states(&[unexpected], ["budget:a:g:n:b"]).is_err());
+    }
 
     #[test]
     fn a_broker_timestamp_parses_in_every_shape_it_arrives_in() {
