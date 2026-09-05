@@ -209,6 +209,7 @@ with no broker configured, which is green lines that verified nothing. CI sets
 | `GATE_MAX_PARK_MS` | 30000 | how long a handler holds its claim waiting for a window before releasing |
 | `GATE_INTERIOR_SEED_SKEW_SECONDS` | 120 | how far before a graph's start a new group on an **interior** queue is seeded; a margin for Gate's clock against the broker's, capped at 600 |
 | `GATE_RECONCILE_SECONDS` | 15 | how often a replica re-reads the store |
+| `GATE_MAX_PUSH_BODY_BYTES` | 8388608 | the largest body a **push** route buffers, clamped to 2 MiB–64 MiB. 2 MiB is axum's default, which is what applied to everything until 2026-09-04 because nothing set one; the ceiling is there because the limit is a per-request memory reservation and nothing bounds how many requests hold one at once. Document routes keep the default |
 
 **Where a new consumer group starts, and it is two rules.** On an **ingress** queue — yours, or
 Gate's own HTTP front door — a new group is seeded at the *head* of the retained log, because a
