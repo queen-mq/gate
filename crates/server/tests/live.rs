@@ -2157,38 +2157,60 @@ async fn a_partially_refused_sync_reaps_nothing() {
         return;
     };
     let out = egress_of("sync-refusal", &h.application);
-    let (status, body) = h.put_graph("keep", one_node(&out, wide("b"))).await;
-    assert_eq!(status, 200, "initial declare: {body}");
+    // Two targets, so the list that follows is PARTIALLY valid and one target is
+    // omitted from it. A sync naming nothing valid would prove much less.
+    for name in ["keep", "drop"] {
+        let (status, body) = h
+            .put_graph(name, one_node(&format!("{out}.{name}"), wide("b")))
+            .await;
+        assert_eq!(status, 200, "initial declare of {name}: {body}");
+    }
 
+    let mut valid = one_node(&format!("{out}.keep"), wide("b"));
+    valid["application"] = json!(h.application);
+    valid["graph"] = json!("keep");
     let (status, result) = h
         .send(
             reqwest::Method::PUT,
             &format!("/v1/apps/{}/targets", h.application),
-            Some(json!([{
-                "application": h.application,
-                "graph": "broken",
-                "version": 1,
-                "nodes": {},
-                "paths": []
-            }])),
+            Some(json!([
+                valid,
+                {
+                    "application": h.application,
+                    "graph": "broken",
+                    "version": 1,
+                    "nodes": {},
+                    "paths": []
+                }
+            ])),
         )
         .await;
     assert_eq!(status, 200, "sync response: {result}");
     assert_eq!(result["ok"], json!(false), "the invalid graph must fail");
+    assert_eq!(
+        result["applied"],
+        json!(["keep"]),
+        "a valid document in the list still applies: {result}"
+    );
     assert_eq!(
         result["removed"],
         json!([]),
         "a partial sync may reap nothing"
     );
 
-    let (status, view) = h.get_graph("keep").await;
-    assert_eq!(
-        status, 200,
-        "the omitted valid target was deleted by a refused sync: {view}"
-    );
-    assert!(view["running"].as_bool().unwrap_or(false), "{view}");
+    // `drop` is the one the caller left out. A refusal anywhere in the list is
+    // what makes the list unfit to authorise a deletion.
+    for name in ["keep", "drop"] {
+        let (status, view) = h.get_graph(name).await;
+        assert_eq!(
+            status, 200,
+            "`{name}` was deleted by a refused sync: {view}"
+        );
+        assert!(view["running"].as_bool().unwrap_or(false), "{name}: {view}");
+    }
 
     h.cleanup("keep").await;
+    h.cleanup("drop").await;
 }
 
 /// The routes that are gone say where to go instead.
