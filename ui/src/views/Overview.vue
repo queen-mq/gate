@@ -27,10 +27,10 @@ async function load() {
     const [ov, ts, bs] = await Promise.all([
       api.get('/api/overview'),
       api.get('/api/targets'),
-      // The breach log is written by a consumer that may not be running, and a
-      // console that refuses to render because its optional history is absent
-      // would be useless exactly when the gate itself is the only thing up.
-      api.get('/api/breaches/recent?limit=10').catch(() => null),
+      // An empty breach log is a successful empty array. A failed read is not
+      // equivalent: without it this page cannot truthfully claim that every
+      // target is below the vendor's real cap.
+      api.get('/api/breaches/recent?limit=10'),
     ])
     overview.value = ov
     targets.value = ts

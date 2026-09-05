@@ -32,9 +32,9 @@ async function load() {
   if (outcome.value !== 'all') qs.set('outcome', outcome.value)
   try {
     const [tr, ts] = await Promise.all([
-      // A build with no trace log is not a broken console; it is a console
-      // with nothing to show on one page.
-      api.get(`/api/traces?${qs.toString()}`).catch(() => null),
+      // No trace log is a successful empty response. A configured history
+      // store that cannot be read must reach this page's error state instead.
+      api.get(`/api/traces?${qs.toString()}`),
       api.get('/api/targets').catch(() => []),
     ])
     raw.value = tr === null ? null : (Array.isArray(tr) ? tr : (tr?.traces ?? []))
