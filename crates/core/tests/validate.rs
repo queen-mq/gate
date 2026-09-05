@@ -380,6 +380,40 @@ fn an_ingress_queue_claimed_elsewhere_in_the_fleet_is_refused() {
     assert!(got.contains(&"ingress-owner"), "{got:?}");
 }
 
+/// A named ingress can spell one of Gate's derived interior names. It is still
+/// one physical queue, so treating the two appearances as different logical
+/// sources duplicates the stream under two consumer groups.
+#[test]
+fn a_named_ingress_may_not_alias_an_interior_queue() {
+    let got = broken(|d| {
+        d.nodes.get_mut("messages").unwrap().ingress =
+            Some(Ingress::Named(gate_core::IngressSpec {
+                queue: Some("gate.channel.airbnb.ip.in".into()),
+                partitions: None,
+                http: None,
+                shed: None,
+            }));
+    });
+    assert!(got.contains(&"ingress-owner"), "{got:?}");
+}
+
+/// Node-cycle validation cannot see a loop made only by physical queue names.
+/// Without this refusal the relay acks each input and atomically pushes its
+/// output back into the same queue, for ever.
+#[test]
+fn an_egress_may_not_feed_a_source_of_the_same_graph() {
+    let doc: GraphDoc = serde_json::from_str(
+        r#"{"application":"a","graph":"g","version":1,
+            "nodes":{"n":{"ingress":{"queue":"loop"},
+                          "budgets":[{"id":"b","count":100,"timeMs":1000}],
+                          "egress":"loop"}},
+            "paths":[{"name":"main","nodes":["n"]}]}"#,
+    )
+    .unwrap();
+    let got = rules(&validate(&doc));
+    assert!(got.contains(&"queue-cycle"), "{got:?}");
+}
+
 // ------------------------------------------------------------------ warnings
 
 /// A kv TTL is whole seconds, so a window declared under one is enforced at one
@@ -561,4 +595,45 @@ fn ingress_true_is_a_queue_gate_owns() {
     // application already pushes to with its own SDK.
     assert!(doc.nodes["prices"].ingress.as_ref().unwrap().http());
     assert!(!doc.nodes["messages"].ingress.as_ref().unwrap().http());
+}
+
+/// A queue that is both an egress and a source is only a cycle when work put
+/// there can come back to it. Two paths chained through one queue — `in` to
+/// `mid`, then `mid` to `out` — is a legal linear topology, and rejecting it
+/// would also stop the graph from restarting on the next boot.
+#[test]
+fn a_chain_through_one_queue_is_not_a_cycle() {
+    let chain: GraphDoc = serde_json::from_str(
+        r#"{"application":"a","graph":"g","version":1,
+            "nodes":{
+              "first": {"ingress":{"queue":"app.in"},
+                        "budgets":[{"id":"b1","count":100,"timeMs":1000}],
+                        "egress":"app.mid"},
+              "second":{"ingress":{"queue":"app.mid"},
+                        "budgets":[{"id":"b2","count":100,"timeMs":1000}],
+                        "egress":"app.out"}},
+            "paths":[{"name":"p1","nodes":["first"]},
+                     {"name":"p2","nodes":["second"]}]}"#,
+    )
+    .unwrap();
+    assert!(
+        !rules(&validate(&chain)).contains(&"queue-cycle"),
+        "`app.mid` is a hop, not a loop: {:?}",
+        validate(&chain)
+    );
+
+    // The real thing: what a node admits goes straight back to what it reads.
+    let loop_doc: GraphDoc = serde_json::from_str(
+        r#"{"application":"a","graph":"g","version":1,
+            "nodes":{"n":{"ingress":{"queue":"app.in"},
+                          "budgets":[{"id":"b","count":100,"timeMs":1000}],
+                          "egress":"app.in"}},
+            "paths":[{"name":"main","nodes":["n"]}]}"#,
+    )
+    .unwrap();
+    assert!(
+        rules(&validate(&loop_doc)).contains(&"queue-cycle"),
+        "{:?}",
+        validate(&loop_doc)
+    );
 }

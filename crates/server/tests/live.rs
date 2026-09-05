@@ -2144,6 +2144,49 @@ async fn one_owner_per_ingress_queue() {
     h.cleanup("second").await;
 }
 
+/// Gate-owned interior queues participate in the same fleet-wide ownership
+/// rule as declared ingress queues. Calling one a "user ingress" in another
+/// graph must not create a second consumer that forwards every internal frame.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn another_graph_cannot_claim_an_interior_queue_as_its_ingress() {
+    let Some(h) = harness("interior-owner").await else {
+        return;
+    };
+    let mut owner = chain_doc();
+    owner["nodes"]["ip"]["egress"] = json!(egress_of("interior-owner-a", &h.application));
+    let (status, body) = h.put_graph("first", owner).await;
+    assert_eq!(status, 200, "declare owner: {body}");
+
+    let interior = gate_core::plan::interior_queue(&h.application, "first", "ip");
+    let borrower = json!({
+      "version": 1,
+      "nodes": {
+        "n": {
+          "ingress": { "queue": interior },
+          "budgets": [wide("b")],
+          "egress": egress_of("interior-owner-b", &h.application)
+        }
+      },
+      "paths": [{ "name": "main", "nodes": ["n"] }]
+    });
+    let (status, refused) = h.put_graph("second", borrower).await;
+    assert!(
+        status == 409 || status == 422,
+        "an interior queue must keep its one owner, got {status}: {refused}"
+    );
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("already the source"),
+        "the refusal must identify the ownership collision: {refused}"
+    );
+
+    h.cleanup("first").await;
+    h.cleanup("second").await;
+}
+
 /// The routes that are gone say where to go instead.
 ///
 /// A 404 would read as "wrong URL" and send somebody hunting; a 410 with the

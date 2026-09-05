@@ -115,17 +115,14 @@ pub async fn declare_locked(
         if let Ok(stored) = crate::store::try_load_all(&app.queen).await {
             for other in stored.items.iter().filter(|d| d.key() != key) {
                 let mine = gate_core::compile(other);
-                for (node, np) in &mine.nodes {
-                    let Some(q) = &np.ingress_queue else { continue };
-                    if plan
-                        .nodes
-                        .values()
-                        .any(|n| n.ingress_queue.as_deref() == Some(q.as_str()))
-                    {
+                for owner in &mine.stages {
+                    let q = &owner.source;
+                    if plan.stages.iter().any(|candidate| candidate.source == *q) {
                         return Err(Refusal::Conflict(format!(
-                            "`{q}` is already the ingress of node `{node}` in graph `{}` (declared \
-                             on another replica). Two consumers of one queue in different groups \
+                            "`{q}` is already the source of node `{}` in graph `{}` (declared on \
+                             another replica). Two consumers of one queue in different groups \
                              each get every message, which doubles what leaves.",
+                            owner.node,
                             other.key()
                         )));
                     }
