@@ -333,6 +333,7 @@ pub async fn view(st: &Shared, rt: &Arc<GraphRuntime>) -> Value {
                     "key": b.key,
                     "scopeBy": b.scope_by,
                     "sharedKey": b.shared_key,
+                    "whenOp": b.when_op,
                     "count": b.count,
                     "timeMs": b.time_ms,
                     "subWindows": b.sub_windows,

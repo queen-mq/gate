@@ -90,6 +90,10 @@ export function perMinute(rows, path = null) {
 */
 export function budgetSeries(minutes, budget) {
   if (!minutes) return null
+  // Roll-ups have node/path dimensions, but no scope value or operation. A
+  // percentage for either kind of selective budget would use unrelated work in
+  // its numerator, so leave it unknown instead of drawing a false zero/peak.
+  if (budget?.scopeBy || budget?.whenOp?.length) return null
   // The SUB-window and its count, because that is what is enforced: a budget
   // declared over ten seconds and subdivided into ten is a one-second window of
   // a tenth, and drawing the declared pair would draw a ceiling nothing meets.
@@ -99,7 +103,13 @@ export function budgetSeries(minutes, budget) {
   const allowance = p > 0 ? cap * ((span * 60) / p) : 0
   const out = minutes.map((w, i) => {
     let sum = 0
-    for (let k = Math.max(0, i - span + 1); k <= i; k++) sum += minutes[k].admitted
+    for (let k = Math.max(0, i - span + 1); k <= i; k++) {
+      // Rows written before cost rollups existed legitimately contain zero in
+      // that column. Costs are positive, so admitted is a safe legacy fallback.
+      sum += (minutes[k].cost_estimated ?? 0) > 0
+        ? minutes[k].cost_estimated
+        : (minutes[k].admitted ?? 0)
+    }
     return { ...w, utilisation: allowance > 0 ? sum / allowance : 0 }
   })
   // A trailing sum that has not filled yet is not a low utilisation, it is an

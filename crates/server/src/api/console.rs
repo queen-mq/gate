@@ -324,6 +324,9 @@ pub async fn flow(State(app): State<Shared>, Query(q): Query<FlowQuery>) -> ApiR
         for (name, np) in &g.plan.nodes {
             let per_min = np
                 .unscoped()
+                // A target-level rollup has no operation dimension, so it
+                // cannot be compared honestly with an operation-only budget.
+                .filter(|b| b.when_op.is_none())
                 .map(|b| b.count_sub as f64 * 60.0 / b.window_sub_seconds.max(1) as f64)
                 .fold(f64::INFINITY, f64::min);
             if per_min.is_finite() && per_min > 0.0 {
@@ -342,20 +345,22 @@ pub async fn flow(State(app): State<Shared>, Query(q): Query<FlowQuery>) -> ApiR
         utilisation: f64,
         target: String,
         admitted: i64,
+        cost: f64,
         ceiling: f64,
         total: i64,
     }
     let mut cells: HashMap<(String, i64), Cell> = HashMap::new();
     let mut minute_set: BTreeSet<i64> = BTreeSet::new();
 
-    for (application, target, minute, admitted) in h.flow(minutes, now).await {
+    for (application, target, minute, admitted, cost) in h.flow(minutes, now).await {
         minute_set.insert(minute);
         let cap = ceiling.get(&(application.clone(), target.clone())).copied();
-        let u = cap.map_or(0.0, |c| admitted as f64 / c);
+        let u = cap.map_or(0.0, |c| cost / c);
         let e = cells.entry((application.clone(), minute)).or_insert(Cell {
             utilisation: 0.0,
             target: target.clone(),
             admitted: 0,
+            cost: 0.0,
             ceiling: cap.unwrap_or(0.0),
             total: 0,
         });
@@ -364,6 +369,7 @@ pub async fn flow(State(app): State<Shared>, Query(q): Query<FlowQuery>) -> ApiR
             e.utilisation = u;
             e.target = target;
             e.admitted = admitted;
+            e.cost = cost;
             e.ceiling = cap.unwrap_or(0.0);
         }
     }
@@ -378,12 +384,14 @@ pub async fn flow(State(app): State<Shared>, Query(q): Query<FlowQuery>) -> ApiR
                 .map(|t| match cells.get(&(a.clone(), *t)) {
                     Some(c) => json!({
                         "t": t, "utilisation": c.utilisation, "target": c.target,
-                        "admitted": c.admitted, "ceiling": c.ceiling, "total_admitted": c.total,
+                        "admitted": c.admitted, "cost": c.cost,
+                        "ceiling": c.ceiling, "total_admitted": c.total,
                     }),
                     // A minute an application did not appear in is a minute it
                     // admitted nothing, which is a real zero and not a gap.
                     None => {
-                        json!({ "t": t, "utilisation": 0.0, "admitted": 0, "total_admitted": 0 })
+                        json!({ "t": t, "utilisation": 0.0, "admitted": 0,
+                                "cost": 0.0, "total_admitted": 0 })
                     }
                 })
                 .collect();

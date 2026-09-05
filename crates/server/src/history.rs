@@ -287,19 +287,22 @@ impl History {
     // counter now, so N ceilings cannot oversubscribe it, and the whole argument
     // evaporates with the feature.
 
-    /// Admissions per minute for every target, over the last `minutes`.
+    /// Admissions and admitted cost per minute for every target, over the last
+    /// `minutes`.
     ///
     /// One query for the whole deployment rather than one per target: the
     /// dashboard draws every application at once, and N round trips to draw one
     /// picture is how a console starts costing more than the thing it watches.
-    pub async fn flow(&self, minutes: i64, now_ms: i64) -> Vec<(String, String, i64, i64)> {
+    pub async fn flow(&self, minutes: i64, now_ms: i64) -> Vec<(String, String, i64, i64, f64)> {
         let Ok(client) = self.pool.get().await else {
             return vec![];
         };
         let since = now_ms / 60_000 * 60_000 - minutes * 60_000;
         let rows = client
             .query(
-                "SELECT application, target, minute, COALESCE(SUM(admitted), 0)::BIGINT
+                "SELECT application, target, minute,
+                        COALESCE(SUM(admitted), 0)::BIGINT,
+                        COALESCE(NULLIF(SUM(cost_est), 0), SUM(admitted)::DOUBLE PRECISION, 0)
                  FROM gate.rollups WHERE minute >= $1
                  GROUP BY application, target, minute
                  ORDER BY minute",
@@ -314,6 +317,7 @@ impl History {
                     r.try_get::<_, String>(1).ok()?,
                     r.try_get::<_, i64>(2).ok()?,
                     r.try_get::<_, i64>(3).ok()?,
+                    r.try_get::<_, f64>(4).ok()?,
                 ))
             })
             .collect()
