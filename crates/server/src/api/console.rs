@@ -323,7 +323,7 @@ pub async fn flow(State(app): State<Shared>, Query(q): Query<FlowQuery>) -> ApiR
     for g in app.registry.all() {
         for (name, np) in &g.plan.nodes {
             let per_min = np
-                .node_wide()
+                .node_wide_rates()
                 .map(|b| b.count_sub as f64 * 60.0 / b.window_sub_seconds.max(1) as f64)
                 .fold(f64::INFINITY, f64::min);
             if per_min.is_finite() && per_min > 0.0 {

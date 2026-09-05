@@ -817,7 +817,7 @@ pub fn compile_with(doc: &GraphDoc, opts: &PlanOpts) -> Plan {
 fn fitting_batch(np: &NodePlan, share: f64, declared: u32) -> u32 {
     let per_item = np.cost.default_value().max(1);
     let fits = np
-        .node_wide()
+        .node_wide_rates()
         .map(|b| (b.max_for(share) / per_item).max(1))
         .min();
     match fits {
@@ -862,8 +862,7 @@ fn fitting_batch(np: &NodePlan, share: f64, declared: u32) -> u32 {
 fn fitting_workers(np: &NodePlan, share: f64, partitions: u32, lane_capacity: u32) -> u32 {
     let capacity = lane_capacity.max(1) as f64;
     let tightest = np
-        .node_wide()
-        .filter(|b| b.id != PASSTHROUGH_BUDGET_ID)
+        .node_wide_rates()
         .map(|b| b.max_for(share) as f64 / b.window_sub_seconds.max(1) as f64)
         .fold(f64::INFINITY, f64::min);
     if !tightest.is_finite() {
@@ -1032,6 +1031,24 @@ impl NodePlan {
     /// counters apply to a subset whose size those calculations cannot know.
     pub fn node_wide(&self) -> impl Iterator<Item = &CompiledBudget> {
         self.unscoped().filter(|b| b.when_op.is_none())
+    }
+
+    /// The node-wide budgets that are a MEASUREMENT, which is a different
+    /// question from [`NodePlan::node_wide`] and the reason the two are separate.
+    ///
+    /// `node-unscoped-budget` asks whether some counter every item meets exists,
+    /// and the migration's [`PASSTHROUGH_BUDGET_ID`] is there precisely to
+    /// answer it for a v1 node that declared no limit of its own. But a million
+    /// a second is a sentinel and not a rate: used as a denominator it answers
+    /// every question with "there is room" — an ETA of zero, a utilisation near
+    /// zero, a claim sized against a limit nobody declared.
+    ///
+    /// So scheduling, the ETA and utilisation read this one, and a node with
+    /// nothing here has no node-wide rate at all. That is the honest answer:
+    /// what such a node forwards is bounded by the tight node downstream of it,
+    /// not by itself.
+    pub fn node_wide_rates(&self) -> impl Iterator<Item = &CompiledBudget> {
+        self.node_wide().filter(|b| b.id != PASSTHROUGH_BUDGET_ID)
     }
 
     /// The widest ceiling any path can reach at this node — what the breaker

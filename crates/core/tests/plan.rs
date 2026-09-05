@@ -798,3 +798,40 @@ const VRBO: &str = r#"
 
 const PATHS_WITH_REVIEWS: &str = r#""paths": [
     { "name": "reviews", "nodes": ["reviews", "partner"] },"#;
+
+/// The migration's passthrough is a sentinel, not a measurement, and every
+/// node-wide aggregate has to agree about that. `fitting_workers` always did;
+/// the batch, the ETA and the flow ceiling reached it through `node_wide` and
+/// would have read a million a second as this node's real rate.
+#[test]
+fn the_passthrough_sentinel_is_not_a_node_wide_rate() {
+    let mut doc: gate_core::GraphDoc = serde_json::from_str(
+        r#"{"application":"a","graph":"g","version":1,
+            "nodes":{"n":{"ingress":true,"egress":"a.g.out","budgets":[
+                {"id":"real","count":100,"timeMs":1000,"whenOp":["listing.update"]}]}},
+            "paths":[{"name":"main","nodes":["n"]}]}"#,
+    )
+    .unwrap();
+    // What the v1 migration adds to a node carrying only conditional budgets.
+    doc.nodes.get_mut("n").unwrap().budgets.push(
+        serde_json::from_str(r#"{"id":"passthrough","count":1000000,"timeMs":1000}"#).unwrap(),
+    );
+
+    let p = compile(&doc);
+    let np = p.node("n").unwrap();
+    assert_eq!(
+        np.node_wide().count(),
+        1,
+        "`node-unscoped-budget` is satisfied: the sentinel IS met by every item"
+    );
+    assert_eq!(
+        np.node_wide_rates().count(),
+        0,
+        "but it is not a rate, so no aggregate may divide by it"
+    );
+    assert!(
+        gate_core::validate(&doc).is_empty(),
+        "a migrated node must still declare clean: {:?}",
+        gate_core::validate(&doc)
+    );
+}

@@ -148,7 +148,7 @@ pub async fn view(app: &Shared, rt: &Arc<GraphRuntime>, node: &str, path: &str) 
     let want = waiting_for_budget as f64 * cost_per_item;
 
     // ---- rate.
-    let keys: Vec<String> = np.node_wide().map(|b| b.key.clone()).collect();
+    let keys: Vec<String> = np.node_wide_rates().map(|b| b.key.clone()).collect();
     let states = app.budgets.read(&keys).await.unwrap_or_default();
 
     let bound = binding_schedule(np, stage.share, &states, want, now);
@@ -198,7 +198,7 @@ fn binding_schedule<'a>(
     now: i64,
 ) -> Option<(&'a CompiledBudget, Schedule)> {
     let mut bound: Option<(&CompiledBudget, Schedule)> = None;
-    for b in np.node_wide() {
+    for b in np.node_wide_rates() {
         let s = states.iter().find(|s| s.key == b.key);
         let sched = admits(
             b.max_for(share),
