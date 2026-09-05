@@ -2780,8 +2780,9 @@ async fn the_reconcile_loop_converges_a_second_replica_on_its_own() {
 
 /// A depth the broker will not report is unavailable, not the last value it did.
 ///
-/// The failure is cached for one TTL, so an honest outage still costs one round
-/// trip rather than one per caller.
+/// The failure is cached for one TTL, so an honest outage still costs one Queen
+/// request (the client retries that request three times) rather than one request
+/// per caller.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn a_depth_the_broker_will_not_report_never_becomes_zero_or_stale() {
@@ -2820,8 +2821,8 @@ async fn a_depth_the_broker_will_not_report_never_becomes_zero_or_stale() {
     }
     assert_eq!(
         faulty.hits("/depth"),
-        1,
-        "the failure must be cached for the same TTL as an answer"
+        3,
+        "the failure must be cached after one client request and its retries"
     );
     faulty.allow();
 }
@@ -2858,7 +2859,8 @@ async fn an_eta_against_an_older_broker_still_costs_one_probe_per_ttl() {
 ///
 /// Every endpoint below used to consume the cache's default or stale map as if
 /// it were a live answer. They now fail together, while the cached failure
-/// keeps several page requests from repeating the same broken admin call.
+/// keeps several page requests from repeating the same broken admin call. The
+/// default Queen client makes three HTTP attempts for that one call.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn live_state_endpoints_do_not_invent_zero_during_a_depth_outage() {
@@ -2903,8 +2905,8 @@ async fn live_state_endpoints_do_not_invent_zero_during_a_depth_outage() {
     }
     assert_eq!(
         faulty.hits("/depth"),
-        1,
-        "the failed read must be cached across page endpoints"
+        3,
+        "the failed read must be cached across page endpoints after one client request"
     );
 
     faulty.allow();
