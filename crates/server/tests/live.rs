@@ -2187,6 +2187,124 @@ async fn another_graph_cannot_claim_an_interior_queue_as_its_ingress() {
     h.cleanup("second").await;
 }
 
+/// Unknown remote ownership is not the same thing as an unowned queue.
+///
+/// The local registry is deliberately empty: this is the replica on which the
+/// old best-effort store scan silently turned both a transport error and an
+/// incomplete inventory into permission to start a second consumer group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn a_fresh_replica_fails_closed_when_source_ownership_cannot_be_verified() {
+    let Some((h, faulty)) = faulty_harness("owner-unknown").await else {
+        assert!(std::env::var("GATE_TEST_REQUIRE_LIVE").is_err());
+        return;
+    };
+    let shared_in = format!("test.owner-unknown.{}.in", h.application);
+    let doc = |egress: &str| {
+        json!({
+          "version": 1,
+          "nodes": {
+            "n": { "ingress": { "queue": shared_in }, "budgets": [wide("b")], "egress": egress }
+          },
+          "paths": [{ "name": "main", "nodes": ["n"] }]
+        })
+    };
+
+    let (status, body) = h.put_graph("first", doc("test.owner-unknown.a")).await;
+    assert_eq!(status, 200, "declare: {body}");
+
+    let second = serve(&faulty.url).await;
+    assert!(second.registry.all().is_empty());
+    let second_base = spawn_server(second.clone()).await;
+    let client = reqwest::Client::new();
+
+    // A transport failure used to be swallowed by `if let Ok(stored)`.
+    faulty.refuse("getPrefix");
+    let res = client
+        .put(format!(
+            "{second_base}/v1/apps/{}/graphs/second",
+            h.application
+        ))
+        .json(&doc("test.owner-unknown.b"))
+        .send()
+        .await
+        .expect("declare against unreadable inventory");
+    faulty.allow();
+    let status = res.status().as_u16();
+    let body: Value = res.json().await.unwrap_or(Value::Null);
+    assert_eq!(status, 502, "the failed ownership read was ignored: {body}");
+    assert!(
+        body.to_string().contains("exclusive ownership"),
+        "the refusal should name the safety property: {body}"
+    );
+    assert!(second.registry.all().is_empty());
+
+    // An unreadable document is an equally incomplete inventory. It may be a
+    // newer Gate document whose source this build cannot decode.
+    let namespace = gate_server::budget::namespace();
+    let corrupt_key = format!("graph:{}:newer", h.application);
+    h.queen
+        .kv()
+        .put(
+            &namespace,
+            &corrupt_key,
+            json!({ "fromAFutureGate": true }),
+            queen_mq::Expiry::forever(),
+        )
+        .send()
+        .await
+        .expect("plant unreadable document");
+    let res = client
+        .put(format!(
+            "{second_base}/v1/apps/{}/graphs/second",
+            h.application
+        ))
+        .json(&doc("test.owner-unknown.b"))
+        .send()
+        .await
+        .expect("declare against incomplete inventory");
+    let status = res.status().as_u16();
+    let body: Value = res.json().await.unwrap_or(Value::Null);
+    assert_eq!(status, 502, "the incomplete inventory was ignored: {body}");
+    assert!(
+        body.to_string().contains("inventory is incomplete"),
+        "{body}"
+    );
+    assert!(second.registry.all().is_empty());
+
+    // But a graph whose sources Gate NAMES ITSELF is not blocked by the same
+    // unreadable row. `gate.{app}.{graph}.{node}.in` cannot be minted by another
+    // graph key, so there is no ownership question for the missing document to
+    // be hiding an answer to — and `complete` is a fact about the whole
+    // namespace, so refusing here would take every tenant's declares down for
+    // one document written by a newer build.
+    let res = client
+        .put(format!(
+            "{second_base}/v1/apps/{}/graphs/owned",
+            h.application
+        ))
+        .json(&one_node("test.owner-unknown.c", wide("b")))
+        .send()
+        .await
+        .expect("declare a graph Gate names the source of");
+    let status = res.status().as_u16();
+    let body: Value = res.json().await.unwrap_or(Value::Null);
+    assert_eq!(
+        status, 200,
+        "an unreadable row elsewhere blocked a graph it cannot collide with: {body}"
+    );
+
+    h.queen
+        .kv()
+        .delete(&namespace, &corrupt_key)
+        .send()
+        .await
+        .expect("remove unreadable document");
+    h.cleanup("first").await;
+    h.cleanup("second").await;
+    h.cleanup("owned").await;
+}
+
 /// The routes that are gone say where to go instead.
 ///
 /// A 404 would read as "wrong URL" and send somebody hunting; a 410 with the
@@ -2548,9 +2666,11 @@ async fn a_declare_that_cannot_be_restored_leaves_nothing_registered() {
     assert_eq!(status, 200, "declare: {body}");
     assert!(h.app.registry.get(&h.application, "g").is_some());
 
-    // Nothing gets through now, so neither the new plan nor the old one can be
-    // provisioned.
-    faulty.refuse("");
+    // Refuse the graph's queue rather than every broker route. The ownership
+    // preflight added by this fix must still be allowed to read the inventory;
+    // after it succeeds, both the new plan and the restore of the old plan use
+    // this same ingress queue and therefore fail provisioning.
+    faulty.refuse(&format!("gate.{}.g.n.ingress", h.application));
     let mut v2 = one_node(&out, wide("b"));
     v2["version"] = json!(2);
     v2["nodes"]["n"]["budgets"][0]["count"] = json!(7);

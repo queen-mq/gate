@@ -108,24 +108,59 @@ pub async fn declare_locked(
                 )));
             }
         }
-        // The same question of the STORE, because a declare lands on ONE
-        // replica: a graph declared a second ago on another pod is not in this
-        // registry yet. A store that will not answer is not a reason to refuse —
-        // the local check still stands.
-        if let Ok(stored) = crate::store::try_load_all(&app.queen).await {
-            for other in stored.items.iter().filter(|d| d.key() != key) {
-                let mine = gate_core::compile(other);
-                for owner in &mine.stages {
-                    let q = &owner.source;
-                    if plan.stages.iter().any(|candidate| candidate.source == *q) {
-                        return Err(Refusal::Conflict(format!(
-                            "`{q}` is already the source of node `{}` in graph `{}` (declared on \
-                             another replica). Two consumers of one queue in different groups \
-                             each get every message, which doubles what leaves.",
-                            owner.node,
-                            other.key()
-                        )));
-                    }
+        // Ask the STORE the same ownership question, because a declare lands on
+        // ONE replica: a graph declared on another pod need not be in this
+        // registry yet. This check must fail closed. An error, a clamped page,
+        // or an unreadable newer document all mean "ownership is unknown", not
+        // "the source is free".
+        let stored = crate::store::try_load_all(&app.queen).await.map_err(|e| {
+            Refusal::Gateway(format!(
+                "`{key}` was not declared: Gate could not read the stored graph inventory ({e}), \
+                 so it cannot safely prove exclusive ownership of the source queues"
+            ))
+        })?;
+        // An incomplete inventory only hides an answer for a source Gate does
+        // NOT name: an owned ingress and an interior queue are derived from
+        // `{app}.{graph}.{node}`, so no other graph key can mint the same name
+        // and no unreadable document can be claiming one. A user-declared
+        // ingress is free-form and another graph really may name it.
+        //
+        // Scoping the refusal there matters because `complete` is a fact about
+        // the whole namespace: `deny_unknown_fields` is deliberate, so ONE
+        // document written by a newer build makes every declare in every
+        // application unreadable-and-therefore-refused, which is a rolling
+        // deploy taking the control plane down for tenants that share nothing
+        // but a broker.
+        let user_sources: Vec<&str> = plan
+            .stages
+            .iter()
+            .map(|s| s.source.as_str())
+            .filter(|source| {
+                plan.queue(source)
+                    .is_some_and(|q| q.kind == gate_core::QueueKind::UserIngress)
+            })
+            .collect();
+        if !stored.complete && !user_sources.is_empty() {
+            return Err(Refusal::Gateway(format!(
+                "`{key}` was not declared: the stored graph inventory is incomplete (a page was \
+                 clamped or a document could not be read), so Gate cannot prove that {} is not \
+                 already consumed by another graph. A queue Gate names itself would not need \
+                 this check.",
+                user_sources.join(", ")
+            )));
+        }
+        for other in stored.items.iter().filter(|d| d.key() != key) {
+            let mine = gate_core::compile(other);
+            for owner in &mine.stages {
+                let q = &owner.source;
+                if plan.stages.iter().any(|candidate| candidate.source == *q) {
+                    return Err(Refusal::Conflict(format!(
+                        "`{q}` is already the source of node `{}` in graph `{}` (declared on \
+                         another replica). Two consumers of one queue in different groups each \
+                         get every message, which doubles what leaves.",
+                        owner.node,
+                        other.key()
+                    )));
                 }
             }
         }
