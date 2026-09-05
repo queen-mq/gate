@@ -334,6 +334,11 @@ fn the_knobs_default_to_what_the_design_says() {
         k.retry_limit, 3,
         "the DLQ is back: v1 had to disarm it because it paced by nacking"
     );
+    assert!(
+        k.max_push_body <= gate_server::knobs::MAX_PUSH_BODY_CEILING,
+        "the knob is floored at axum's default and capped: a per-request buffer is a memory \
+         reservation, and nothing limits how many requests hold one at once"
+    );
     assert_eq!(
         k.max_push_body,
         8 * 1024 * 1024,

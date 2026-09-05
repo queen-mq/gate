@@ -174,6 +174,18 @@ impl Default for Knobs {
 /// where it is.
 pub const AXUM_DEFAULT_BODY_LIMIT: usize = 2 * 1024 * 1024;
 
+/// The largest a push body may be configured to be.
+///
+/// The limit is a per-request memory reservation, not a per-request cost: the
+/// buffered bytes, the `serde_json::Value` they parse into, the copy the
+/// envelope is built on and the body sent to the broker are all live at once,
+/// and there is no concurrency limiter in front of any of it. A typo in a
+/// deployment manifest should not be able to ask one pod to hold gigabytes.
+///
+/// 64 MiB is eight times the default and far past any real push; a deployment
+/// that wants more than this wants a different shape, not a bigger number.
+pub const MAX_PUSH_BODY_CEILING: usize = 64 * 1024 * 1024;
+
 fn env_u32(name: &str) -> Option<u32> {
     std::env::var(name).ok().and_then(|v| v.parse().ok())
 }
@@ -216,7 +228,7 @@ pub fn knobs() -> &'static Knobs {
             // environment must not be able to make this service refuse bodies it
             // accepted before anybody set the variable.
             max_push_body: env_u32("GATE_MAX_PUSH_BODY_BYTES")
-                .map(|n| (n as usize).max(AXUM_DEFAULT_BODY_LIMIT))
+                .map(|n| (n as usize).clamp(AXUM_DEFAULT_BODY_LIMIT, MAX_PUSH_BODY_CEILING))
                 .unwrap_or(d.max_push_body),
         }
     })
