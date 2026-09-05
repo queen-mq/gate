@@ -2911,7 +2911,7 @@ async fn malformed_budget_state_is_reported_and_a_failed_decode_is_refunded() {
     let (status, body) = h.put_graph("g", one_node(&out, budget)).await;
     assert_eq!(status, 200, "declare: {body}");
 
-    let key = h.key("g", "n", "b");
+    let key = gate_core::plan::shared_budget_key(&h.application, "vendor");
     h.queen
         .kv()
         .put(h.app.budgets.ns(), &key, json!(3), Expiry::forever())
