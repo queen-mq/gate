@@ -69,9 +69,11 @@ pub struct Charge {
 pub struct State {
     pub key: String,
     pub value: i64,
-    /// Epoch millis. `None` only where a batch response omitted its trailing
-    /// read — which reads as *retry now*, not *wait for ever*. A returned
-    /// counter row must carry a valid expiry.
+    /// Epoch millis, and `None` reads as *retry now* rather than *wait for
+    /// ever*: a batch response that omitted its trailing read, or a row whose
+    /// expiry the broker did not render in a shape `parse_instant` knows. Only
+    /// the deadline degrades, which is not worth failing a charge over — see
+    /// `decode_state`.
     pub expires_at_ms: Option<i64>,
 }
 
@@ -86,22 +88,42 @@ fn decode_state(row: &queen_mq::KvRow) -> Result<State> {
                 row.key
             ))
         })?;
-    let expires = row.expires_at.as_deref().ok_or_else(|| {
-        queen_mq::Error::Decode(format!(
-            "budget counter `{}` is present without an expiry",
-            row.key
-        ))
-    })?;
-    let expires_at_ms = parse_instant(expires).ok_or_else(|| {
-        queen_mq::Error::Decode(format!(
-            "budget counter `{}` has an invalid expiry `{expires}`",
-            row.key
-        ))
-    })?;
+    // An expiry we cannot read costs the PARK DEADLINE and nothing else: the
+    // caller degrades to "retry now", which is what an omitted read has always
+    // meant here. Refusing the whole decode instead would fail the CHARGE, and a
+    // failed charge is not a refusal — the relay reads it as "the batch did not
+    // happen", releases the claim and is handed the identical batch back. One
+    // row with a missing or unrenderable expiry would then stop every path on
+    // that counter for ever, at twice the write volume, admitting nothing.
+    //
+    // The VALUE above is a different case and stays an error: a counter that is
+    // not an integer cannot be reasoned about at all.
+    let expires_at_ms = match row.expires_at.as_deref() {
+        None => {
+            tracing::warn!(
+                key = %row.key,
+                "budget: this counter is present without an expiry, so its wait deadline \
+                 degrades to `retry now`. A counter row is created by `incr` with a TTL; one \
+                 without a TTL never rotates and should be deleted"
+            );
+            None
+        }
+        Some(raw) => match parse_instant(raw) {
+            Some(ms) => Some(ms),
+            None => {
+                tracing::warn!(
+                    key = %row.key, expires_at = %raw,
+                    "budget: this counter's expiry cannot be read, so its wait deadline \
+                     degrades to `retry now`"
+                );
+                None
+            }
+        },
+    };
     Ok(State {
         key: row.key.clone(),
         value,
-        expires_at_ms: Some(expires_at_ms),
+        expires_at_ms,
     })
 }
 
@@ -664,8 +686,19 @@ mod tests {
         assert_eq!(state.expires_at_ms, Some(1_755_763_200_000));
 
         assert!(decode_state(&row(json!("7"), Some("2025-08-21T08:00:00Z"))).is_err());
-        assert!(decode_state(&row(json!(7), None)).is_err());
-        assert!(decode_state(&row(json!(7), Some("not-a-time"))).is_err());
+        // The deadline, and only the deadline, degrades.
+        assert_eq!(
+            decode_state(&row(json!(7), None))
+                .expect("readable")
+                .expires_at_ms,
+            None
+        );
+        assert_eq!(
+            decode_state(&row(json!(7), Some("not-a-time")))
+                .expect("readable")
+                .expires_at_ms,
+            None
+        );
     }
 
     #[test]

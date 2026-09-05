@@ -2890,11 +2890,14 @@ async fn live_state_endpoints_do_not_invent_zero_during_a_kv_outage() {
     h.cleanup("g").await;
 }
 
-/// A present counter with the wrong type or lifetime is corrupt state, not zero.
+/// A present counter whose VALUE is not a number is corrupt state, not zero.
 ///
-/// Besides the read-side lie, a missing expiry after an applied charge used to
-/// become "retry now". The charge now fails and gives back anything it can
-/// prove it wrote before returning the decode error.
+/// The two halves of a counter row fail differently, on purpose. A value that
+/// is not an integer cannot be reasoned about at all, so it is an error and the
+/// charge gives back anything it can prove it wrote first. A missing or
+/// unreadable EXPIRY costs only the park deadline, which degrades to "retry
+/// now" — failing the charge over it would stop every path on that counter for
+/// ever, because a failed charge is redelivered and fails again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn malformed_budget_state_is_reported_and_a_failed_decode_is_refunded() {
@@ -2914,10 +2917,15 @@ async fn malformed_budget_state_is_reported_and_a_failed_decode_is_refunded() {
     let key = gate_core::plan::shared_budget_key(&h.application, "vendor");
     h.queen
         .kv()
-        .put(h.app.budgets.ns(), &key, json!(3), Expiry::forever())
+        .put(
+            h.app.budgets.ns(),
+            &key,
+            json!("three"),
+            Expiry::seconds(60),
+        )
         .send()
         .await
-        .expect("plant counter without the mandatory window expiry");
+        .expect("plant a counter whose value is not a number");
 
     let paths = [
         format!("/v1/apps/{}/graphs/g", h.application),
@@ -2952,8 +2960,8 @@ async fn malformed_budget_state_is_reported_and_a_failed_decode_is_refunded() {
             budget_id: "b".into(),
         }])
         .await
-        .expect_err("a returned counter without an expiry must fail decoding");
-    assert!(error.to_string().contains("without an expiry"), "{error}");
+        .expect_err("a returned counter whose value is not an integer must fail decoding");
+    assert!(error.to_string().contains("not an integer"), "{error}");
     let raw = h
         .app
         .budgets
@@ -2962,15 +2970,68 @@ async fn malformed_budget_state_is_reported_and_a_failed_decode_is_refunded() {
         .expect("read counter after refund");
     assert_eq!(
         raw.first().and_then(|row| row.value.clone()),
-        Some(json!(3)),
+        Some(json!("three")),
         "the applied increment must be refunded before the decode error escapes"
     );
 
+    // The other half: a counter with a real value and no expiry is READABLE.
+    // It loses its deadline and nothing else, so the graph keeps admitting.
     h.app
         .budgets
         .clear(std::slice::from_ref(&key))
         .await
         .expect("remove corrupt counter");
+    h.queen
+        .kv()
+        .put(h.app.budgets.ns(), &key, json!(3), Expiry::forever())
+        .send()
+        .await
+        .expect("plant a counter with no window expiry");
+
+    let states = h
+        .app
+        .budgets
+        .read(std::slice::from_ref(&key))
+        .await
+        .expect("a counter without an expiry is readable, not an error");
+    assert_eq!(states.first().map(|s| s.value), Some(3), "{states:?}");
+    assert_eq!(
+        states.first().and_then(|s| s.expires_at_ms),
+        None,
+        "an unreadable expiry degrades to `retry now`"
+    );
+
+    let attempt = h
+        .app
+        .budgets
+        .charge(&[gate_server::budget::Charge {
+            key: key.clone(),
+            max: 100,
+            ttl: 1,
+            delta: 2,
+            budget_id: "b".into(),
+        }])
+        .await
+        .expect("a missing expiry must not fail the charge and stall the node");
+    assert!(
+        attempt.all_applied(),
+        "the charge is decided by the counter, not by its deadline: {attempt:?}"
+    );
+
+    let (status, body) = h
+        .send(
+            reqwest::Method::GET,
+            &format!("/v1/apps/{}/graphs/g", h.application),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "a readable counter must not 502: {body}");
+
+    h.app
+        .budgets
+        .clear(std::slice::from_ref(&key))
+        .await
+        .expect("remove the expiryless counter");
     h.cleanup("g").await;
 }
 
