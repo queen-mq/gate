@@ -3,7 +3,7 @@ import { ref, onMounted, computed } from 'vue'
 import { useRoute } from 'vue-router'
 import Icon from './components/Icon.vue'
 import SignIn from './views/SignIn.vue'
-import { api, authState, me, fetchMe, isAdmin, READ_ONLY_NOTE } from './lib/api.js'
+import { api, authState, authError, me, fetchMe, isAdmin, READ_ONLY_NOTE } from './lib/api.js'
 
 const route = useRoute()
 const overview = ref(null)
@@ -64,6 +64,13 @@ async function load() {
     overview.value = null
   }
 }
+
+async function retryAuth() {
+  authState.value = 'unknown'
+  await fetchMe()
+  load()
+}
+
 onMounted(async () => {
   await fetchMe()
   load()
@@ -99,6 +106,24 @@ const warnings = computed(() => {
        sidebar whose every page answers "sign in required" is a dashboard that
        looks broken rather than closed. -->
   <SignIn v-else-if="authState === 'login'" />
+
+  <div v-else-if="authState === 'error'" class="min-h-screen grid place-items-center px-6">
+    <div class="card w-full max-w-[440px] px-7 py-8 text-center">
+      <span class="w-10 h-10 rounded-xl bg-bad-dim text-bad grid place-items-center mx-auto">
+        <Icon name="alert" :size="19" />
+      </span>
+      <h1 class="text-[20px] font-semibold tracking-[-0.02em] mt-5">Console unavailable</h1>
+      <p class="text-[13.5px] text-fg-2 mt-2 leading-relaxed">
+        Gate could not establish whether this session is signed in.
+      </p>
+      <p class="mt-4 px-3 py-2.5 rounded-lg bg-bad-dim text-[12.5px] text-bad break-words">
+        {{ authError }}
+      </p>
+      <button type="button" class="btn btn-primary mt-6 mx-auto" @click="retryAuth">
+        Try again
+      </button>
+    </div>
+  </div>
 
   <div v-else class="min-h-screen">
     <!-- ------------------------------------------------------- sidebar -->
