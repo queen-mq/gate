@@ -1167,6 +1167,17 @@ async fn settle_head(ctx: &Ctx, m: &Message, kind: &Kind) -> bool {
             st.counters.forwarded.fetch_add(1, Ordering::Relaxed);
             st.counters.admitted.fetch_add(1, Ordering::Relaxed);
             st.counters.commits.fetch_add(1, Ordering::Relaxed);
+            // The same weight the batch path records, and for the same reason:
+            // the budget was charged for this item, so a roll-up that counts the
+            // admission and not the cost measures a node as idler than it is.
+            // Utilisation is read from this number.
+            let cost = cost_of(&st.node.cost, &m.data).unwrap_or(1).max(0) as u64;
+            let _ = st
+                .counters
+                .cost
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    Some(value.saturating_add(cost))
+                });
             true
         }
         // Already downstream: settle it and move on. It does NOT count as
