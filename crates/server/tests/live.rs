@@ -2778,14 +2778,13 @@ async fn the_reconcile_loop_converges_a_second_replica_on_its_own() {
 
 // ============================================================== depth and eta
 
-/// A depth the broker will not report falls back to the last one it did.
+/// A depth the broker will not report is unavailable, not the last value it did.
 ///
-/// An outage costs one round trip per TTL instead of one per caller: a console
-/// polling every few seconds across a dozen graphs would otherwise hammer an
-/// admin API that is already unhappy.
+/// The failure is cached for one TTL, so an honest outage still costs one round
+/// trip rather than one per caller.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
-async fn a_depth_the_broker_will_not_report_falls_back_to_the_last_one() {
+async fn a_depth_the_broker_will_not_report_never_becomes_zero_or_stale() {
     let Some((h, faulty)) = faulty_harness("depth").await else {
         assert!(std::env::var("GATE_TEST_REQUIRE_LIVE").is_err());
         return;
@@ -2799,16 +2798,30 @@ async fn a_depth_the_broker_will_not_report_falls_back_to_the_last_one() {
         .await
         .expect("push");
 
-    let first: u64 = h.app.depths.pending(&h.queen, &queue).await.values().sum();
+    let first: u64 = h
+        .app
+        .depths
+        .pending(&h.queen, &queue)
+        .await
+        .expect("initial depth")
+        .values()
+        .sum();
     assert_eq!(first, 1);
 
     // Wait past the cache TTL, then refuse.
     tokio::time::sleep(Duration::from_secs(3)).await;
     faulty.refuse("/depth");
-    let stale: u64 = h.app.depths.pending(&h.queen, &queue).await.values().sum();
+    faulty.forget();
+    for _ in 0..5 {
+        assert!(
+            h.app.depths.pending(&h.queen, &queue).await.is_err(),
+            "neither zero nor a stale depth is a live answer"
+        );
+    }
     assert_eq!(
-        stale, 1,
-        "the last answer is served rather than a zero, which would read as an empty queue"
+        faulty.hits("/depth"),
+        1,
+        "the failure must be cached for the same TTL as an answer"
     );
     faulty.allow();
 }
@@ -2839,6 +2852,63 @@ async fn an_eta_against_an_older_broker_still_costs_one_probe_per_ttl() {
         faulty.hits("/depth")
     );
     faulty.allow();
+}
+
+/// A broker depth outage is not an empty graph or an immediate ETA.
+///
+/// Every endpoint below used to consume the cache's default or stale map as if
+/// it were a live answer. They now fail together, while the cached failure
+/// keeps several page requests from repeating the same broken admin call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn live_state_endpoints_do_not_invent_zero_during_a_depth_outage() {
+    let Some((h, faulty)) = faulty_harness("depthstate").await else {
+        assert!(std::env::var("GATE_TEST_REQUIRE_LIVE").is_err());
+        return;
+    };
+    let out = egress_of("depthstate", &h.application);
+    let (status, body) = h
+        .put_graph(
+            "g",
+            one_node(&out, json!({ "id": "b", "count": 1000, "timeMs": 1000 })),
+        )
+        .await;
+    assert_eq!(status, 200, "declare: {body}");
+
+    // The declaration response populated the depth cache. Once it expires, a
+    // failed refresh must not resurrect that old value as if it were current.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    faulty.refuse("/depth");
+    faulty.forget();
+    let paths = [
+        format!("/v1/apps/{}/graphs/g", h.application),
+        format!("/v1/apps/{}/graphs/g/nodes/n/eta", h.application),
+        "/api/targets".into(),
+        "/api/graphs".into(),
+        format!("/v1/apps/{}/metrics", h.application),
+    ];
+    for path in paths {
+        let (status, body) = h.send(reqwest::Method::GET, &path, None).await;
+        assert_eq!(
+            status, 502,
+            "{path} invented a backlog while depth was unavailable: {body}"
+        );
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("live broker state"),
+            "{path}: {body}"
+        );
+    }
+    assert_eq!(
+        faulty.hits("/depth"),
+        1,
+        "the failed read must be cached across page endpoints"
+    );
+
+    faulty.allow();
+    h.cleanup("g").await;
 }
 
 /// Live state is either read from the broker or reported as unavailable. A KV
@@ -3302,6 +3372,7 @@ async fn an_ack_settles_the_whole_claim_or_pays_a_lease() {
         .depths
         .pending_of_group(&h.queen, &q, "g")
         .await
+        .expect("group depth")
         .values()
         .sum();
     assert_eq!(owed, 3, "nothing is lost: the group still owes the tail");

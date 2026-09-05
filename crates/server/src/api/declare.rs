@@ -388,7 +388,7 @@ pub async fn view(st: &Shared, rt: &Arc<GraphRuntime>) -> queen_mq::Result<Value
         let lag: u64 = st
             .depths
             .pending_of_group(&st.queen, &s.stage.source, &s.stage.group)
-            .await
+            .await?
             .values()
             .sum();
         stages.push(json!({
