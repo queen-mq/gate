@@ -2272,6 +2272,28 @@ async fn a_fresh_replica_fails_closed_when_source_ownership_cannot_be_verified()
     );
     assert!(second.registry.all().is_empty());
 
+    // But a graph whose sources Gate NAMES ITSELF is not blocked by the same
+    // unreadable row. `gate.{app}.{graph}.{node}.in` cannot be minted by another
+    // graph key, so there is no ownership question for the missing document to
+    // be hiding an answer to — and `complete` is a fact about the whole
+    // namespace, so refusing here would take every tenant's declares down for
+    // one document written by a newer build.
+    let res = client
+        .put(format!(
+            "{second_base}/v1/apps/{}/graphs/owned",
+            h.application
+        ))
+        .json(&one_node("test.owner-unknown.c", wide("b")))
+        .send()
+        .await
+        .expect("declare a graph Gate names the source of");
+    let status = res.status().as_u16();
+    let body: Value = res.json().await.unwrap_or(Value::Null);
+    assert_eq!(
+        status, 200,
+        "an unreadable row elsewhere blocked a graph it cannot collide with: {body}"
+    );
+
     h.queen
         .kv()
         .delete(&namespace, &corrupt_key)
@@ -2280,6 +2302,7 @@ async fn a_fresh_replica_fails_closed_when_source_ownership_cannot_be_verified()
         .expect("remove unreadable document");
     h.cleanup("first").await;
     h.cleanup("second").await;
+    h.cleanup("owned").await;
 }
 
 /// The routes that are gone say where to go instead.

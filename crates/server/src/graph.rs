@@ -119,11 +119,34 @@ pub async fn declare_locked(
                  so it cannot safely prove exclusive ownership of the source queues"
             ))
         })?;
-        if !stored.complete {
+        // An incomplete inventory only hides an answer for a source Gate does
+        // NOT name: an owned ingress and an interior queue are derived from
+        // `{app}.{graph}.{node}`, so no other graph key can mint the same name
+        // and no unreadable document can be claiming one. A user-declared
+        // ingress is free-form and another graph really may name it.
+        //
+        // Scoping the refusal there matters because `complete` is a fact about
+        // the whole namespace: `deny_unknown_fields` is deliberate, so ONE
+        // document written by a newer build makes every declare in every
+        // application unreadable-and-therefore-refused, which is a rolling
+        // deploy taking the control plane down for tenants that share nothing
+        // but a broker.
+        let user_sources: Vec<&str> = plan
+            .stages
+            .iter()
+            .map(|s| s.source.as_str())
+            .filter(|source| {
+                plan.queue(source)
+                    .is_some_and(|q| q.kind == gate_core::QueueKind::UserIngress)
+            })
+            .collect();
+        if !stored.complete && !user_sources.is_empty() {
             return Err(Refusal::Gateway(format!(
                 "`{key}` was not declared: the stored graph inventory is incomplete (a page was \
-                 clamped or a document could not be read), so Gate cannot safely prove exclusive \
-                 ownership of the source queues"
+                 clamped or a document could not be read), so Gate cannot prove that {} is not \
+                 already consumed by another graph. A queue Gate names itself would not need \
+                 this check.",
+                user_sources.join(", ")
             )));
         }
         for other in stored.items.iter().filter(|d| d.key() != key) {
