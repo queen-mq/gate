@@ -121,6 +121,12 @@ const SATURATING_HOLD: Duration = Duration::from_secs(15);
 #[derive(Debug)]
 struct BacklogSample {
     depth: u64,
+    /// Whether the PREVIOUS sample was already higher than the one before it.
+    /// One reading above the last is queue jitter — a backlog that never sits
+    /// at zero oscillates between polls — and latching on it holds a healthy
+    /// graph in "needs attention" for ever. Two in a row is the shortest
+    /// sequence that can distinguish a rise from a wobble.
+    rising: bool,
     growing_until: Option<Instant>,
 }
 
@@ -134,6 +140,16 @@ impl BacklogTrends {
         self.sample_at(graph, depth, Instant::now())
     }
 
+    /// Forget the graphs that are gone. Nothing else removes an entry, and the
+    /// key is a graph name, so without this a deployment that declares and
+    /// deletes graphs grows this map for the life of the process.
+    pub fn retain(&self, live: &std::collections::HashSet<String>) {
+        let mut samples = self.samples.write();
+        if samples.len() > live.len() {
+            samples.retain(|graph, _| live.contains(graph));
+        }
+    }
+
     fn sample_at(&self, graph: &str, depth: u64, now: Instant) -> bool {
         let mut samples = self.samples.write();
         let Some(previous) = samples.get_mut(graph) else {
@@ -141,17 +157,20 @@ impl BacklogTrends {
                 graph.to_string(),
                 BacklogSample {
                     depth,
+                    rising: false,
                     growing_until: None,
                 },
             );
             return false;
         };
 
-        if depth > previous.depth {
+        let up = depth > previous.depth;
+        if up && previous.rising {
             previous.growing_until = Some(now + SATURATING_HOLD);
         } else if depth < previous.depth || depth == 0 {
             previous.growing_until = None;
         }
+        previous.rising = up;
         previous.depth = depth;
         previous.growing_until.is_some_and(|until| until > now)
     }
@@ -247,10 +266,11 @@ mod tests {
         let now = Instant::now();
 
         assert!(!trends.sample_at("app/g", 3, now));
-        assert!(trends.sample_at("app/g", 5, now + Duration::from_secs(1)));
-        assert!(trends.sample_at("app/g", 5, now + Duration::from_secs(5)));
-        assert!(!trends.sample_at("app/g", 4, now + Duration::from_secs(6)));
-        assert!(!trends.sample_at("app/g", 0, now + Duration::from_secs(7)));
+        assert!(!trends.sample_at("app/g", 5, now + Duration::from_secs(1)));
+        assert!(trends.sample_at("app/g", 7, now + Duration::from_secs(2)));
+        assert!(trends.sample_at("app/g", 7, now + Duration::from_secs(6)));
+        assert!(!trends.sample_at("app/g", 4, now + Duration::from_secs(7)));
+        assert!(!trends.sample_at("app/g", 0, now + Duration::from_secs(8)));
     }
 
     #[test]
@@ -259,7 +279,40 @@ mod tests {
         let now = Instant::now();
 
         assert!(!trends.sample_at("app/g", 1, now));
-        assert!(trends.sample_at("app/g", 2, now + Duration::from_secs(1)));
-        assert!(!trends.sample_at("app/g", 2, now + Duration::from_secs(17)));
+        assert!(!trends.sample_at("app/g", 2, now + Duration::from_secs(1)));
+        assert!(trends.sample_at("app/g", 3, now + Duration::from_secs(2)));
+        assert!(!trends.sample_at("app/g", 3, now + Duration::from_secs(18)));
+    }
+
+    /// A busy graph's backlog is never zero and never still. One reading above
+    /// the last is the normal shape of a queue that is being drained as fast as
+    /// it fills, and it must not pin the graph in "needs attention".
+    #[test]
+    fn an_oscillating_backlog_is_not_saturating() {
+        let trends = BacklogTrends::default();
+        let now = Instant::now();
+
+        let mut at = now;
+        for (i, depth) in [100, 120, 100, 120, 100, 120, 100].into_iter().enumerate() {
+            at = now + Duration::from_secs(i as u64);
+            assert!(
+                !trends.sample_at("app/g", depth, at),
+                "sample {i} at depth {depth} latched on jitter"
+            );
+        }
+        // A real rise still shows, on the second consecutive increase.
+        assert!(!trends.sample_at("app/g", 130, at + Duration::from_secs(1)));
+        assert!(trends.sample_at("app/g", 160, at + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn a_graph_that_is_gone_is_forgotten() {
+        let trends = BacklogTrends::default();
+        trends.sample("app/kept", 1);
+        trends.sample("app/gone", 1);
+
+        trends.retain(&["app/kept".to_string()].into_iter().collect());
+        assert_eq!(trends.samples.read().len(), 1);
+        assert!(trends.samples.read().contains_key("app/kept"));
     }
 }

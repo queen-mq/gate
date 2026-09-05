@@ -139,7 +139,13 @@ pub async fn list_targets(State(app): State<Shared>) -> ApiResult {
     let now = crate::now_ms();
     let mut out = Vec::new();
 
-    for g in app.registry.all() {
+    let graphs = app.registry.all();
+    // This is the one route that samples, so it is the one place that knows
+    // which graphs still exist.
+    app.backlogs
+        .retain(&graphs.iter().map(|g| g.key()).collect());
+
+    for g in graphs {
         // The backlog of everything that has not been admitted yet: every stage
         // source this graph reads, under the group that reads it. Interior
         // stages matter too — a downstream budget can be the binding one.
