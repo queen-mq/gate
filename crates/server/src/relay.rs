@@ -1138,8 +1138,15 @@ fn push_for(st: &StageRuntime, m: &Message, dest: &gate_core::Destination) -> Tx
 async fn settle_head(ctx: &Ctx, m: &Message, kind: &Kind) -> bool {
     let st = &ctx.st;
     if !matches!(kind, Kind::Work) {
-        let _ = ctx.queen.transaction().ack(m).commit().await;
-        st.counters.foreign.fetch_add(1, Ordering::Relaxed);
+        match ctx.queen.transaction().ack(m).commit().await {
+            Ok(_) => {
+                st.counters.foreign.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => tracing::warn!(
+                stage = %st.key(), error = %e,
+                "could not settle a foreign item at the head; its lease will lapse"
+            ),
+        }
         return false;
     }
 
@@ -1153,13 +1160,21 @@ async fn settle_head(ctx: &Ctx, m: &Message, kind: &Kind) -> bool {
     }
     let Some(tx) = tx else {
         // Nack with the reason so it reaches the DLQ, never dropped.
-        let _ = ctx
+        match ctx
             .queen
             .transaction()
             .nack(m, "gate: this item cannot be staged for its destination")
             .commit()
-            .await;
-        st.counters.deadlettered.fetch_add(1, Ordering::Relaxed);
+            .await
+        {
+            Ok(_) => {
+                st.counters.deadlettered.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => tracing::warn!(
+                stage = %st.key(), error = %e,
+                "could not dead-letter an item that cannot be staged; its lease will lapse"
+            ),
+        }
         return false;
     };
     match tx.commit().await {
