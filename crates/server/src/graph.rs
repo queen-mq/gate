@@ -89,9 +89,29 @@ pub async fn declare_locked(
     let key = doc.key();
     let (plan, facts) = compile(app, &doc).await;
 
+    // A caller's declare is held to every rule. A document coming back from the
+    // store is not: it was accepted by some version of Gate and is, in the
+    // ordinary case, already serving traffic, so a rule added since then must
+    // not be the thing that takes it down. See `refuses_stored_document`.
     let problems = gate_core::validate_with(&doc, &facts);
-    if !problems.is_empty() {
-        return Err(Refusal::Invalid(join(&problems)));
+    let (fatal, kept): (Vec<_>, Vec<_>) = if from_caller {
+        (problems, Vec::new())
+    } else {
+        problems
+            .into_iter()
+            .partition(|p| gate_core::refuses_stored_document(p.rule))
+    };
+    if !kept.is_empty() {
+        tracing::warn!(
+            graph = %key,
+            rules = %kept.iter().map(|p| p.rule).collect::<Vec<_>>().join(", "),
+            "a stored document breaks a rule this build enforces; it keeps running rather than \
+             being taken down, and the next declare of it must fix this: {}",
+            join(&kept)
+        );
+    }
+    if !fatal.is_empty() {
+        return Err(Refusal::Invalid(join(&fatal)));
     }
 
     let old = app.registry.get(&doc.application, &doc.graph);
