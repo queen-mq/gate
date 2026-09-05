@@ -562,3 +562,40 @@ fn ingress_true_is_a_queue_gate_owns() {
     assert!(doc.nodes["prices"].ingress.as_ref().unwrap().http());
     assert!(!doc.nodes["messages"].ingress.as_ref().unwrap().http());
 }
+
+/// A rule added after a document was written must not be the thing that takes
+/// that document down on the next restart. Only a document whose plan cannot be
+/// built or addressed at all is refused on the way back out of the store.
+#[test]
+fn a_stored_document_is_refused_only_for_a_rule_it_cannot_be_served_under() {
+    for fatal in [
+        "nodes",
+        "paths",
+        "application",
+        "graph-name",
+        "node-name",
+        "path-name",
+    ] {
+        assert!(
+            gate_core::refuses_stored_document(fatal),
+            "`{fatal}` leaves no plan to run and must still refuse"
+        );
+    }
+    for kept in [
+        "node-unscoped-budget",
+        "budget-count",
+        "cost-fits",
+        "shares",
+        "ingress-owner",
+        "counters-window",
+        "graph-workers",
+        "breaker-width",
+        "queue-cycle",
+        "a-rule-that-does-not-exist-yet",
+    ] {
+        assert!(
+            !gate_core::refuses_stored_document(kept),
+            "`{kept}` would strand a graph that was serving traffic a moment ago"
+        );
+    }
+}

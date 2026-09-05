@@ -79,6 +79,31 @@ fn p(rule: &'static str, detail: String) -> Problem {
 
 // -------------------------------------------------------------------- refusals
 
+/// Whether a stored document must be REFUSED for this rule, or may keep running.
+///
+/// Every rule here is enforced without exception against a CALLER's declare.
+/// The question this answers is a different one: what should happen when a
+/// document already in the store violates a rule that did not exist when it was
+/// written.
+///
+/// Refusing it is not the safe direction. `restore` and `reconcile` both go
+/// through the same declare path, so a refusal leaves the graph unregistered:
+/// its pushes answer 404, its ingress queue fills with nobody draining it, and
+/// the only trace is one WARN line. That is strictly worse than the condition
+/// the new rule describes — the graph was serving traffic a moment ago, and the
+/// rule was added to stop the NEXT declare, not to stop this one.
+///
+/// So a rule stops a stored document only when the plan cannot be built or
+/// addressed at all: no nodes, no paths, or a name that cannot become a queue
+/// name and a kv key. Everything else is logged and kept running, and the next
+/// caller declare still has to fix it.
+pub fn refuses_stored_document(rule: &str) -> bool {
+    matches!(
+        rule,
+        "nodes" | "paths" | "application" | "graph-name" | "node-name" | "path-name"
+    )
+}
+
 pub fn validate(doc: &GraphDoc) -> Vec<Problem> {
     validate_with(doc, &ExternalFacts::default())
 }

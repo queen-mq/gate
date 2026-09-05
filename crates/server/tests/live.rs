@@ -1423,6 +1423,68 @@ async fn an_item_that_can_never_be_admitted_is_dead_lettered() {
     h.cleanup("g").await;
 }
 
+/// A rule added after a document was stored must not take that document down.
+///
+/// `restore` and `reconcile` declare through the same path a caller does, so a
+/// refusal there does not keep anybody safe: it unregisters the graph, answers
+/// 404 to its pushes, and leaves its ingress queue filling behind one WARN
+/// line. The document was accepted by an older build and is serving traffic, so
+/// it keeps running and the breach is logged. A CALLER's declare of the same
+/// document is still refused, which is what the rule is for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn a_stored_document_that_breaks_a_later_rule_keeps_running() {
+    let Some(h) = harness("grandfather").await else {
+        return;
+    };
+    let out = egress_of("grandfather", &h.application);
+    // Only a per-key budget, which `node-unscoped-budget` refuses. Any rule that
+    // is not about naming or emptiness would do; this one has been enforced
+    // since v2 shipped, so the test needs no future rule to exist.
+    let doc = json!({
+      "version": 1,
+      "nodes": { "n": {
+        "ingress": true,
+        "egress": out,
+        "budgets": [{ "id": "per-listing", "count": 100, "timeMs": 1000,
+                      "scopeBy": "payload.listingId" }]
+      }},
+      "paths": [{ "name": "main", "nodes": ["n"] }]
+    });
+
+    let (status, body) = h.put_graph("g", doc.clone()).await;
+    assert_eq!(
+        status, 422,
+        "a caller's declare must still be refused: {body}"
+    );
+    assert!(
+        h.app.registry.get(&h.application, "g").is_none(),
+        "a refused declare must not register anything"
+    );
+
+    // The same document, already in the store — where an older build left it.
+    let mut stored: gate_core::GraphDoc =
+        serde_json::from_value(doc).expect("the document parses; only the rules refuse it");
+    stored.application = h.application.clone();
+    stored.graph = "g".into();
+    gate_server::store::save(&h.queen, &stored)
+        .await
+        .expect("plant the stored document");
+
+    gate_server::reconcile(&h.app).await;
+    let rt = h.app.registry.get(&h.application, "g");
+    assert!(
+        rt.is_some(),
+        "the stored graph was taken down by a rule added after it was written"
+    );
+    assert!(
+        rt.expect("registered").is_running(),
+        "the stored graph was registered but never started"
+    );
+
+    h.cleanup("g").await;
+}
+
 /// A KV route that refuses is NOT a refusal.
 ///
 /// Reading a failed charge as a refusal would park the graph; reading it as an
