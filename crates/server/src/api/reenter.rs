@@ -45,7 +45,7 @@ use crate::registry::GraphRuntime;
 pub struct ReenterBody {
     /// The payload as it was popped off the egress queue, `_gate` and all.
     #[serde(default)]
-    pub payload: Value,
+    pub payload: Option<Value>,
     /// The transaction id it arrived with. Required: it is what the re-entry id
     /// is derived from, and without it two reports of one item would re-enter
     /// twice.

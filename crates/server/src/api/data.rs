@@ -58,7 +58,7 @@ pub struct PushBody {
     #[serde(default)]
     pub cost: Option<i64>,
     #[serde(default)]
-    pub payload: Value,
+    pub payload: Option<Value>,
 }
 
 pub async fn graph_push(
