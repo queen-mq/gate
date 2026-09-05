@@ -30,7 +30,7 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use parking_lot::RwLock;
 use queen_mq::Queen;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::budget::Budgets;
 use crate::obs::Traces;
@@ -289,6 +289,32 @@ pub fn ok(v: serde_json::Value) -> ApiResult {
     Ok(Json(v).into_response())
 }
 
+/// Gate's HTTP doors add `_gate` metadata to the application payload. Refuse a
+/// shape that cannot carry that metadata instead of silently replacing the
+/// caller's data with an empty object.
+pub(crate) fn object_payload(payload: Option<Value>) -> Result<Value, Fail> {
+    // An ABSENT payload is not a payload Gate would be erasing: there is nothing
+    // to lose, and `{"op": "publish", "txn": "t1"}` has always been a legal push
+    // of an item that carries only its envelope. `serde` cannot tell an absent
+    // field from an explicit `null`, so the distinction is drawn here, on
+    // `Option`, rather than on `Value::Null`.
+    let Some(payload) = payload else {
+        return Ok(json!({}));
+    };
+    if payload.is_object() {
+        return Ok(payload);
+    }
+    Err(Fail(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        format!(
+            "payload must be a JSON object: Gate must add `{}` metadata without changing the \
+             application value. Omit the field entirely to push an item that carries only its \
+             envelope.",
+            gate_core::GATE_META
+        ),
+    ))
+}
+
 impl From<crate::graph::Refusal> for Fail {
     fn from(r: crate::graph::Refusal) -> Self {
         match r {
@@ -350,4 +376,42 @@ pub fn refuse_if_stopped(rt: &Arc<crate::registry::GraphRuntime>) -> Result<(), 
             rt.key()
         ),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_http_payload_must_be_an_object_instead_of_being_discarded() {
+        let kept = object_payload(Some(json!({ "kept": true })))
+            .ok()
+            .expect("object refused");
+        assert_eq!(kept["kept"], true);
+        for value in [json!(7), json!("lost"), json!([1, 2])] {
+            let err = object_payload(Some(value)).expect_err("non-object accepted");
+            assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+            assert!(err.1.contains("must be a JSON object"));
+        }
+    }
+
+    /// An omitted `payload` erases nothing, so it is not the shape this refusal
+    /// is about: `{"op": "publish", "txn": "t1"}` is a push of an item that
+    /// carries only its envelope, and it answered 200 before this rule existed.
+    #[test]
+    fn an_omitted_payload_is_an_empty_object_and_not_a_refusal() {
+        let absent = object_payload(None)
+            .ok()
+            .expect("an absent payload was refused");
+        assert_eq!(absent, json!({}));
+        let body: crate::api::data::PushBody =
+            serde_json::from_value(json!({ "op": "publish", "txn": "t1" })).expect("body");
+        assert_eq!(body.payload, None, "an absent field must not read as null");
+        // `serde` maps an explicit `null` onto `None` as well, and that is the
+        // right reading: both spellings say "this item carries no payload", and
+        // neither has anything for Gate to erase.
+        let body: crate::api::data::PushBody =
+            serde_json::from_value(json!({ "payload": null })).expect("body");
+        assert_eq!(body.payload, None);
+    }
 }
