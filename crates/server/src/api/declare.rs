@@ -321,12 +321,23 @@ async fn do_sync(st: &Shared, application: &str, bodies: Vec<Value>) -> ApiResul
             if declared.contains(&name) {
                 continue;
             }
+            // The store's copy decided that a name was a target; the RUNTIME
+            // decides whether this replica may reap it. A redeclare registers
+            // before it saves, so a graph that grew nodes and then failed to
+            // persist reads as a one-node document here and is a multi-node
+            // graph in the registry — and a sync of targets does not delete a
+            // graph. Asked before the store write, so a graph that is exempt
+            // keeps its document too.
+            let live = st.registry.get(application, &name);
+            if live.as_ref().is_some_and(|rt| rt.plan.nodes.len() > 1) {
+                continue;
+            }
             if let Err(e) = crate::store::forget(&st.queen, application, &name).await {
                 tracing::warn!(graph = %name, error = %e, "sync: not reaped, the stored document could not be removed");
                 refused.push(json!({ "target": name, "error": format!("not reaped: {e}") }));
                 continue;
             }
-            if let Some(rt) = st.registry.get(application, &name) {
+            if let Some(rt) = live {
                 crate::supervisor::stop(&rt).await;
                 st.registry.remove(application, &name);
             }

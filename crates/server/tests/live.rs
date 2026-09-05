@@ -1423,6 +1423,85 @@ async fn an_item_that_can_never_be_admitted_is_dead_lettered() {
     h.cleanup("g").await;
 }
 
+/// A sync of TARGETS does not delete a graph, and the runtime is what decides
+/// that — not the store's copy of it.
+///
+/// A redeclare registers before it saves. A graph that grew nodes and whose save
+/// then failed is a one-node document in the store and a multi-node graph on
+/// this replica, so an inventory built from the store alone offers it up for
+/// reaping. Master never could: it iterated runtimes and skipped the wide ones.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn a_target_sync_never_reaps_a_graph_that_grew_nodes() {
+    let Some(h) = harness("wide-reap").await else {
+        return;
+    };
+    let out = egress_of("wide-reap", &h.application);
+
+    // What the store holds: the one-node shape, as it was first declared.
+    let (status, body) = h.put_graph("wide", one_node(&out, wide("b"))).await;
+    assert_eq!(status, 200, "declare: {body}");
+
+    // What this replica runs: two nodes, registered without the store agreeing.
+    let two = json!({
+      "version": 2,
+      "nodes": {
+        "n": { "ingress": true, "budgets": [wide("b")] },
+        "m": { "budgets": [wide("c")], "egress": out }
+      },
+      "paths": [{ "name": "main", "nodes": ["n", "m"] }]
+    });
+    let (status, body) = h.put_graph("wide", two).await;
+    assert_eq!(status, 200, "redeclare: {body}");
+    gate_server::store::save(
+        &h.queen,
+        &serde_json::from_value({
+            let mut d = one_node(&out, wide("b"));
+            d["application"] = json!(h.application);
+            d["graph"] = json!("wide");
+            d
+        })
+        .expect("document"),
+    )
+    .await
+    .expect("put the store back to the one-node copy");
+
+    // A sync that names something else at all.
+    let (status, body) = h
+        .send(
+            reqwest::Method::PUT,
+            &format!("/v1/apps/{}/targets", h.application),
+            Some(json!([one_node(&out, wide("b"))
+                .as_object()
+                .map(|o| {
+                    let mut o = o.clone();
+                    o.insert("graph".into(), json!("other"));
+                    Value::Object(o)
+                })
+                .expect("object")])),
+        )
+        .await;
+    assert_eq!(status, 200, "sync: {body}");
+    assert_eq!(
+        body["removed"],
+        json!([]),
+        "the graph is wider than a target and must not be reaped: {body}"
+    );
+
+    let rt = h.app.registry.get(&h.application, "wide");
+    assert!(
+        rt.is_some(),
+        "the multi-node graph was stopped by a target sync"
+    );
+    assert!(
+        rt.expect("registered").is_running(),
+        "it was left registered and stopped"
+    );
+
+    h.cleanup("wide").await;
+    h.cleanup("other").await;
+}
+
 /// A KV route that refuses is NOT a refusal.
 ///
 /// Reading a failed charge as a refusal would park the graph; reading it as an
