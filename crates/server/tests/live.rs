@@ -2643,9 +2643,11 @@ async fn a_declare_that_cannot_be_restored_leaves_nothing_registered() {
     assert_eq!(status, 200, "declare: {body}");
     assert!(h.app.registry.get(&h.application, "g").is_some());
 
-    // Nothing gets through now, so neither the new plan nor the old one can be
-    // provisioned.
-    faulty.refuse("");
+    // Refuse the graph's queue rather than every broker route. The ownership
+    // preflight added by this fix must still be allowed to read the inventory;
+    // after it succeeds, both the new plan and the restore of the old plan use
+    // this same ingress queue and therefore fail provisioning.
+    faulty.refuse(&format!("gate.{}.g.n.ingress", h.application));
     let mut v2 = one_node(&out, wide("b"));
     v2["version"] = json!(2);
     v2["nodes"]["n"]["budgets"][0]["count"] = json!(7);
