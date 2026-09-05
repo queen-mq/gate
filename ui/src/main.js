@@ -43,7 +43,11 @@ function graphLocation(app, name, to) {
   const base = `/apps/${encodeURIComponent(app)}/graphs/${encodeURIComponent(name)}`
   const p = lane || path
   if (p) return `${base}?path=${encodeURIComponent(p)}`
-  if (to.path.endsWith('/edit')) return `${base}/edit`
+  /* The suffix comes from the ROUTE PATTERN, never from `to.path`. `ok_name`
+     admits `edit` as a graph name, so `/targets/edit` ends with `/edit` while
+     naming no suffix at all — reading the concrete URL sends that graph to the
+     editor instead of to its detail page. The pattern is static. */
+  if (to.matched.at(-1)?.path.endsWith('/edit')) return `${base}/edit`
   return base
 }
 
