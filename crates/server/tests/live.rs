@@ -2276,6 +2276,11 @@ async fn the_console_can_draw_what_is_running() {
         json!(true),
         "the broker health must be probed: {overview}"
     );
+    assert_eq!(
+        overview["history_error"],
+        Value::Null,
+        "a healthy history must not report one: {overview}"
+    );
     assert!(
         overview["admitted_per_sec"].is_null(),
         "without the counters stream this must be null, not a lifetime average: {overview}"

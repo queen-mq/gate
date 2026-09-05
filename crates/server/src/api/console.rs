@@ -69,10 +69,22 @@ pub async fn overview(State(app): State<Shared>) -> ApiResult {
         }
     }
 
-    let admitted_per_sec = if counters_on {
-        rate_of(&app, now).await?
+    // Every other field in this document comes from the registry and the
+    // broker, not from Postgres. Failing the whole response on the history read
+    // would take `queen.reachable` down with it — the one field that says
+    // whether the LIMITER is healthy, hidden at exactly the moment an operator
+    // is working out what broke. So the rate reports itself as unknown and
+    // names its own failure, and the rest of the overview still answers.
+    let (admitted_per_sec, history_error) = if counters_on {
+        match rate_of(&app, now).await {
+            Ok(rate) => (rate, Value::Null),
+            Err(Fail(_, message)) => {
+                tracing::warn!(error = %message, "overview: the admission rate is unreadable");
+                (Value::Null, Value::String(message))
+            }
+        }
     } else {
-        Value::Null
+        (Value::Null, Value::Null)
     };
 
     ok(json!({
@@ -89,6 +101,9 @@ pub async fn overview(State(app): State<Shared>) -> ApiResult {
         // the caller does not know is a number that is wrong in a way nobody can
         // see.
         "admitted_per_sec": admitted_per_sec,
+        // Present only when the rate above is null BECAUSE the read failed, so
+        // a console can tell that apart from roll-ups being switched off.
+        "history_error": history_error,
         "budgets_assumed": assumed,
         "budgets_stale": stale,
     }))
