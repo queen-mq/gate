@@ -145,6 +145,24 @@ fn the_worker_count_comes_from_the_budget_and_not_from_the_partitions() {
         16,
         "the per-key budget is not a rate"
     );
+
+    // Nor is a selector a node-wide rate. A rare operation capped at one per
+    // hour must not reduce unrelated traffic from four lanes to one.
+    let conditional = doc(json!({
+      "application": "a", "graph": "g", "version": 1,
+      "nodes": { "n": { "ingress": { "queue": "theirs.in" }, "egress": "theirs.out",
+                        "budgets": [
+                          { "id": "node", "count": 4000, "timeMs": 1000 },
+                          { "id": "rare", "count": 1, "timeMs": 3600000,
+                            "subWindows": 1, "whenOp": ["photo.delete"] }
+                        ] } },
+      "paths": [{ "name": "main", "nodes": ["n"] }]
+    }));
+    assert_eq!(
+        with_partitions(&conditional, 16),
+        4,
+        "a conditional budget is not the node's rate"
+    );
 }
 
 /// A path's SHARE is part of its ceiling, so it is part of its worker count: a
@@ -292,6 +310,23 @@ fn a_claim_is_sized_by_the_nodes_own_rate_and_never_by_a_per_key_one() {
         gate_core::DEFAULT_BATCH,
         "a batch of two hundred messages across two hundred different keys spends one unit of \
          each: sizing on a per-key allowance is how a node stops draining"
+    );
+
+    let conditional = doc(json!({
+      "application": "a", "graph": "g", "version": 1,
+      "nodes": { "n": { "ingress": true,
+                        "budgets": [
+                          { "id": "node", "count": 500, "timeMs": 1000 },
+                          { "id": "rare", "count": 1, "timeMs": 3600000,
+                            "subWindows": 1, "whenOp": ["photo.delete"] }
+                        ],
+                        "egress": "out" } },
+      "paths": [{ "name": "main", "nodes": ["n"] }]
+    }));
+    assert_eq!(
+        gate_core::compile(&conditional).stages[0].batch,
+        gate_core::DEFAULT_BATCH,
+        "a selector for one operation must not shrink every claim"
     );
 }
 

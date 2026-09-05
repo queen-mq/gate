@@ -129,9 +129,9 @@ pub struct Node {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch: Option<u32>,
 
-    /// How many workers drain this node's stages. Defaults to
-    /// `max(4, source partitions)`. More workers than partitions is harmless
-    /// (the extras find nothing and park); fewer is a throughput ceiling.
+    /// How many workers drain this node's stages. By default this is derived
+    /// from the tightest unconditional, unscoped rate and capped at the source
+    /// partition count; an explicit value overrides that derivation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<u32>,
 }
