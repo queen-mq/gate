@@ -221,23 +221,45 @@ static JWKS: RwLock<Option<(Value, Instant)>> = RwLock::new(None);
 
 /// Google's keys, cached. On a refresh failure a stale copy is preferable to
 /// locking everyone out: the keys rotate slowly and an outage at Google should
-/// not become an outage here.
-async fn jwks(http: &reqwest::Client) -> Result<Value, String> {
-    if let Some((v, at)) = JWKS.read().as_ref() {
-        if at.elapsed() < JWKS_TTL {
-            return Ok(v.clone());
+/// not become an outage here. `force` is used only after a token names a key
+/// absent from the otherwise-fresh cache; in that case the stale set is already
+/// known to be unusable, so a failed download is returned rather than disguised
+/// as a successful refresh.
+async fn jwks(http: &reqwest::Client, force: bool) -> Result<Value, String> {
+    if !force {
+        if let Some((v, at)) = JWKS.read().as_ref() {
+            if at.elapsed() < JWKS_TTL {
+                return Ok(v.clone());
+            }
         }
     }
-    match http.get(GOOGLE_JWKS_URL).timeout(HTTP_TIMEOUT).send().await {
-        Ok(r) => match r.json::<Value>().await {
-            Ok(v) => {
-                *JWKS.write() = Some((v.clone(), Instant::now()));
-                Ok(v)
-            }
-            Err(e) => stale_or(format!("jwks decode: {e}")),
-        },
-        Err(e) => stale_or(format!("jwks fetch: {e}")),
+    match download_jwks(http).await {
+        Ok(v) => {
+            *JWKS.write() = Some((v.clone(), Instant::now()));
+            Ok(v)
+        }
+        Err(e) if force => Err(e),
+        Err(e) => stale_or(e),
     }
+}
+
+async fn download_jwks(http: &reqwest::Client) -> Result<Value, String> {
+    let response = http
+        .get(GOOGLE_JWKS_URL)
+        .timeout(HTTP_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| format!("jwks fetch: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("jwks fetch: {e}"))?;
+    let value = response
+        .json::<Value>()
+        .await
+        .map_err(|e| format!("jwks decode: {e}"))?;
+    if value.get("keys").and_then(Value::as_array).is_none() {
+        return Err("jwks decode: response has no keys array".into());
+    }
+    Ok(value)
 }
 
 fn stale_or(err: String) -> Result<Value, String> {
@@ -257,20 +279,8 @@ async fn verify_id_token(
 ) -> Result<GoogleClaims, String> {
     let header = decode_header(id_token).map_err(|e| format!("id_token header: {e}"))?;
     let kid = header.kid.ok_or("id_token has no kid")?;
-    let keys = jwks(http).await?;
-    let (n, e) = keys["keys"]
-        .as_array()
-        .and_then(|ks| {
-            ks.iter()
-                .find(|k| k["kid"].as_str() == Some(&kid))
-                .map(|k| {
-                    (
-                        k["n"].as_str().unwrap_or("").to_string(),
-                        k["e"].as_str().unwrap_or("").to_string(),
-                    )
-                })
-        })
-        .ok_or("no matching jwks key")?;
+    let keys = jwks(http, false).await?;
+    let (n, e) = matching_jwk(keys, &kid, || jwks(http, true)).await?;
     let key = DecodingKey::from_rsa_components(&n, &e).map_err(|e| format!("jwks key: {e}"))?;
     let mut v = Validation::new(Algorithm::RS256);
     v.set_audience(std::slice::from_ref(&cfg.client_id));
@@ -278,6 +288,37 @@ async fn verify_id_token(
     decode::<GoogleClaims>(id_token, &key, &v)
         .map(|d| d.claims)
         .map_err(|e| format!("id_token: {e}"))
+}
+
+fn jwk_components(keys: &Value, kid: &str) -> Option<(String, String)> {
+    keys["keys"].as_array().and_then(|ks| {
+        ks.iter()
+            .filter(|k| k["kid"].as_str() == Some(kid))
+            .find_map(|k| {
+                let n = k["n"].as_str()?.to_string();
+                let e = k["e"].as_str()?.to_string();
+                Some((n, e))
+            })
+    })
+}
+
+/// Select a key from the cache, refreshing once when rotation introduced a
+/// `kid` the cached set does not contain. A token with a genuinely unknown key
+/// still fails after that one bounded retry.
+async fn matching_jwk<F, Fut>(
+    keys: Value,
+    kid: &str,
+    refresh: F,
+) -> Result<(String, String), String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Value, String>>,
+{
+    if let Some(key) = jwk_components(&keys, kid) {
+        return Ok(key);
+    }
+    let refreshed = refresh().await?;
+    jwk_components(&refreshed, kid).ok_or_else(|| format!("no matching jwks key for `{kid}`"))
 }
 
 // ------------------------------------------------------------------ routes
@@ -695,12 +736,64 @@ fn urlencode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use axum::http::{header, HeaderMap, HeaderValue, Method};
+    use serde_json::json;
 
     use super::{
-        cookie_value, nonce, oauth_state_cookie, requires_admin, safe_next, session_exempt,
-        LOGOUT_PATH, OAUTH_CALLBACK_PATH, OAUTH_LOGIN_PATH, OAUTH_STATE_COOKIE,
+        cookie_value, matching_jwk, nonce, oauth_state_cookie, requires_admin, safe_next,
+        session_exempt, LOGOUT_PATH, OAUTH_CALLBACK_PATH, OAUTH_LOGIN_PATH, OAUTH_STATE_COOKIE,
     };
+
+    #[tokio::test]
+    async fn an_unknown_google_key_refreshes_the_cache_once() {
+        let refreshes = AtomicUsize::new(0);
+        let key = matching_jwk(
+            json!({ "keys": [{ "kid": "old", "n": "old-n", "e": "AQAB" }] }),
+            "new",
+            || async {
+                refreshes.fetch_add(1, Ordering::Relaxed);
+                Ok(json!({ "keys": [{ "kid": "new", "n": "new-n", "e": "AQAB" }] }))
+            },
+        )
+        .await
+        .expect("the rotated key is present after refresh");
+
+        assert_eq!(key, ("new-n".into(), "AQAB".into()));
+        assert_eq!(refreshes.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn a_cached_google_key_does_not_refresh() {
+        let refreshes = AtomicUsize::new(0);
+        let key = matching_jwk(
+            json!({ "keys": [{ "kid": "current", "n": "current-n", "e": "AQAB" }] }),
+            "current",
+            || async {
+                refreshes.fetch_add(1, Ordering::Relaxed);
+                Err("refresh should not run".into())
+            },
+        )
+        .await
+        .expect("the cached key is enough");
+
+        assert_eq!(key, ("current-n".into(), "AQAB".into()));
+        assert_eq!(refreshes.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn a_key_unknown_after_refresh_is_rejected_without_looping() {
+        let refreshes = AtomicUsize::new(0);
+        let result = matching_jwk(json!({ "keys": [] }), "missing", || async {
+            refreshes.fetch_add(1, Ordering::Relaxed);
+            Ok(json!({ "keys": [] }))
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(refreshes.load(Ordering::Relaxed), 1);
+    }
 
     #[test]
     fn oauth_nonces_are_fresh_128_bit_hex_values() {
