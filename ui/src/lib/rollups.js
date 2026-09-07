@@ -14,9 +14,7 @@ import { api, toDate } from './api.js'
   it, possibly empty", and every caller renders the difference.
 */
 async function series(key, minutes) {
-  const r = await api
-    .get(`/api/rollups?target=${encodeURIComponent(key)}&minutes=${minutes}`)
-    .catch(() => null)
+  const r = await api.get(`/api/rollups?target=${encodeURIComponent(key)}&minutes=${minutes}`)
   const rows = Array.isArray(r) ? r : (r?.windows ?? null)
   return rows && rows.length ? rows : null
 }
