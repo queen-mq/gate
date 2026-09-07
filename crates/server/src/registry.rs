@@ -42,7 +42,7 @@ pub struct GraphRuntime {
     /// is stop-then-start, so the state exists for as long as a swap takes and
     /// outlives it whenever a restore fails — this is what makes it visible
     /// instead of implied.
-    pub stopped: AtomicBool,
+    pub stopped: Arc<AtomicBool>,
     /// One token per graph, cloned into every stage.
     pub cancel: queen_mq::Cancel,
 }
