@@ -103,7 +103,26 @@ fn rolling_sub_windows(time_ms: i64, count: i64, cost_max: i64) -> u32 {
 }
 
 fn budget(b: &v1::Budget, cost_max: i64, out: &mut Vec<Problem>, node: &str) -> Budget {
-    let time_ms = b.period_seconds.max(1) * 1000;
+    let seconds = b.period_seconds.max(1);
+    // v1 carries seconds in an i64 while v2 carries milliseconds in one. The
+    // multiplication can therefore overflow for a document that is perfectly
+    // valid on the old wire. Keep the migration total and say explicitly when
+    // the destination type cannot represent the original duration.
+    let time_ms = seconds.saturating_mul(1000);
+    if seconds > i64::MAX / 1000 {
+        out.push(w(
+            "period-clamped",
+            format!(
+                "budget `{}` of node `{node}` declares periodSeconds {}. The v2 `timeMs` field \
+                 cannot represent that many milliseconds, so it was capped at {}ms instead of \
+                 overflowing the migration. Lower the period and redeclare if this budget is \
+                 intended to rotate on an operational timescale.",
+                b.id,
+                b.period_seconds,
+                i64::MAX
+            ),
+        ));
+    }
     let count = (b.cap.floor() as i64).max(1);
 
     let sub_windows = match b.alignment {
@@ -125,8 +144,8 @@ fn budget(b: &v1::Budget, cost_max: i64, out: &mut Vec<Problem>, node: &str) -> 
                      admitted.",
                     b.id,
                     (time_ms / n.max(1) as i64) / 1000,
-                    2 * (count / n.max(1) as i64).max(1),
-                    2 * count
+                    (count / n.max(1) as i64).max(1).saturating_mul(2),
+                    count.saturating_mul(2)
                 ),
             ));
             Some(n)
