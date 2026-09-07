@@ -22,13 +22,14 @@ import { computed } from 'vue'
     on-screen evidence that the model and the vendor disagree.
 */
 const props = defineProps({
-  used: { type: Number, required: true },
+  used: { type: Number, default: null },
   cap: { type: Number, required: true },
   assumed: { type: Boolean, default: false },
   height: { type: Number, default: 6 },
 })
 
-const ratio = computed(() => (props.cap > 0 ? props.used / props.cap : 0))
+const known = computed(() => props.used !== null && props.used !== undefined && props.cap > 0)
+const ratio = computed(() => (known.value ? props.used / props.cap : 0))
 const width = computed(() => `${Math.min(100, Math.max(0, ratio.value * 100))}%`)
 const over = computed(() => ratio.value > 1)
 
@@ -43,7 +44,7 @@ const fill = computed(() => {
   <div class="w-full">
     <div class="w-full rounded-full bg-surface-2 overflow-hidden"
          :style="{ height: `${height}px` }">
-      <div class="h-full rounded-full transition-[width] duration-500 ease-spring"
+      <div v-if="known" class="h-full rounded-full transition-[width] duration-500 ease-spring"
            :class="[fill, assumed ? 'opacity-60' : '']"
            :style="{
              width,
@@ -51,6 +52,9 @@ const fill = computed(() => {
                ? 'repeating-linear-gradient(135deg, transparent 0 3px, rgb(0 0 0 / 0.25) 3px 6px)'
                : 'none',
            }" />
+    </div>
+    <div v-if="!known" class="mt-1 text-[11px] text-fg-3">
+      no single live value is available for this budget
     </div>
     <div v-if="over" class="mt-1 text-[11px] text-bad tabular-nums">
       over cap by {{ Math.round((ratio - 1) * 100) }}%

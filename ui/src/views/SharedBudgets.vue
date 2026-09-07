@@ -146,7 +146,7 @@ function enforcedOf(b) {
         </div>
 
         <div class="mt-2.5">
-          <BudgetBar :used="b.used ?? 0" :cap="ceilingOf(b)"
+          <BudgetBar :used="b.used" :cap="ceilingOf(b)"
                      :assumed="b.confidence === 'assumed'" :height="7" />
         </div>
 
