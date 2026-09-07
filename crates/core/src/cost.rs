@@ -69,10 +69,22 @@ pub fn cost_of(cost: &Cost, data: &Value) -> Result<i64, TooExpensive> {
         Cost::Fixed(n) => (*n, *n),
         Cost::Path(c) => {
             let max = c.max.unwrap_or(c.default);
-            let v = resolve(data, &c.path)
-                .and_then(integral)
-                .filter(|n| *n >= 1)
-                .unwrap_or(c.default);
+            let v = match resolve(data, &c.path) {
+                Some(value) => match integral(value) {
+                    Ok(value) => value.filter(|n| *n >= 1).unwrap_or(c.default),
+                    // `i64::MAX` is the largest lower bound the public error
+                    // type can carry. It is enough to refuse every ordinary
+                    // maximum; equality is the sentinel for an out-of-range
+                    // positive number and gets its own truthful message below.
+                    Err(()) => {
+                        return Err(TooExpensive {
+                            cost: i64::MAX,
+                            max,
+                        })
+                    }
+                },
+                None => c.default,
+            };
             (v, max)
         }
     };
@@ -94,6 +106,13 @@ pub struct TooExpensive {
 
 impl std::fmt::Display for TooExpensive {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.cost == i64::MAX && self.max == i64::MAX {
+            return write!(
+                f,
+                "this item declares a cost outside the signed 64-bit range the broker can charge: \
+                 refusing it is safer than silently charging i64::MAX"
+            );
+        }
         write!(
             f,
             "this item declares a cost of {} and the node admits at most {}: an item that cannot \
@@ -105,13 +124,38 @@ impl std::fmt::Display for TooExpensive {
 }
 
 /// A JSON number that is a whole number. `3.0` is three; `3.5` is not a cost.
-fn integral(v: &Value) -> Option<i64> {
+///
+/// A whole number outside `i64` is an error rather than a missing value. Rust's
+/// float-to-integer cast saturates, so treating it as an ordinary conversion
+/// would collapse every larger JSON number to `i64::MAX` and undercharge it.
+fn integral(v: &Value) -> Result<Option<i64>, ()> {
     match v {
         Value::Number(n) => match n.as_i64() {
-            Some(i) => Some(i),
-            None => n.as_f64().filter(|f| f.fract() == 0.0).map(|f| f as i64),
+            Some(i) => Ok(Some(i)),
+            None => {
+                let Some(f) = n.as_f64() else {
+                    return Ok(None);
+                };
+                if f.fract() != 0.0 {
+                    return Ok(None);
+                }
+                // `i64::MAX as f64` rounds to 2^63, one past the largest i64,
+                // so the upper bound is deliberately exclusive. The lower one
+                // is inclusive because -2^63 is representable.
+                const I64_BOUND: f64 = 9_223_372_036_854_775_808.0;
+                if f >= I64_BOUND {
+                    return Err(());
+                }
+                // A negative value already means "use the default". Keep that
+                // tolerance even when its magnitude is outside i64; unlike an
+                // oversized positive cost, it cannot make Gate undercharge.
+                if f < -I64_BOUND {
+                    return Ok(None);
+                }
+                Ok(Some(f as i64))
+            }
         },
-        _ => None,
+        _ => Ok(None),
     }
 }
 
