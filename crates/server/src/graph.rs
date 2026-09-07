@@ -89,11 +89,16 @@ pub async fn declare_locked(
     let key = doc.key();
     let (plan, facts) = compile(app, &doc).await;
 
+    // Validate the resolved plan, not a second compilation with library
+    // defaults. In particular this includes the fleet-wide worker override:
+    // an unsafe `GATE_STAGE_CONCURRENCY` must be refused before the SDK
+    // preallocates and spawns that many consumer tasks.
+    //
     // A caller's declare is held to every rule. A document coming back from the
     // store is not: it was accepted by some version of Gate and is, in the
     // ordinary case, already serving traffic, so a rule added since then must
     // not be the thing that takes it down. See `refuses_stored_document`.
-    let problems = gate_core::validate_with(&doc, &facts);
+    let problems = gate_core::validate_plan_with(&doc, &plan, &facts);
     let (fatal, kept): (Vec<_>, Vec<_>) = if from_caller {
         (problems, Vec::new())
     } else {

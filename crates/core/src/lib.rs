@@ -34,6 +34,7 @@ pub use plan::{
     ASSUMED_FACTOR, DEFAULT_BATCH, DEFAULT_INGRESS_PARTITIONS,
 };
 pub use validate::{
-    needs_version_bump, refuses_stored_document, validate, validate_with, warnings, warnings_with,
-    ExternalFacts, Problem, QueueFacts, MAX_BREAKER_COUNTERS,
+    needs_version_bump, refuses_stored_document, validate, validate_plan_with, validate_with,
+    warnings, warnings_with, ExternalFacts, Problem, QueueFacts, MAX_BREAKER_COUNTERS,
+    MAX_GRAPH_WORKERS,
 };
