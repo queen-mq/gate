@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 
 use gate_core::{v1, GraphDoc};
 
-use crate::api::{find, ok, resolve, ApiResult, Fail, Shared};
+use crate::api::{find, ok, resolve, resolve_found, ApiResult, Fail, Shared};
 use crate::registry::GraphRuntime;
 
 // ------------------------------------------------------------------- reading a body
@@ -152,11 +152,16 @@ pub async fn del_graph(
 }
 
 pub async fn del_graph_default(State(st): State<Shared>, Path(name): Path<String>) -> ApiResult {
-    let app = match st.registry.resolve(&name) {
-        crate::registry::Resolved::One(g) => g.doc.application.clone(),
-        _ => gate_core::default_application(),
+    // The flat GET and data-plane routes refuse an ambiguous name; DELETE must
+    // obey the same rule. Falling back to `default` here could remove one of the
+    // colliding graphs precisely when the caller had not identified which one.
+    let application = match st.registry.resolve(&name) {
+        // Preserve idempotent flat deletes: with no live match, the route still
+        // removes a possibly stored default-application document.
+        crate::registry::Resolved::None => gate_core::default_application(),
+        found => resolve_found(&name, found)?.doc.application.clone(),
     };
-    ok(crate::graph::remove(&st, &app, &name).await?)
+    ok(crate::graph::remove(&st, &application, &name).await?)
 }
 
 pub async fn topology(

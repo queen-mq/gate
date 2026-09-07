@@ -590,6 +590,57 @@ fn egress_of(tag: &str, application: &str) -> String {
     format!("test.{tag}.{application}.out")
 }
 
+/// Every flat route resolves a bare graph name across applications and refuses
+/// to guess when more than one matches. DELETE used to be the exception: it
+/// silently fell back to `default` and could remove that tenant's graph.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn a_flat_delete_refuses_an_ambiguous_graph_name() {
+    let Some(h) = harness("ambiguous-delete").await else {
+        return;
+    };
+    let other = format!("{}-other", h.application);
+    let name = "same";
+
+    for (application, suffix) in [(&h.application, "one"), (&other, "two")] {
+        let doc = one_node(
+            &format!("test.ambiguous-delete.{application}.{suffix}.out"),
+            wide("b"),
+        );
+        let (status, body) = h
+            .send(
+                reqwest::Method::PUT,
+                &format!("/v1/apps/{application}/graphs/{name}"),
+                Some(doc),
+            )
+            .await;
+        assert_eq!(status, 200, "declare {application}: {body}");
+    }
+
+    let (status, body) = h
+        .send(reqwest::Method::DELETE, &format!("/v1/graphs/{name}"), None)
+        .await;
+    assert_eq!(status, 409, "an ambiguous delete must not choose: {body}");
+
+    for application in [&h.application, &other] {
+        let (status, body) = h
+            .send(
+                reqwest::Method::GET,
+                &format!("/v1/apps/{application}/graphs/{name}"),
+                None,
+            )
+            .await;
+        assert_eq!(status, 200, "{application} was removed: {body}");
+        let _ = h
+            .send(
+                reqwest::Method::DELETE,
+                &format!("/v1/apps/{application}/graphs/{name}"),
+                None,
+            )
+            .await;
+    }
+}
+
 // ============================================================== the relay
 
 /// Exactly once, across a two-node graph. `got.len() == N` AND `distinct == N`,
