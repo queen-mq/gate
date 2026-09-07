@@ -189,6 +189,17 @@ fn a_node_needs_at_least_one_unscoped_budget() {
     assert!(got.contains(&"node-unscoped-budget"), "{got:?}");
 }
 
+/// A conditional counter is not a breaker lever for operations it does not
+/// select. At least one unscoped counter must therefore take every item.
+#[test]
+fn a_node_needs_an_unconditional_unscoped_budget() {
+    let got = broken(|d| {
+        let n = d.nodes.get_mut("audit").unwrap();
+        n.budgets[0].when_op = Some(vec!["photo.delete".into()]);
+    });
+    assert!(got.contains(&"node-unscoped-budget"), "{got:?}");
+}
+
 #[test]
 fn a_budget_that_cannot_admit_anything_never_will() {
     assert!(
