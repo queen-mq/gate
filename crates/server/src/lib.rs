@@ -332,7 +332,15 @@ pub async fn reconcile(app: &api::Shared) {
             // matters: a graph whose provisioning failed is registered-and-
             // stopped, and comparing documents alone would leave it down for
             // ever while its ingress queue kept filling.
-            Some(doc) if doc == rt.doc && rt.is_running() => {}
+            Some(doc) if doc == rt.doc && rt.is_running() => {
+                // Seeing this exact document in the authoritative store is
+                // proof that it is durable, even if this replica never saw the
+                // answer to its own write. Without repairing the marker here,
+                // a later delete on another replica is mistaken for a failed
+                // initial save and this replica resurrects the graph.
+                rt.persisted
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             Some(doc) => {
                 tracing::info!(graph = %doc.key(), "reconcile: re-declaring a graph that is changed or not fully up");
                 if let Err(e) = graph::declare_from_store(app, doc).await {
