@@ -2945,6 +2945,17 @@ async fn an_eta_tells_a_budget_backlog_from_a_worker_one() {
     assert_eq!(eta["waitingForBudget"], json!(0), "{eta}");
     assert_eq!(eta["state"], "waiting-workers", "{eta}");
 
+    // The graph detail is what the topology diagram reads. These fields used
+    // to be absent, which the Vue component silently rendered as two zeroes.
+    let (status, view) = h.get_graph("g").await;
+    assert_eq!(status, 200, "{view}");
+    let node = &view["nodes"][0];
+    assert_eq!(node["waiting_for_budget"], json!(0), "{view}");
+    assert!(
+        node["waiting_for_workers"].as_u64().unwrap_or(0) as usize >= N,
+        "the graph must show the worker backlog instead of a fallback zero: {view}"
+    );
+
     h.cleanup("g").await;
 }
 

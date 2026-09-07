@@ -266,6 +266,8 @@ async function remove() {
                         running: graph.running,
                         paths: n.paths ?? [],
                         budgets: n.budgets ?? [],
+                        waiting_for_budget: n.waiting_for_budget,
+                        waiting_for_workers: n.waiting_for_workers,
                       }))"
                       :edges="edges" />
       </section>
