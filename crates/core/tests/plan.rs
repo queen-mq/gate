@@ -551,6 +551,44 @@ fn a_scope_is_required_only_when_its_budget_applies() {
     );
 }
 
+fn budget_key_components_cannot_smuggle_separators() {
+    let mut doc = airbnb();
+    doc.nodes.get_mut("photos").unwrap().budgets[1].id = Some("per:listing%v2".into());
+    let p = compile(&doc);
+    let b = p
+        .node("photos")
+        .unwrap()
+        .budgets
+        .iter()
+        .find(|b| b.id == "per:listing%v2")
+        .unwrap();
+
+    assert_eq!(
+        b.key_for(Some("listing:42%blue")),
+        "b:channel:airbnb:photos:per%3Alisting%25v2:listing%3A42%25blue"
+    );
+    assert_ne!(
+        plan::budget_key("channel", "airbnb", "photos", "per:listing"),
+        format!(
+            "{}:listing",
+            plan::budget_key("channel", "airbnb", "photos", "per")
+        )
+    );
+}
+
+#[test]
+fn local_and_shared_budget_namespaces_cannot_collide() {
+    let local = plan::budget_key("channel", "shared", "vendor", "minute");
+    let shared_scoped = format!("{}:minute", plan::shared_budget_key("channel", "vendor"));
+    assert_eq!(local, "b:channel:%73hared:vendor:minute");
+    assert_ne!(local, shared_scoped);
+
+    assert_ne!(
+        plan::shared_budget_key("channel", "vendor:minute"),
+        shared_scoped
+    );
+}
+
 // ---------------------------------------------------------------------- cost
 
 #[test]
