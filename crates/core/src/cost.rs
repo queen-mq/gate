@@ -7,7 +7,7 @@
 
 use serde_json::Value;
 
-use crate::doc::{Cost, PAYLOAD_ROOT};
+use crate::doc::{Cost, GATE_META, PAYLOAD_ROOT};
 
 /// Walk a dotted payload path. The first segment must be `payload`, which names
 /// the message's own `data`; `payload.a.b` is `data["a"]["b"]`.
@@ -21,22 +21,30 @@ pub fn resolve<'a>(data: &'a Value, path: &str) -> Option<&'a Value> {
     if segs.next()? != PAYLOAD_ROOT {
         return None;
     }
-    let mut cur = data;
+    let first = segs.next()?;
+    if first.is_empty() || first == GATE_META {
+        return None;
+    }
+    let mut cur = data.get(first)?;
     for s in segs {
+        if s.is_empty() {
+            return None;
+        }
         cur = cur.get(s)?;
     }
     Some(cur)
 }
 
 /// Whether a string is a usable payload path: `payload` plus at least one
-/// segment, each of them non-empty.
+/// non-empty segment. Gate's root `_gate` envelope is deliberately outside the
+/// declaration language: costs and scopes may only come from producer data.
 pub fn ok_payload_path(path: &str) -> bool {
     let mut segs = path.split('.');
     if segs.next() != Some(PAYLOAD_ROOT) {
         return false;
     }
     let rest: Vec<&str> = segs.collect();
-    !rest.is_empty() && rest.iter().all(|s| !s.is_empty())
+    !rest.is_empty() && rest.first() != Some(&GATE_META) && rest.iter().all(|s| !s.is_empty())
 }
 
 /// The scope value a budget keys on, as it reaches the kv key.
