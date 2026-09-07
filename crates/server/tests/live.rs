@@ -412,16 +412,21 @@ impl Harness {
 /// v2 adds two failures it must cover that v1 had no equivalent of: a KV route
 /// that refuses (does the relay refund and release, or lose the batch?) and a
 /// transaction that fails AFTER a successful charge (does the refund fire?).
+type RefusalRule = Arc<parking_lot::RwLock<Option<(Option<axum::http::Method>, String)>>>;
+
 struct FaultyBroker {
     url: String,
-    refuse: Arc<parking_lot::RwLock<Option<String>>>,
+    refuse: RefusalRule,
     absent: Arc<parking_lot::RwLock<Option<String>>>,
     seen: Arc<parking_lot::RwLock<Vec<String>>>,
 }
 
 impl FaultyBroker {
     fn refuse(&self, marker: &str) {
-        *self.refuse.write() = Some(marker.to_string());
+        *self.refuse.write() = Some((None, marker.to_string()));
+    }
+    fn refuse_method(&self, method: axum::http::Method, marker: &str) {
+        *self.refuse.write() = Some((Some(method), marker.to_string()));
     }
     fn allow(&self) {
         *self.refuse.write() = None;
@@ -448,7 +453,7 @@ impl FaultyBroker {
 struct ProxyState {
     real: String,
     http: reqwest::Client,
-    refuse: Arc<parking_lot::RwLock<Option<String>>>,
+    refuse: RefusalRule,
     absent: Arc<parking_lot::RwLock<Option<String>>>,
     seen: Arc<parking_lot::RwLock<Vec<String>>>,
 }
@@ -520,9 +525,11 @@ async fn proxy(
         }
     }
 
-    if let Some(marker) = st.refuse.read().clone() {
+    if let Some((method, marker)) = st.refuse.read().clone() {
         let text = String::from_utf8_lossy(&bytes);
-        if marker.is_empty() || text.contains(&marker) || path.contains(&marker) {
+        let method_matches = method.as_ref().is_none_or(|m| m == parts.method);
+        if method_matches && (marker.is_empty() || text.contains(&marker) || path.contains(&marker))
+        {
             return (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "refused by the test",
@@ -3080,7 +3087,7 @@ async fn a_declare_that_cannot_be_stored_is_not_acknowledged() {
     // Refuse only the store write. It is a path-route `PUT /api/v1/kv/{ns}/{key}`,
     // so the key reaches the proxy URL-ENCODED and the marker has to be spelt the
     // way the wire spells it — `graph:` matches nothing.
-    faulty.refuse("graph%3A");
+    faulty.refuse_method(axum::http::Method::PUT, "graph%3A");
     let (status, res) = h.put_graph("g", one_node(&out, wide("b"))).await;
     faulty.allow();
     assert_eq!(
@@ -3121,7 +3128,7 @@ async fn a_declare_that_cannot_be_stored_is_not_acknowledged() {
     let mut v2 = one_node(&out, wide("b"));
     v2["version"] = json!(2);
     v2["nodes"]["n"]["budgets"][0]["count"] = json!(7);
-    faulty.refuse("graph%3A");
+    faulty.refuse_method(axum::http::Method::PUT, "graph%3A");
     let (status, res) = h.put_graph("g", v2).await;
     faulty.allow();
     assert_eq!(status, 502, "{res}");
@@ -3218,11 +3225,10 @@ async fn a_declare_that_cannot_be_restored_leaves_nothing_registered() {
     assert_eq!(status, 200, "declare: {body}");
     assert!(h.app.registry.get(&h.application, "g").is_some());
 
-    // Refuse the graph's queue rather than every broker route. The ownership
-    // preflight added by this fix must still be allowed to read the inventory;
-    // after it succeeds, both the new plan and the restore of the old plan use
-    // this same ingress queue and therefore fail provisioning.
-    faulty.refuse(&format!("gate.{}.g.n.ingress", h.application));
+    // No queue can be configured now, so neither the new plan nor the old one
+    // can be provisioned. Reads remain available: this test is about a failed
+    // swap, not about the predecessor check failing closed.
+    faulty.refuse("configure");
     let mut v2 = one_node(&out, wide("b"));
     v2["version"] = json!(2);
     v2["nodes"]["n"]["budgets"][0]["count"] = json!(7);
@@ -3464,6 +3470,42 @@ async fn a_second_replica_converges_on_the_stored_document() {
         second.registry.by_key(&key).is_none(),
         "a delete on one replica must reach the others"
     );
+}
+
+/// A caller cannot evade the version-bump rule by reaching a replica before
+/// that replica's reconcile loop has loaded the graph.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn a_fresh_replica_checks_the_stored_version_before_redeclaring() {
+    let Some(h) = harness("remote-version").await else {
+        return;
+    };
+    let out = egress_of("remote-version", &h.application);
+    let (status, body) = h.put_graph("g", one_node(&out, wide("b"))).await;
+    assert_eq!(status, 200, "declare: {body}");
+
+    // This replica deliberately has no local runtime. Renaming the budget
+    // re-founds its counter and therefore needs a bump above the stored v1.
+    let second = serve(&h.app.queen_url).await;
+    assert!(second.registry.all().is_empty());
+    let second_base = spawn_server(second).await;
+    let mut changed = one_node(&out, wide("renamed"));
+    changed["version"] = json!(1);
+    let res = reqwest::Client::new()
+        .put(format!("{second_base}/v1/apps/{}/graphs/g", h.application))
+        .json(&changed)
+        .send()
+        .await
+        .expect("declare on the fresh replica");
+    let status = res.status().as_u16();
+    let body: Value = res.json().await.unwrap_or(Value::Null);
+    assert_eq!(status, 409, "the stored predecessor was ignored: {body}");
+    assert!(
+        body.to_string().contains("bump version above 1"),
+        "the refusal should identify the required version: {body}"
+    );
+
+    h.cleanup("g").await;
 }
 
 /// A replica converges on a redeclared graph instead of wedging.
