@@ -3,12 +3,14 @@ import { ref, onMounted, computed } from 'vue'
 import { useRoute } from 'vue-router'
 import Icon from './components/Icon.vue'
 import SignIn from './views/SignIn.vue'
-import { api, authState, me, fetchMe, isAdmin, LOGOUT_URL, READ_ONLY_NOTE } from './lib/api.js'
+import { api, authState, me, fetchMe, isAdmin, READ_ONLY_NOTE } from './lib/api.js'
 
 const route = useRoute()
 const overview = ref(null)
 const dark = ref(document.documentElement.classList.contains('dark'))
 const mobileNav = ref(false)
+const signingOut = ref(false)
+const signOutError = ref('')
 
 /*
   Navigation grouped by intent: "Monitor" is what an operator opens when a
@@ -35,6 +37,23 @@ function toggleTheme() {
   dark.value = !dark.value
   document.documentElement.classList.toggle('dark', dark.value)
   localStorage.setItem('gate-theme', dark.value ? 'dark' : 'light')
+}
+
+async function signOut() {
+  if (signingOut.value) return
+  signingOut.value = true
+  signOutError.value = ''
+  try {
+    await api.post('/api/auth/logout', null)
+    window.location.assign('/')
+  } catch (e) {
+    // A 401 already switches the shell to SignIn. Other failures leave the
+    // current session intact and should be visible rather than becoming an
+    // unhandled event promise in the console.
+    if (authState.value !== 'login') signOutError.value = e.message
+  } finally {
+    signingOut.value = false
+  }
 }
 
 async function load() {
@@ -146,11 +165,16 @@ const warnings = computed(() => {
               </span>
               <span class="block text-[11px] text-fg-3 truncate">{{ me.role || 'unknown role' }}</span>
             </span>
-            <a v-if="me.email" :href="LOGOUT_URL" class="w-7 h-7 grid place-items-center rounded-md
-                      text-fg-3 hover:text-fg hover:bg-surface-2 transition-colors" title="Sign out">
+            <button v-if="me.actor === 'google'" type="button" :disabled="signingOut"
+                    class="w-7 h-7 grid place-items-center rounded-md text-fg-3 hover:text-fg
+                           hover:bg-surface-2 transition-colors disabled:opacity-50"
+                    title="Sign out" @click="signOut">
               <Icon name="x" :size="13" />
-            </a>
+            </button>
           </div>
+          <p v-if="signOutError" class="text-[11px] leading-snug text-bad">
+            Could not sign out: {{ signOutError }}
+          </p>
           <p v-if="!isAdmin" class="text-[11px] leading-snug text-fg-3">{{ READ_ONLY_NOTE }}</p>
         </div>
 

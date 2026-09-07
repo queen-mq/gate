@@ -19,10 +19,6 @@ export const me = ref(null) // { actor, email, role }
 */
 export const isAdmin = computed(() => me.value?.role === 'admin')
 export const READ_ONLY_NOTE = 'read-only: your account is not in GATE_ADMIN_EMAILS'
-/* A GET that clears the cookie and redirects, so it is a link and not a fetch —
-   going through the API client would follow the redirect inside XHR and leave
-   the console showing a stale identity. */
-export const LOGOUT_URL = '/api/auth/logout'
 
 async function request(path, { method = 'GET', body } = {}) {
   const headers = {}

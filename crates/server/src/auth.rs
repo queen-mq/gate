@@ -7,9 +7,10 @@
 //! rule can expose something by accident, and the same router serves both ports
 //! unchanged.
 //!
-//! Two exemptions, both structural rather than chosen: `/auth/*`, because you
-//! cannot require a session in order to obtain one, and the static shell, which
-//! has to render the page the sign-in button lives on.
+//! Two exemptions, both structural rather than chosen: the two sign-in
+//! bootstrap routes, because you cannot require a session in order to obtain
+//! one, and the static shell, which has to render the page the sign-in button
+//! lives on. Logout is deliberately not a bootstrap route.
 //!
 //! The claim checks mirror `queen-proxy`'s `validate_google_claims`, including
 //! its `hd` OR email-domain form. Diverging would give two products in one house
@@ -40,7 +41,9 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const STATE_TTL_S: i64 = 300;
 pub const COOKIE: &str = "gate_session";
 const OAUTH_STATE_COOKIE: &str = "gate_oauth_state";
+const OAUTH_LOGIN_PATH: &str = "/api/auth/google/login";
 const OAUTH_CALLBACK_PATH: &str = "/api/auth/google/callback";
+const LOGOUT_PATH: &str = "/api/auth/logout";
 
 #[derive(Clone)]
 pub struct AuthConfig {
@@ -525,16 +528,13 @@ pub async fn callback(
     response
 }
 
-pub async fn logout() -> Response {
+pub async fn logout(axum::Json(()): axum::Json<()>) -> Response {
     (
-        StatusCode::SEE_OTHER,
-        [
-            (
-                header::SET_COOKIE,
-                format!("{COOKIE}=; Path=/; HttpOnly; Max-Age=0"),
-            ),
-            (header::LOCATION, "/".to_string()),
-        ],
+        StatusCode::NO_CONTENT,
+        [(
+            header::SET_COOKIE,
+            format!("{COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"),
+        )],
     )
         .into_response()
 }
@@ -600,14 +600,13 @@ pub async fn require_session(
     next: axum::middleware::Next,
 ) -> Response {
     let path = req.uri().path().to_string();
-    let exempt = path.starts_with("/api/auth/") || path == "/health" || is_shell(&path);
-    if exempt {
+    if session_exempt(&path) {
         return next.run(req).await;
     }
     // The laptop case: no Google client at all, or one that is configured but
     // deliberately stood down for local work.
     if let Some(dev) = dev_identity(app.auth.as_ref().map(|a| &a.cfg)) {
-        if writes(req.method()) && !is_admin(&dev.email) {
+        if requires_admin(req.method(), &path) && !is_admin(&dev.email) {
             return (
                 StatusCode::FORBIDDEN,
                 "read-only: this account is not in GATE_ADMIN_EMAILS",
@@ -628,7 +627,7 @@ pub async fn require_session(
             // Keyed on the METHOD rather than on a list of paths, so a route
             // added tomorrow cannot be born unprotected because someone forgot
             // to enumerate it.
-            if writes(req.method()) && !is_admin(&s.email) {
+            if requires_admin(req.method(), &path) && !is_admin(&s.email) {
                 return (
                     StatusCode::FORBIDDEN,
                     "read-only: this account is not in GATE_ADMIN_EMAILS",
@@ -669,6 +668,16 @@ fn writes(m: &axum::http::Method) -> bool {
     !matches!(*m, axum::http::Method::GET | axum::http::Method::HEAD)
 }
 
+/// Logout mutates only the caller's own browser cookie. It still requires a
+/// valid session, but a read-only operator must be able to end that session.
+fn requires_admin(method: &axum::http::Method, path: &str) -> bool {
+    writes(method) && path != LOGOUT_PATH
+}
+
+fn session_exempt(path: &str) -> bool {
+    path == OAUTH_LOGIN_PATH || path == OAUTH_CALLBACK_PATH || path == "/health" || is_shell(path)
+}
+
 fn is_shell(path: &str) -> bool {
     path == "/" || path.starts_with("/assets/") || path == "/favicon.ico"
 }
@@ -686,9 +695,12 @@ fn urlencode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use axum::http::{header, HeaderMap, HeaderValue};
+    use axum::http::{header, HeaderMap, HeaderValue, Method};
 
-    use super::{cookie_value, nonce, oauth_state_cookie, safe_next, OAUTH_STATE_COOKIE};
+    use super::{
+        cookie_value, nonce, oauth_state_cookie, requires_admin, safe_next, session_exempt,
+        LOGOUT_PATH, OAUTH_CALLBACK_PATH, OAUTH_LOGIN_PATH, OAUTH_STATE_COOKIE,
+    };
 
     #[test]
     fn oauth_nonces_are_fresh_128_bit_hex_values() {
@@ -697,6 +709,18 @@ mod tests {
         assert_eq!(first.len(), 32);
         assert!(first.bytes().all(|b| b.is_ascii_hexdigit()));
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn logout_requires_a_session_but_not_an_admin() {
+        assert!(session_exempt(OAUTH_LOGIN_PATH));
+        assert!(session_exempt(OAUTH_CALLBACK_PATH));
+        assert!(!session_exempt(LOGOUT_PATH));
+        assert!(!session_exempt("/api/auth/future-route"));
+
+        assert!(!requires_admin(&Method::POST, LOGOUT_PATH));
+        assert!(requires_admin(&Method::POST, "/v1/apps/a/graphs/g"));
+        assert!(!requires_admin(&Method::GET, "/api/graphs"));
     }
 
     #[test]
