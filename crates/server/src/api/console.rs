@@ -140,10 +140,11 @@ pub async fn list_targets(State(app): State<Shared>) -> ApiResult {
     let mut out = Vec::new();
 
     for g in app.registry.all() {
-        // The backlog of everything that has not been admitted yet: every
-        // ingress queue this graph reads, under the group that reads it.
+        // The backlog of everything that has not been admitted yet: every stage
+        // source this graph reads, under the group that reads it. Interior
+        // stages matter too — a downstream budget can be the binding one.
         let mut backlog = 0u64;
-        for s in g.stages.iter().filter(|s| s.stage.first_hop) {
+        for s in &g.stages {
             backlog += app
                 .depths
                 .pending_of_group(&app.queen, &s.stage.source, &s.stage.group)
@@ -228,7 +229,13 @@ pub async fn list_targets(State(app): State<Shared>) -> ApiResult {
             "worst_assumed": worst.4,
             "admitted": adm,
             "denied": den,
-            "state": if den > 0 { "pacing" } else { "flowing" },
+            "state": if !g.is_running() {
+                "down"
+            } else if backlog > 0 {
+                "pacing"
+            } else {
+                "flowing"
+            },
             "backlog": backlog,
             "at": now,
         }));
