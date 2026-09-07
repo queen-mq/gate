@@ -20,11 +20,13 @@ pub mod plan;
 pub mod v1;
 pub mod validate;
 
-pub use cost::{cost_of, ok_payload_path, op_matches, op_of, resolve, scope_value, TooExpensive};
+pub use cost::{
+    cost_of, missing_scope, ok_payload_path, op_matches, op_of, resolve, scope_value, TooExpensive,
+};
 pub use doc::{
     default_application, ok_name, ok_target_name, Budget, Confidence, Cost, CostPath, Counters,
-    Egress, EgressSpec, GraphDoc, Ingress, IngressSpec, Node, Path, PathElem, GATE_META,
-    PAYLOAD_ROOT,
+    Egress, EgressSpec, GraphDoc, Ingress, IngressSpec, Node, Path, PathElem,
+    COUNTERS_WINDOW_SECONDS, GATE_META, PAYLOAD_ROOT,
 };
 pub use ids::derive;
 pub use plan::{
@@ -34,6 +36,7 @@ pub use plan::{
     ASSUMED_FACTOR, DEFAULT_BATCH, DEFAULT_INGRESS_PARTITIONS,
 };
 pub use validate::{
-    needs_version_bump, validate, validate_with, warnings, warnings_with, ExternalFacts, Problem,
-    QueueFacts,
+    needs_version_bump, refuses_stored_document, validate, validate_plan_with, validate_with,
+    warnings, warnings_with, ExternalFacts, Problem, QueueFacts, MAX_BREAKER_COUNTERS,
+    MAX_GRAPH_WORKERS,
 };

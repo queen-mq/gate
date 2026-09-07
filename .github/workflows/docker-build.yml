@@ -18,10 +18,10 @@ name: Docker Image
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "master" ]
     tags: [ "v*" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "master" ]
   workflow_dispatch:
 
 # One run per ref: a tag push landing on top of a branch push should supersede

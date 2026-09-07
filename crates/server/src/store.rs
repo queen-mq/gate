@@ -60,22 +60,110 @@ pub async fn save(queen: &Queen, doc: &GraphDoc) -> Result<()> {
     Ok(())
 }
 
+/// The declaration currently stored for one graph.
+///
+/// A caller's declare needs this exact read even when the replica has not
+/// reconciled yet. A prefix scan is the wrong primitive for that check: it can
+/// be paged, and a graph past the first page would look new and escape the
+/// version-bump rule.
+pub async fn load_one(queen: &Queen, app: &str, name: &str) -> Result<Option<GraphDoc>> {
+    let current = queen.kv().get(&ns(), &graph_key(app, name)).await?;
+    if current.found() {
+        let value = current.value.ok_or_else(|| {
+            queen_mq::Error::Decode(format!(
+                "stored graph `{app}/{name}` was found without a value"
+            ))
+        })?;
+        return decode_graph(value, app, name).map(Some);
+    }
+
+    // A v1 standalone target may not have been restored by this replica yet.
+    // It is still the stored predecessor of the one-node graph the caller is
+    // about to replace, so it participates in the same version check.
+    let legacy = queen.kv().get(&ns(), &v1_target_key(app, name)).await?;
+    if !legacy.found() {
+        return Ok(None);
+    }
+    let value = legacy.value.ok_or_else(|| {
+        queen_mq::Error::Decode(format!(
+            "stored v1 target `{app}/{name}` was found without a value"
+        ))
+    })?;
+    let old: v1::TargetSpec = serde_json::from_value(value).map_err(|e| {
+        queen_mq::Error::Decode(format!(
+            "stored v1 target `{app}/{name}` is unreadable: {e}"
+        ))
+    })?;
+    gate_core::migrate::from_v1_target(&old)
+        .map(|m| Some(m.doc))
+        .map_err(|e| queen_mq::Error::Decode(e.0))
+}
+
+fn decode_graph(value: serde_json::Value, app: &str, name: &str) -> Result<GraphDoc> {
+    match serde_json::from_value::<GraphDoc>(value.clone()) {
+        Ok(doc) => Ok(doc),
+        Err(v2_error) => {
+            let old: v1::GraphSpec = serde_json::from_value(value).map_err(|v1_error| {
+                queen_mq::Error::Decode(format!(
+                    "stored graph `{app}/{name}` is neither a readable v2 graph ({v2_error}) nor \
+                     a readable v1 graph ({v1_error})"
+                ))
+            })?;
+            gate_core::migrate::from_v1_graph(&old)
+                .map(|m| m.doc)
+                .map_err(|e| queen_mq::Error::Decode(e.0))
+        }
+    }
+}
+
 pub async fn forget(queen: &Queen, app: &str, name: &str) -> Result<()> {
+    // Remove legacy target rows first. A v1 graph-node target named
+    // `airbnb.ip` migrates to the one-node graph `ip`; deleting only
+    // `spec:{app}:ip` leaves `spec:{app}:airbnb.ip` behind and the next boot
+    // restores the graph that the caller just deleted.
+    queen
+        .kv()
+        .delete(&ns(), &v1_target_key(app, name))
+        .send()
+        .await?;
+    forget_dotted_v1_targets(queen, app, name).await?;
+
     queen
         .kv()
         .delete(&ns(), &graph_key(app, name))
         .send()
         .await?;
-    // A graph that came across from a v1 standalone target keeps its old row
-    // until it is deleted too, or the next boot restores it and the delete looks
-    // like it did not take.
-    queen
-        .kv()
-        .delete(&ns(), &v1_target_key(app, name))
-        .send()
-        .await
-        .ok();
     Ok(())
+}
+
+async fn forget_dotted_v1_targets(queen: &Queen, app: &str, graph: &str) -> Result<()> {
+    let prefix = format!("{V1_TARGET_PREFIX}{app}:");
+    let found = queen
+        .kv()
+        .get_prefix(&ns(), &prefix)
+        .limit(1000)
+        .send()
+        .await?;
+    if found.truncated() {
+        return Err(queen_mq::Error::Invalid(format!(
+            "cannot safely delete `{app}/{graph}`: more than 1000 legacy target rows share this application"
+        )));
+    }
+
+    for row in found.rows.unwrap_or_default() {
+        let belongs = row
+            .value
+            .and_then(|value| serde_json::from_value::<v1::TargetSpec>(value).ok())
+            .is_some_and(|old| legacy_graph_name(&old.name) == graph);
+        if belongs {
+            queen.kv().delete(&ns(), &row.key).send().await?;
+        }
+    }
+    Ok(())
+}
+
+fn legacy_graph_name(target: &str) -> &str {
+    target.rsplit('.').next().unwrap_or(target)
 }
 
 /// What a prefix read found, and whether it found everything.
@@ -117,16 +205,9 @@ pub async fn try_load_all(queen: &Queen) -> Result<Stored> {
     let mut items = Vec::new();
     let mut migrated = Vec::new();
     let mut unreadable = 0usize;
-    let mut truncated = false;
 
-    let res = queen
-        .kv()
-        .get_prefix(&ns(), GRAPH_PREFIX)
-        .limit(1000)
-        .send()
-        .await?;
-    truncated |= res.truncated();
-    for row in res.rows.unwrap_or_default() {
+    let (rows, graphs_complete) = scan_prefix(queen, GRAPH_PREFIX).await?;
+    for row in rows {
         let Some(value) = row.value else {
             unreadable += 1;
             continue;
@@ -161,14 +242,8 @@ pub async fn try_load_all(queen: &Queen) -> Result<Stored> {
     }
 
     // v1 standalone targets. Each becomes a one-node graph named for itself.
-    let res = queen
-        .kv()
-        .get_prefix(&ns(), V1_TARGET_PREFIX)
-        .limit(1000)
-        .send()
-        .await?;
-    truncated |= res.truncated();
-    for row in res.rows.unwrap_or_default() {
+    let (rows, targets_complete) = scan_prefix(queen, V1_TARGET_PREFIX).await?;
+    for row in rows {
         let Some(value) = row.value else {
             unreadable += 1;
             continue;
@@ -202,7 +277,147 @@ pub async fn try_load_all(queen: &Queen) -> Result<Stored> {
     }
     Ok(Stored {
         items,
-        complete: !truncated && unreadable == 0,
+        complete: graphs_complete && targets_complete && unreadable == 0,
         migrated,
     })
+}
+
+/// Read every page under one store prefix.
+///
+/// The broker caps a page by both rows and bytes. `truncated` therefore does
+/// not mean merely "there may be more than 1,000 documents": one large value
+/// can make even a short page incomplete. The exclusive `nextAfter` cursor is
+/// the only correct way to resume it.
+///
+/// A malformed truncated response is returned as incomplete rather than spun
+/// on forever. Reconcile may still add/change the documents it did see, but its
+/// `complete` guard will not interpret an unseen one as deleted.
+async fn scan_prefix(queen: &Queen, prefix: &str) -> Result<(Vec<queen_mq::KvRow>, bool)> {
+    let namespace = ns();
+    let mut rows = Vec::new();
+    let mut after: Option<String> = None;
+
+    loop {
+        let mut query = queen.kv().get_prefix(&namespace, prefix).limit(1000);
+        if let Some(cursor) = &after {
+            query = query.after(cursor);
+        }
+        let page = query.send().await?;
+        let truncated = page.truncated();
+        let next = page.next_after.clone();
+        rows.extend(page.rows.unwrap_or_default());
+
+        if !truncated {
+            return Ok((rows, true));
+        }
+        match next {
+            Some(cursor) if after.as_ref().is_none_or(|previous| cursor > *previous) => {
+                after = Some(cursor);
+            }
+            _ => return Ok((rows, false)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::extract::State;
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use parking_lot::Mutex;
+    use queen_mq::{Config, Queen};
+    use serde_json::{json, Value};
+
+    use super::*;
+
+    fn document(name: &str) -> Value {
+        json!({
+            "application": "paging",
+            "graph": name,
+            "version": 1,
+            "nodes": {
+                "n": {
+                    "budgets": [{ "id": "b", "count": 10, "timeMs": 1000 }],
+                    "ingress": true,
+                    "egress": "paging.out"
+                }
+            },
+            "paths": [{ "name": "main", "nodes": ["n"] }]
+        })
+    }
+
+    async fn kv_page(
+        State(seen): State<Arc<Mutex<Vec<Value>>>>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        seen.lock().push(body.clone());
+        let op = &body["operations"][0];
+        let prefix = op["prefix"].as_str().unwrap_or_default();
+        let after = op.get("after").and_then(Value::as_str);
+        let result = match (prefix, after) {
+            (GRAPH_PREFIX, None) => json!({
+                "index": 0,
+                "op": "getPrefix",
+                "rows": [{ "key": "graph:paging:a", "value": document("a"), "version": 1 }],
+                "truncated": true,
+                "nextAfter": "graph:paging:a"
+            }),
+            (GRAPH_PREFIX, Some("graph:paging:a")) => json!({
+                "index": 0,
+                "op": "getPrefix",
+                "rows": [{ "key": "graph:paging:b", "value": document("b"), "version": 1 }],
+                "truncated": false
+            }),
+            (V1_TARGET_PREFIX, None) => json!({
+                "index": 0,
+                "op": "getPrefix",
+                "rows": [],
+                "truncated": false
+            }),
+            _ => panic!("unexpected prefix page: {op}"),
+        };
+        Json(json!({ "results": [result] }))
+    }
+
+    #[tokio::test]
+    async fn a_truncated_store_scan_resumes_from_the_brokers_cursor() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake broker");
+        let url = format!("http://{}", listener.local_addr().expect("address"));
+        let router = Router::new()
+            .route("/api/v1/kv", post(kv_page))
+            .with_state(seen.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("serve fake broker")
+        });
+        let queen = Queen::connect(Config::new(url)).expect("client");
+
+        let stored = try_load_all(&queen).await.expect("scan store");
+        server.abort();
+
+        assert!(stored.complete, "both prefixes reached their final page");
+        assert_eq!(
+            stored.items.iter().map(GraphDoc::key).collect::<Vec<_>>(),
+            ["paging/a", "paging/b"]
+        );
+        let requests = seen.lock();
+        assert_eq!(requests.len(), 3, "two graph pages and one target page");
+        assert_eq!(
+            requests[1]["operations"][0]["after"],
+            json!("graph:paging:a"),
+            "the second page must use the broker's exclusive cursor"
+        );
+    }
+
+    #[test]
+    fn a_dotted_v1_target_maps_to_its_leaf_graph() {
+        assert_eq!(legacy_graph_name("airbnb.ip"), "ip");
+        assert_eq!(legacy_graph_name("standalone"), "standalone");
+    }
 }

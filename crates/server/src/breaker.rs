@@ -71,11 +71,29 @@ pub struct Record {
     pub node: String,
 }
 
+impl Record {
+    /// The wall-clock deadline, safe even when a broker record was written by
+    /// a broken or newer producer. Display code must not be able to overflow a
+    /// request merely by reading shared state.
+    pub fn until_ms(&self) -> i64 {
+        self.at
+            .saturating_add(self.retry_after_seconds.saturating_mul(1000))
+    }
+
+    fn valid(&self) -> bool {
+        self.at >= 0 && (MIN_SECONDS..=MAX_SECONDS).contains(&self.retry_after_seconds)
+    }
+}
+
+fn decode_record(value: Value) -> Option<Record> {
+    serde_json::from_value(value).ok().filter(Record::valid)
+}
+
 /// Trip the breaker on one node.
 ///
-/// The ordering is not arbitrary: **refund first**. After the window is spent
-/// the counter is at its ceiling, and a refund arriving then would open a hole
-/// in the very window we are about to close.
+/// The counter writes and the record are one KV batch, hence one PostgreSQL
+/// transaction. A caller must never be told the trip failed while an invisible
+/// breaker was nevertheless left holding the node.
 pub async fn trip(
     budgets: &Budgets,
     application: &str,
@@ -106,33 +124,21 @@ pub async fn trip(
             ),
         }));
     }
-
-    if let Some(refund) = body.refund_cost.filter(|c| *c > 0) {
-        // A CREDIT and not a refund: there is no charge of ours to identify, so
-        // there is no window to prove and `min: 0` is the only available guard.
-        // It is safe here and nowhere else, because the spend below overwrites
-        // whatever this credited a few microseconds later.
-        let charges: Vec<crate::budget::Charge> = first_by_key(node)
-            .into_iter()
-            .map(|b| crate::budget::Charge {
-                key: b.key.clone(),
-                max: b.max_for(node.widest_share()),
-                ttl: b.window_sub_seconds,
-                delta: refund,
-                budget_id: b.id.clone(),
-            })
-            .collect();
-        budgets.credit(&charges).await;
+    if keys.len() > gate_core::MAX_BREAKER_COUNTERS {
+        return Ok(too_wide(node, keys.len()));
     }
 
     // The WIDEST path's ceiling, so no path can slip under it: a path at
     // share 0.5 refuses itself at half the counter, and writing half would leave
-    // it admitting.
+    // it admitting. Replacing the old counter also gives back `refundCost`:
+    // none of the old window survives this write, and after the breaker expires
+    // the next charge starts a fresh window at zero. A separate decrement before
+    // this replacement was a no-op on success and leaked capacity if the trip
+    // subsequently failed.
     let spend: Vec<(String, i64)> = first_by_key(node)
         .into_iter()
         .map(|b| (b.key.clone(), b.max_for(node.widest_share())))
         .collect();
-    budgets.spend(&spend, seconds).await?;
 
     let rec = Record {
         at: crate::now_ms(),
@@ -142,10 +148,12 @@ pub async fn trip(
         graph: graph.to_string(),
         node: node.name.clone(),
     };
-    // Fleet-wide, and that is the point: v1's breach ring was per-replica, and a
-    // breach seen only by the pod nobody is looking at is a breach nobody sees.
+    // Fleet-wide and atomic with the counters. v1's breach ring was per-replica,
+    // and a breach seen only by the pod nobody is looking at is a breach nobody
+    // sees; a counter spent without this record is the same operationally.
     budgets
-        .put_json(
+        .spend_with_record(
+            &spend,
             &node.breaker_key,
             serde_json::to_value(&rec).unwrap_or(json!({})),
             seconds,
@@ -162,9 +170,9 @@ pub async fn trip(
         "ok": true,
         "node": node.name,
         "retryAfterSeconds": seconds,
-        "until": rec.at + seconds * 1000,
+        "until": rec.until_ms(),
         "keys": keys,
-        "refunded": body.refund_cost.unwrap_or(0),
+        "refunded": body.refund_cost.filter(|c| *c > 0).unwrap_or(0),
     }))
 }
 
@@ -177,6 +185,9 @@ pub async fn reset(budgets: &Budgets, node: &NodePlan) -> queen_mq::Result<Value
     // Deduplicated for the same reason as `trip`: one key twice in one call is
     // `kv_duplicate_key_in_call`, and a reset that errors leaves the node held.
     let mut keys: Vec<String> = unique_keys(node);
+    if keys.len() > gate_core::MAX_BREAKER_COUNTERS {
+        return Ok(too_wide(node, keys.len()));
+    }
     keys.push(node.breaker_key.clone());
     budgets.clear(&keys).await?;
     tracing::info!(node = %node.name, "breaker reset");
@@ -207,48 +218,100 @@ fn unique_keys(node: &NodePlan) -> Vec<String> {
         .collect()
 }
 
+fn too_wide(node: &NodePlan, keys: usize) -> Value {
+    json!({
+        "ok": false,
+        "error": format!(
+            "node `{}` has {keys} distinct node-wide counters; its breaker needs one additional \
+             operation for the audit record, but the broker accepts at most 256 operations in one \
+             atomic call. Redeclare it with at most {} distinct unscoped counters.",
+            node.name,
+            gate_core::MAX_BREAKER_COUNTERS
+        ),
+    })
+}
+
 /// Every breaker currently holding a node, fleet-wide.
-pub async fn recent(budgets: &Budgets, limit: u32) -> Vec<Value> {
-    match budgets.get_prefix("brk:", limit).await {
-        Ok(rows) => {
-            let mut out: Vec<Record> = rows
-                .into_iter()
-                .filter_map(|r| r.value.and_then(|v| serde_json::from_value(v).ok()))
-                .collect();
-            out.sort_by_key(|r| std::cmp::Reverse(r.at));
-            out.iter()
-                .map(|r| {
-                    json!({
-                        "at": r.at,
-                        "application": r.application,
-                        "target": format!("{}.{}", r.graph, r.node),
-                        "graph": r.graph,
-                        "node": r.node,
-                        "retryAfterSeconds": r.retry_after_seconds,
-                        "until": r.at + r.retry_after_seconds * 1000,
-                        "by": r.by,
-                    })
-                })
-                .collect()
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "could not read the breaker records");
-            Vec::new()
-        }
-    }
+pub async fn recent(budgets: &Budgets, limit: u32) -> queen_mq::Result<Vec<Value>> {
+    let rows = budgets.get_prefix("brk:", limit).await?;
+    let mut out: Vec<Record> = rows
+        .into_iter()
+        .filter_map(|r| r.value.and_then(decode_record))
+        .collect();
+    out.sort_by_key(|r| std::cmp::Reverse(r.at));
+    Ok(out
+        .iter()
+        .map(|r| {
+            json!({
+                "at": r.at,
+                "application": r.application,
+                "target": format!("{}.{}", r.graph, r.node),
+                "graph": r.graph,
+                "node": r.node,
+                "retryAfterSeconds": r.retry_after_seconds,
+                "until": r.until_ms(),
+                "by": r.by,
+            })
+        })
+        .collect())
 }
 
 /// One node's breaker record, if it is currently held.
 ///
 /// The record's own TTL is the answer: a key that has expired is a breaker that
 /// has lifted, and there is nothing to sweep and nothing to clear.
-pub async fn held(budgets: &Budgets, node: &NodePlan) -> Option<Record> {
+pub async fn held(budgets: &Budgets, node: &NodePlan) -> queen_mq::Result<Option<Record>> {
     let rows = budgets
         .get_raw(std::slice::from_ref(&node.breaker_key))
-        .await
-        .ok()?;
-    rows.into_iter()
+        .await?;
+    Ok(rows
+        .into_iter()
         .next()
         .and_then(|r| r.value)
-        .and_then(|v| serde_json::from_value(v).ok())
+        .and_then(decode_record))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{decode_record, Record, MAX_SECONDS};
+
+    #[test]
+    fn a_breaker_deadline_saturates_instead_of_overflowing() {
+        let record = Record {
+            at: i64::MAX - 500,
+            retry_after_seconds: 1,
+            by: None,
+            application: "a".into(),
+            graph: "g".into(),
+            node: "n".into(),
+        };
+        assert_eq!(record.until_ms(), i64::MAX);
+    }
+
+    #[test]
+    fn malformed_shared_breaker_records_are_not_reported_as_live() {
+        let record = |seconds| {
+            json!({
+                "at": 1,
+                "retryAfterSeconds": seconds,
+                "application": "a",
+                "graph": "g",
+                "node": "n"
+            })
+        };
+
+        assert!(decode_record(record(1)).is_some());
+        assert!(decode_record(record(0)).is_none());
+        assert!(decode_record(record(MAX_SECONDS + 1)).is_none());
+        assert!(decode_record(json!({
+            "at": -1,
+            "retryAfterSeconds": 1,
+            "application": "a",
+            "graph": "g",
+            "node": "n"
+        }))
+        .is_none());
+    }
 }

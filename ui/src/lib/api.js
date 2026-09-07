@@ -5,8 +5,10 @@ import { ref, computed } from 'vue'
   - 'unknown'  boot, /api/me in flight
   - 'ready'    a session (or admin token / open mode) answers for us
   - 'login'    the API said 401 — show the login screen
+  - 'error'    /api/me failed for another reason — show the failure and retry
 */
 export const authState = ref('unknown')
+export const authError = ref('')
 export const me = ref(null) // { actor, email, role }
 
 /*
@@ -19,10 +21,6 @@ export const me = ref(null) // { actor, email, role }
 */
 export const isAdmin = computed(() => me.value?.role === 'admin')
 export const READ_ONLY_NOTE = 'read-only: your account is not in GATE_ADMIN_EMAILS'
-/* A GET that clears the cookie and redirects, so it is a link and not a fetch —
-   going through the API client would follow the redirect inside XHR and leave
-   the console showing a stale identity. */
-export const LOGOUT_URL = '/api/auth/logout'
 
 async function request(path, { method = 'GET', body } = {}) {
   const headers = {}
@@ -79,9 +77,17 @@ export const api = {
 export async function fetchMe() {
   try {
     me.value = await request('/api/me')
+    authError.value = ''
     authState.value = 'ready'
-  } catch {
-    if (authState.value !== 'login') authState.value = 'login'
+  } catch (e) {
+    // `request` alone moves to login, and only for an actual 401. A network
+    // failure or a 5xx is not evidence that the operator is signed out.
+    if (authState.value === 'login') {
+      authError.value = ''
+      return
+    }
+    authError.value = e?.message || 'Could not reach the console API'
+    authState.value = 'error'
   }
 }
 
@@ -193,10 +199,12 @@ export function pct(x) {
   ones that can render "we cannot say" do.
 */
 export function utilisation(b) {
-  if (!b) return 0
-  if (b.utilisation !== null && b.utilisation !== undefined) return b.utilisation
+  if (!b) return null
+  if (b.utilisation !== undefined) return b.utilisation
+  const used = b.value ?? b.used
+  if (used === null || used === undefined) return null
   const ceiling = ceilingOf(b)
-  return ceiling > 0 ? (b.value ?? b.used ?? 0) / ceiling : 0
+  return ceiling > 0 ? used / ceiling : null
 }
 
 /* The widest path's ceiling on this budget, which is what the bar is drawn

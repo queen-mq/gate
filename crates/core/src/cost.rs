@@ -7,7 +7,8 @@
 
 use serde_json::Value;
 
-use crate::doc::{Cost, PAYLOAD_ROOT};
+use crate::doc::{Cost, GATE_META, PAYLOAD_ROOT};
+use crate::plan::CompiledBudget;
 
 /// Walk a dotted payload path. The first segment must be `payload`, which names
 /// the message's own `data`; `payload.a.b` is `data["a"]["b"]`.
@@ -21,22 +22,30 @@ pub fn resolve<'a>(data: &'a Value, path: &str) -> Option<&'a Value> {
     if segs.next()? != PAYLOAD_ROOT {
         return None;
     }
-    let mut cur = data;
+    let first = segs.next()?;
+    if first.is_empty() || first == GATE_META {
+        return None;
+    }
+    let mut cur = data.get(first)?;
     for s in segs {
+        if s.is_empty() {
+            return None;
+        }
         cur = cur.get(s)?;
     }
     Some(cur)
 }
 
 /// Whether a string is a usable payload path: `payload` plus at least one
-/// segment, each of them non-empty.
+/// non-empty segment. Gate's root `_gate` envelope is deliberately outside the
+/// declaration language: costs and scopes may only come from producer data.
 pub fn ok_payload_path(path: &str) -> bool {
     let mut segs = path.split('.');
     if segs.next() != Some(PAYLOAD_ROOT) {
         return false;
     }
     let rest: Vec<&str> = segs.collect();
-    !rest.is_empty() && rest.iter().all(|s| !s.is_empty())
+    !rest.is_empty() && rest.first() != Some(&GATE_META) && rest.iter().all(|s| !s.is_empty())
 }
 
 /// The scope value a budget keys on, as it reaches the kv key.
@@ -54,6 +63,32 @@ pub fn scope_value(data: &Value, path: &str) -> Option<String> {
     }
 }
 
+/// The first applicable scoped budget whose key cannot be resolved.
+///
+/// Applicability comes first: a `photo.delete` per-listing budget has no reason
+/// to require `listingId` from a `photo.upload`. Both the HTTP door and the
+/// relay use this one answer so direct queue ingress cannot enforce a different
+/// contract from HTTP ingress.
+pub fn missing_scope<'a>(
+    budgets: &'a [CompiledBudget],
+    data: &Value,
+) -> Option<(&'a str, &'a str)> {
+    let op = op_of(data);
+    budgets.iter().find_map(|budget| {
+        if budget
+            .when_op
+            .as_ref()
+            .is_some_and(|patterns| !op_matches(patterns, op))
+        {
+            return None;
+        }
+        let path = budget.scope_by.as_deref()?;
+        scope_value(data, path)
+            .is_none()
+            .then_some((budget.id.as_str(), path))
+    })
+}
+
 /// What this item costs, or the reason it can never be admitted.
 ///
 /// Integers, because `kv.incr`'s delta is `i64` on this wire. A resolved cost
@@ -69,10 +104,22 @@ pub fn cost_of(cost: &Cost, data: &Value) -> Result<i64, TooExpensive> {
         Cost::Fixed(n) => (*n, *n),
         Cost::Path(c) => {
             let max = c.max.unwrap_or(c.default);
-            let v = resolve(data, &c.path)
-                .and_then(integral)
-                .filter(|n| *n >= 1)
-                .unwrap_or(c.default);
+            let v = match resolve(data, &c.path) {
+                Some(value) => match integral(value) {
+                    Ok(value) => value.filter(|n| *n >= 1).unwrap_or(c.default),
+                    // `i64::MAX` is the largest lower bound the public error
+                    // type can carry. It is enough to refuse every ordinary
+                    // maximum; equality is the sentinel for an out-of-range
+                    // positive number and gets its own truthful message below.
+                    Err(()) => {
+                        return Err(TooExpensive {
+                            cost: i64::MAX,
+                            max,
+                        })
+                    }
+                },
+                None => c.default,
+            };
             (v, max)
         }
     };
@@ -94,6 +141,13 @@ pub struct TooExpensive {
 
 impl std::fmt::Display for TooExpensive {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.cost == i64::MAX && self.max == i64::MAX {
+            return write!(
+                f,
+                "this item declares a cost outside the signed 64-bit range the broker can charge: \
+                 refusing it is safer than silently charging i64::MAX"
+            );
+        }
         write!(
             f,
             "this item declares a cost of {} and the node admits at most {}: an item that cannot \
@@ -105,13 +159,38 @@ impl std::fmt::Display for TooExpensive {
 }
 
 /// A JSON number that is a whole number. `3.0` is three; `3.5` is not a cost.
-fn integral(v: &Value) -> Option<i64> {
+///
+/// A whole number outside `i64` is an error rather than a missing value. Rust's
+/// float-to-integer cast saturates, so treating it as an ordinary conversion
+/// would collapse every larger JSON number to `i64::MAX` and undercharge it.
+fn integral(v: &Value) -> Result<Option<i64>, ()> {
     match v {
         Value::Number(n) => match n.as_i64() {
-            Some(i) => Some(i),
-            None => n.as_f64().filter(|f| f.fract() == 0.0).map(|f| f as i64),
+            Some(i) => Ok(Some(i)),
+            None => {
+                let Some(f) = n.as_f64() else {
+                    return Ok(None);
+                };
+                if f.fract() != 0.0 {
+                    return Ok(None);
+                }
+                // `i64::MAX as f64` rounds to 2^63, one past the largest i64,
+                // so the upper bound is deliberately exclusive. The lower one
+                // is inclusive because -2^63 is representable.
+                const I64_BOUND: f64 = 9_223_372_036_854_775_808.0;
+                if f >= I64_BOUND {
+                    return Err(());
+                }
+                // A negative value already means "use the default". Keep that
+                // tolerance even when its magnitude is outside i64; unlike an
+                // oversized positive cost, it cannot make Gate undercharge.
+                if f < -I64_BOUND {
+                    return Ok(None);
+                }
+                Ok(Some(f as i64))
+            }
         },
-        _ => None,
+        _ => Ok(None),
     }
 }
 

@@ -128,12 +128,21 @@ impl History {
     /// Add one minute's increments. Two replicas writing the same minute is the
     /// normal case, not a race: they saw different halves of the traffic, and
     /// the row is the sum.
-    pub async fn add(&self, app: &str, target: &str, minute: i64, lanes: &HashMap<String, Bucket>) {
-        let Ok(client) = self.pool.get().await else {
-            return;
+    pub async fn add(
+        &self,
+        app: &str,
+        target: &str,
+        minute: i64,
+        lanes: &HashMap<String, Bucket>,
+    ) -> bool {
+        let Ok(mut client) = self.pool.get().await else {
+            return false;
+        };
+        let Ok(tx) = client.transaction().await else {
+            return false;
         };
         for (lane, b) in lanes {
-            let _ = client
+            if tx
                 .execute(
                     "INSERT INTO gate.rollups
                        (application, target, lane, minute, admitted, denied, calls, throttled, cost_est, cost_actual)
@@ -152,14 +161,26 @@ impl History {
                         &b.cost_estimated, &b.cost_actual,
                     ],
                 )
-                .await;
+                .await
+                .is_err()
+            {
+                return false;
+            }
         }
+        tx.commit().await.is_ok()
     }
 
-    pub async fn rollups(&self, app: &str, target: &str, minutes: i64) -> Vec<Value> {
-        let Ok(client) = self.pool.get().await else {
-            return vec![];
-        };
+    pub async fn rollups(
+        &self,
+        app: &str,
+        target: &str,
+        minutes: i64,
+    ) -> Result<Vec<Value>, String> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("history connection: {e}"))?;
         let since = (crate::now_ms() / 60_000 * 60_000) - minutes * 60_000;
         let rows = client
             .query(
@@ -170,19 +191,29 @@ impl History {
                 &[&app, &target, &since],
             )
             .await
-            .unwrap_or_default();
+            .map_err(|e| format!("history rollups: {e}"))?;
 
         let mut by_minute: Vec<(i64, HashMap<String, Value>, [f64; 6])> = Vec::new();
         for r in rows {
-            let m: i64 = r.get(0);
-            let lane: String = r.get(1);
+            let m: i64 = r
+                .try_get(0)
+                .map_err(|e| format!("history rollup row: {e}"))?;
+            let lane: String = r
+                .try_get(1)
+                .map_err(|e| format!("history rollup row: {e}"))?;
             let v = [
-                r.get::<_, i64>(2) as f64,
-                r.get::<_, i64>(3) as f64,
-                r.get::<_, i64>(4) as f64,
-                r.get::<_, i64>(5) as f64,
-                r.get::<_, f64>(6),
-                r.get::<_, f64>(7),
+                r.try_get::<_, i64>(2)
+                    .map_err(|e| format!("history rollup row: {e}"))? as f64,
+                r.try_get::<_, i64>(3)
+                    .map_err(|e| format!("history rollup row: {e}"))? as f64,
+                r.try_get::<_, i64>(4)
+                    .map_err(|e| format!("history rollup row: {e}"))? as f64,
+                r.try_get::<_, i64>(5)
+                    .map_err(|e| format!("history rollup row: {e}"))? as f64,
+                r.try_get::<_, f64>(6)
+                    .map_err(|e| format!("history rollup row: {e}"))?,
+                r.try_get::<_, f64>(7)
+                    .map_err(|e| format!("history rollup row: {e}"))?,
             ];
             if by_minute.last().map(|(mm, _, _)| *mm) != Some(m) {
                 by_minute.push((m, HashMap::new(), [0.0; 6]));
@@ -198,7 +229,7 @@ impl History {
             );
         }
 
-        by_minute
+        Ok(by_minute
             .into_iter()
             .map(|(m, lanes, t)| {
                 json!({
@@ -208,15 +239,23 @@ impl History {
                     "lanes": lanes,
                 })
             })
-            .collect()
+            .collect())
     }
 
     /// Admissions per second for one lane, from the table rather than from
     /// whatever this replica happened to see.
-    pub async fn rate_per_sec(&self, app: &str, target: &str, lane: &str, now_ms: i64) -> f64 {
-        let Ok(client) = self.pool.get().await else {
-            return 0.0;
-        };
+    pub async fn rate_per_sec(
+        &self,
+        app: &str,
+        target: &str,
+        lane: &str,
+        now_ms: i64,
+    ) -> Result<f64, String> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("history connection: {e}"))?;
         let current = now_ms / 60_000 * 60_000;
         let rows = client
             .query(
@@ -226,26 +265,26 @@ impl History {
                 &[&app, &target, &lane, &(current - 60_000)],
             )
             .await
-            .unwrap_or_default();
+            .map_err(|e| format!("history rate: {e}"))?;
         for r in &rows {
-            let m: i64 = r.get(0);
-            let a: i64 = r.get(1);
+            let m: i64 = r.try_get(0).map_err(|e| format!("history rate row: {e}"))?;
+            let a: i64 = r.try_get(1).map_err(|e| format!("history rate row: {e}"))?;
             // A complete minute needs no correction. Only fall back to the one
             // still filling — scaled, with a floor on the divisor — when there
             // is no complete one yet, which is exactly the first minute after a
             // declare and exactly when somebody is watching.
             if m < current {
-                return a as f64 / 60.0;
+                return Ok(a as f64 / 60.0);
             }
         }
-        match rows.first() {
+        Ok(match rows.first() {
             Some(r) => {
-                let a: i64 = r.get(1);
+                let a: i64 = r.try_get(1).map_err(|e| format!("history rate row: {e}"))?;
                 let elapsed = (((now_ms - current) as f64) / 1000.0).max(5.0);
                 a as f64 / elapsed
             }
             None => 0.0,
-        }
+        })
     }
 
     /// What one item of this lane charges a budget, measured over the last few
@@ -287,47 +326,65 @@ impl History {
     // counter now, so N ceilings cannot oversubscribe it, and the whole argument
     // evaporates with the feature.
 
-    /// Admissions per minute for every target, over the last `minutes`.
+    /// Admissions and admitted cost per minute for every target, over the last
+    /// `minutes`.
     ///
     /// One query for the whole deployment rather than one per target: the
     /// dashboard draws every application at once, and N round trips to draw one
     /// picture is how a console starts costing more than the thing it watches.
-    pub async fn flow(&self, minutes: i64, now_ms: i64) -> Vec<(String, String, i64, i64)> {
-        let Ok(client) = self.pool.get().await else {
-            return vec![];
-        };
+    pub async fn flow(
+        &self,
+        minutes: i64,
+        now_ms: i64,
+    ) -> Result<Vec<(String, String, i64, i64, f64)>, String> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("history connection: {e}"))?;
         let since = now_ms / 60_000 * 60_000 - minutes * 60_000;
         let rows = client
             .query(
-                "SELECT application, target, minute, COALESCE(SUM(admitted), 0)::BIGINT
+                "SELECT application, target, minute,
+                        COALESCE(SUM(admitted), 0)::BIGINT,
+                        COALESCE(NULLIF(SUM(cost_est), 0), SUM(admitted)::DOUBLE PRECISION, 0)
                  FROM gate.rollups WHERE minute >= $1
                  GROUP BY application, target, minute
                  ORDER BY minute",
                 &[&since],
             )
             .await
-            .unwrap_or_default();
-        rows.iter()
-            .filter_map(|r| {
-                Some((
-                    r.try_get::<_, String>(0).ok()?,
-                    r.try_get::<_, String>(1).ok()?,
-                    r.try_get::<_, i64>(2).ok()?,
-                    r.try_get::<_, i64>(3).ok()?,
-                ))
-            })
-            .collect()
+            .map_err(|e| format!("history flow: {e}"))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            out.push((
+                r.try_get::<_, String>(0)
+                    .map_err(|e| format!("history flow row: {e}"))?,
+                r.try_get::<_, String>(1)
+                    .map_err(|e| format!("history flow row: {e}"))?,
+                r.try_get::<_, i64>(2)
+                    .map_err(|e| format!("history flow row: {e}"))?,
+                r.try_get::<_, i64>(3)
+                    .map_err(|e| format!("history flow row: {e}"))?,
+                r.try_get::<_, f64>(4)
+                    .map_err(|e| format!("history flow row: {e}"))?,
+            ));
+        }
+        Ok(out)
     }
 
-    pub async fn add_traces(&self, rows: &[crate::obs::Trace]) {
+    pub async fn add_traces(&self, rows: &[crate::obs::Trace]) -> bool {
         if rows.is_empty() {
-            return;
+            return true;
         }
-        let Ok(client) = self.pool.get().await else {
-            return;
+        let Ok(mut client) = self.pool.get().await else {
+            return false;
+        };
+        let Ok(tx) = client.transaction().await else {
+            return false;
         };
         for t in rows {
-            let _ = client
+            if tx
                 .execute(
                     "INSERT INTO gate.traces (at, application, target, lane, op, outcome, budget_id, calls)
                      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
@@ -336,14 +393,21 @@ impl History {
                         &t.path, &t.op, &t.outcome, &t.budget_id, &0i64,
                     ],
                 )
-                .await;
+                .await
+                .is_err()
+            {
+                return false;
+            }
         }
+        tx.commit().await.is_ok()
     }
 
-    pub async fn traces(&self, outcome: Option<&str>, limit: i64) -> Vec<Value> {
-        let Ok(client) = self.pool.get().await else {
-            return vec![];
-        };
+    pub async fn traces(&self, outcome: Option<&str>, limit: i64) -> Result<Vec<Value>, String> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("history connection: {e}"))?;
         let rows = match outcome {
             Some(o) => {
                 client
@@ -364,24 +428,32 @@ impl History {
                     .await
             }
         }
-        .unwrap_or_default();
-        // `get` panics on a column type it did not expect, and a console page
-        // is a poor place to discover that somebody upgraded the schema by
-        // hand. A row that will not read is skipped.
-        rows.iter()
-            .filter_map(|r| {
-                Some(json!({
-                    "at": r.try_get::<_, i64>(0).ok()?,
-                    "application": r.try_get::<_, String>(1).ok()?,
-                    "target": r.try_get::<_, String>(2).ok()?,
-                    "lane": r.try_get::<_, String>(3).ok()?,
-                    "op": r.try_get::<_, String>(4).ok()?,
-                    "outcome": r.try_get::<_, String>(5).ok()?,
-                    "budget_id": r.try_get::<_, Option<String>>(6).ok()?,
-                    "calls": r.try_get::<_, i64>(7).ok()?,
-                }))
-            })
-            .collect()
+        .map_err(|e| format!("history traces: {e}"))?;
+        // `get` panics on a column type it did not expect. A schema mismatch
+        // must be visible as a failed read rather than quietly shortening the
+        // result set and making an incident disappear from the console.
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            out.push(json!({
+                "at": r.try_get::<_, i64>(0)
+                    .map_err(|e| format!("history trace row: {e}"))?,
+                "application": r.try_get::<_, String>(1)
+                    .map_err(|e| format!("history trace row: {e}"))?,
+                "target": r.try_get::<_, String>(2)
+                    .map_err(|e| format!("history trace row: {e}"))?,
+                "lane": r.try_get::<_, String>(3)
+                    .map_err(|e| format!("history trace row: {e}"))?,
+                "op": r.try_get::<_, String>(4)
+                    .map_err(|e| format!("history trace row: {e}"))?,
+                "outcome": r.try_get::<_, String>(5)
+                    .map_err(|e| format!("history trace row: {e}"))?,
+                "budget_id": r.try_get::<_, Option<String>>(6)
+                    .map_err(|e| format!("history trace row: {e}"))?,
+                "calls": r.try_get::<_, i64>(7)
+                    .map_err(|e| format!("history trace row: {e}"))?,
+            }));
+        }
+        Ok(out)
     }
 
     /// Retention, on its own slow clock. `O(space)` work does not belong on the

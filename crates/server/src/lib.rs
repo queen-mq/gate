@@ -42,7 +42,7 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use queen_mq::{Config, Queen};
@@ -112,6 +112,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         queen,
         registry: Default::default(),
         depths: Arc::new(depth::Depths::default()),
+        backlogs: Default::default(),
         traces: Arc::new(obs::Traces::default()),
         history: history.clone(),
         queen_url: queen_url.clone(),
@@ -208,66 +209,129 @@ pub fn spawn_reconcile(
 /// It reads the stages' own `AtomicU64`s and writes the DELTA since the last
 /// pass, so two replicas writing the same minute is the normal case rather than
 /// a race: they saw different halves of the traffic and the row is the sum.
+type CounterSnapshot = (u64, u64, u64);
+type CounterCheckpoint = (String, CounterSnapshot);
+const MINUTE_MS: i64 = gate_core::COUNTERS_WINDOW_SECONDS as i64 * 1_000;
+
 pub fn spawn_counters(app: api::Shared) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut last: HashMap<String, (u64, u64, u64)> = HashMap::new();
+        let mut last: HashMap<String, CounterSnapshot> = HashMap::new();
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            let now = now_ms();
-            let minute = now / 60_000 * 60_000;
+            // Anchor samples to wall-clock minute boundaries. Sleeping a fixed
+            // minute from process start makes every bucket span, for example,
+            // 12:00:37..12:01:37 while labelling it 12:01:00.
+            tokio::time::sleep(until_next_minute(now_ms())).await;
+            // The delta ends at this boundary, so it belongs to the minute that
+            // just completed, not to the empty minute that has just begun.
+            let minute = completed_minute(now_ms());
 
             if let Some(h) = app.history.as_ref() {
+                let mut active = HashSet::new();
                 for g in app.registry.all() {
                     if g.plan.counters_window_seconds.is_none() {
                         continue;
                     }
                     let mut per_target: HashMap<String, HashMap<String, history::Bucket>> =
                         HashMap::new();
+                    let mut checkpoints: HashMap<String, Vec<CounterCheckpoint>> = HashMap::new();
                     for s in &g.stages {
                         let key = format!("{}/{}", g.key(), s.key());
+                        active.insert(key.clone());
+                        let target = format!("{}.{}", g.doc.graph, s.stage.node);
                         let c = &s.counters;
                         let o = std::sync::atomic::Ordering::Relaxed;
                         let now3 = (
                             c.admitted.load(o),
-                            c.deferred.load(o) + c.released.load(o),
+                            c.deferred.load(o).saturating_add(c.released.load(o)),
                             c.cost.load(o),
                         );
-                        let was = last.insert(key, now3).unwrap_or((0, 0, 0));
-                        let d = (
-                            now3.0.saturating_sub(was.0),
-                            now3.1.saturating_sub(was.1),
-                            now3.2.saturating_sub(was.2),
-                        );
+                        let d = counter_delta(now3, last.get(&key).copied());
+                        checkpoints
+                            .entry(target.clone())
+                            .or_default()
+                            .push((key, now3));
                         if d == (0, 0, 0) {
                             continue;
                         }
-                        per_target
-                            .entry(format!("{}.{}", g.doc.graph, s.stage.node))
-                            .or_default()
-                            .insert(
-                                s.stage.path.clone(),
-                                history::Bucket {
-                                    admitted: d.0,
-                                    denied: d.1,
-                                    cost_estimated: d.2 as f64,
-                                    ..Default::default()
-                                },
-                            );
+                        per_target.entry(target).or_default().insert(
+                            s.stage.path.clone(),
+                            history::Bucket {
+                                admitted: d.0,
+                                denied: d.1,
+                                cost_estimated: d.2 as f64,
+                                ..Default::default()
+                            },
+                        );
                     }
-                    for (target, paths) in per_target {
-                        h.add(&g.doc.application, &target, minute, &paths).await;
+                    for (target, samples) in checkpoints {
+                        let written = match per_target.remove(&target) {
+                            Some(paths) => h.add(&g.doc.application, &target, minute, &paths).await,
+                            None => true,
+                        };
+                        if written {
+                            for (key, value) in samples {
+                                last.insert(key, value);
+                            }
+                        } else {
+                            tracing::warn!(
+                                application = %g.doc.application,
+                                %target,
+                                "could not persist counter rollup; retaining the previous checkpoint"
+                            );
+                        }
                     }
                 }
+                // A delete, or a redeclare that removes a path, must also
+                // remove its lifetime-counter baseline. Otherwise this map
+                // grows for the life of the process and a later stage reusing
+                // the same identity inherits a checkpoint from a runtime that
+                // no longer exists. Failed writes for ACTIVE stages remain in
+                // the set and deliberately retain their previous checkpoint.
+                retain_active_checkpoints(&mut last, &active);
                 // The refusal ring, on the same cadence. Bounded and
                 // drop-oldest, so a flush that misses a pass loses the oldest
                 // denials and never blocks the hot path.
                 let traces = app.traces.drain();
-                if !traces.is_empty() {
-                    h.add_traces(&traces).await;
+                if !traces.is_empty() && !h.add_traces(&traces).await {
+                    tracing::warn!(
+                        count = traces.len(),
+                        "could not persist traces; returning them to the ring"
+                    );
+                    app.traces.restore(traces);
                 }
             }
         }
     })
+}
+
+fn retain_active_checkpoints(
+    checkpoints: &mut HashMap<String, CounterSnapshot>,
+    active: &HashSet<String>,
+) {
+    checkpoints.retain(|key, _| active.contains(key));
+}
+
+/// Delta of a lifetime counter tuple. A lower value means the stage runtime was
+/// replaced and its atomics restarted at zero, so the new value is itself the
+/// entire increment since that reset.
+fn counter_delta(now: CounterSnapshot, previous: Option<CounterSnapshot>) -> CounterSnapshot {
+    let Some(was) = previous else {
+        return now;
+    };
+    (
+        now.0.checked_sub(was.0).unwrap_or(now.0),
+        now.1.checked_sub(was.1).unwrap_or(now.1),
+        now.2.checked_sub(was.2).unwrap_or(now.2),
+    )
+}
+
+fn until_next_minute(now_ms: i64) -> std::time::Duration {
+    let elapsed = now_ms.rem_euclid(MINUTE_MS);
+    std::time::Duration::from_millis((MINUTE_MS - elapsed) as u64)
+}
+
+fn completed_minute(now_ms: i64) -> i64 {
+    now_ms.div_euclid(MINUTE_MS) * MINUTE_MS - MINUTE_MS
 }
 
 /// Bring back everything that was declared, at boot.
@@ -332,7 +396,15 @@ pub async fn reconcile(app: &api::Shared) {
             // matters: a graph whose provisioning failed is registered-and-
             // stopped, and comparing documents alone would leave it down for
             // ever while its ingress queue kept filling.
-            Some(doc) if doc == rt.doc && rt.is_running() => {}
+            Some(doc) if doc == rt.doc && rt.is_running() => {
+                // Seeing this exact document in the authoritative store is
+                // proof that it is durable, even if this replica never saw the
+                // answer to its own write. Without repairing the marker here,
+                // a later delete on another replica is mistaken for a failed
+                // initial save and this replica resurrects the graph.
+                rt.persisted
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             Some(doc) => {
                 tracing::info!(graph = %doc.key(), "reconcile: re-declaring a graph that is changed or not fully up");
                 if let Err(e) = graph::declare_from_store(app, doc).await {
@@ -362,5 +434,54 @@ pub async fn reconcile(app: &api::Shared) {
         if let Err(e) = graph::declare_from_store(app, doc).await {
             tracing::warn!(graph = %key, error = %e.message(), "reconcile: could not declare");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{HashMap, HashSet};
+
+    use super::{completed_minute, counter_delta, retain_active_checkpoints, until_next_minute};
+
+    #[test]
+    fn a_restarted_counter_counts_from_its_new_zero() {
+        assert_eq!(counter_delta((7, 3, 11), Some((100, 80, 900))), (7, 3, 11));
+    }
+
+    #[test]
+    fn a_running_counter_reports_only_its_increment() {
+        assert_eq!(
+            counter_delta((107, 83, 911), Some((100, 80, 900))),
+            (7, 3, 11)
+        );
+    }
+
+    #[test]
+    fn counter_flush_waits_for_the_next_wall_clock_boundary() {
+        assert_eq!(until_next_minute(120_000).as_millis(), 60_000);
+        assert_eq!(until_next_minute(120_001).as_millis(), 59_999);
+        assert_eq!(until_next_minute(179_999).as_millis(), 1);
+    }
+
+    #[test]
+    fn counter_flush_labels_the_minute_that_just_completed() {
+        assert_eq!(completed_minute(120_000), 60_000);
+        assert_eq!(completed_minute(120_001), 60_000);
+        assert_eq!(completed_minute(179_999), 60_000);
+        assert_eq!(completed_minute(180_000), 120_000);
+    }
+
+    #[test]
+    fn deleted_stages_do_not_leave_lifetime_checkpoints_behind() {
+        let mut checkpoints = HashMap::from([
+            ("app/graph/path/live".to_string(), (10, 20, 30)),
+            ("app/graph/path/deleted".to_string(), (40, 50, 60)),
+        ]);
+        let active = HashSet::from(["app/graph/path/live".to_string()]);
+
+        retain_active_checkpoints(&mut checkpoints, &active);
+
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints["app/graph/path/live"], (10, 20, 30));
     }
 }

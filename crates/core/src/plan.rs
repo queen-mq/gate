@@ -22,6 +22,7 @@
 //! 16 workers per cycle across 2 legs each, a reconcile loop, a history prune
 //! and a depth cache serving four read shapes. v2 runs seven consumers.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use crate::doc::{Confidence, Cost, GraphDoc, Node, Path, PathElem};
@@ -297,6 +298,12 @@ pub struct Destination {
     /// egress queue, which is why this is recorded in §7 rather than done
     /// quietly.
     pub derive_id: bool,
+    /// Whether the queue this push enters is read by more than one stage.
+    /// Such a queue needs `_gate.path` on every frame so each consumer group
+    /// can distinguish its own copy from the other paths' copies. A scalar or
+    /// array cannot carry that stamp and must be rejected before it reaches
+    /// this destination rather than being charged and routed as another path.
+    pub requires_stamp: bool,
     pub terminal: bool,
 }
 
@@ -352,7 +359,7 @@ impl CompiledBudget {
     /// 64 state documents to hold the same thing.
     pub fn key_for(&self, scope: Option<&str>) -> String {
         match (self.scope_by.as_ref(), scope) {
-            (Some(_), Some(v)) => format!("{}:{v}", self.key),
+            (Some(_), Some(v)) => format!("{}:{}", self.key, budget_key_component(v)),
             _ => self.key.clone(),
         }
     }
@@ -395,11 +402,54 @@ pub fn stage_group(app: &str, graph: &str, path: &str, node: &str) -> String {
 }
 
 pub fn budget_key(app: &str, graph: &str, node: &str, bid: &str) -> String {
-    format!("b:{app}:{graph}:{node}:{bid}")
+    let graph = local_budget_graph_component(graph);
+    format!(
+        "b:{}:{graph}:{}:{}",
+        budget_key_component(app),
+        budget_key_component(node),
+        budget_key_component(bid)
+    )
 }
 
 pub fn shared_budget_key(app: &str, shared: &str) -> String {
-    format!("b:{app}:shared:{shared}")
+    format!(
+        "b:{}:shared:{}",
+        budget_key_component(app),
+        budget_key_component(shared)
+    )
+}
+
+/// Escape the separator and the escape byte in a dynamic KV-key component.
+///
+/// Budget ids, shared keys and scope values are deliberately free-form. A raw
+/// colon would otherwise make `(id = "a:b")` indistinguishable from
+/// `(id = "a", scope = "b")`, causing two declarations to spend one row.
+/// Ordinary names keep their historical spelling.
+fn budget_key_component(value: &str) -> Cow<'_, str> {
+    if !value.bytes().any(|b| matches!(b, b'%' | b':')) {
+        return Cow::Borrowed(value);
+    }
+    let mut escaped = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '%' => escaped.push_str("%25"),
+            ':' => escaped.push_str("%3A"),
+            _ => escaped.push(c),
+        }
+    }
+    Cow::Owned(escaped)
+}
+
+/// `shared` is the structural marker immediately after the application in a
+/// shared key. It is also a legal graph name, so encode that one local graph
+/// spelling to keep the two namespaces disjoint. A literal `%73hared` cannot
+/// collide because the general component encoder escapes its percent sign.
+fn local_budget_graph_component(graph: &str) -> Cow<'_, str> {
+    if graph == "shared" {
+        Cow::Borrowed("%73hared")
+    } else {
+        budget_key_component(graph)
+    }
 }
 
 pub fn breaker_key(app: &str, graph: &str, node: &str) -> String {
@@ -640,6 +690,7 @@ pub fn compile_with(doc: &GraphDoc, opts: &PlanOpts) -> Plan {
                             label: egress_label(app, graph, &p.name, node_name),
                             // ALWAYS at a terminal. See the note on `derive_id`.
                             derive_id: true,
+                            requires_stamp: false,
                             terminal: true,
                         }],
                         None => Vec::new(),
@@ -654,6 +705,7 @@ pub fn compile_with(doc: &GraphDoc, opts: &PlanOpts) -> Plan {
                                 queue: dn.interior_queue.clone(),
                                 label: label(app, graph, &p.name, d),
                                 derive_id: false,
+                                requires_stamp: false,
                                 terminal: false,
                             })
                         })
@@ -726,6 +778,7 @@ pub fn compile_with(doc: &GraphDoc, opts: &PlanOpts) -> Plan {
         s.owns_unstamped = claimed.insert(s.source.clone());
         let fanout = s.destinations.len() > 1;
         for d in &mut s.destinations {
+            d.requires_stamp = readers.get(&d.queue).copied().unwrap_or(1) > 1;
             d.derive_id =
                 d.terminal || fanout || converging.get(&d.queue).copied().unwrap_or(1) > 1;
         }
@@ -807,10 +860,9 @@ pub fn compile_with(doc: &GraphDoc, opts: &PlanOpts) -> Plan {
 /// itself by the LEASE, which is the thing this design set out to remove.
 ///
 /// So the batch is clamped to what one sub-window admits at the typical item
-/// cost: `round(count_sub × share) / cost.default`, over the tightest UNSCOPED
-/// budget. Scoped budgets are excluded on purpose — a batch of two hundred
-/// messages across two hundred different keys spends one unit of each, and
-/// sizing on a per-key count would shrink every claim to a per-key allowance.
+/// cost: `round(count_sub × share) / cost.default`, over the tightest NODE-WIDE
+/// budget. Scoped and `whenOp` budgets are excluded on purpose: neither is a
+/// ceiling every item in the claim necessarily meets.
 ///
 /// It is a floor of one and a ceiling of what the declaration asked for: a wide
 /// budget leaves the declared batch untouched, and a tight one gets a claim that
@@ -818,7 +870,7 @@ pub fn compile_with(doc: &GraphDoc, opts: &PlanOpts) -> Plan {
 fn fitting_batch(np: &NodePlan, share: f64, declared: u32) -> u32 {
     let per_item = np.cost.default_value().max(1);
     let fits = np
-        .unscoped()
+        .node_wide_rates()
         .map(|b| (b.max_for(share) / per_item).max(1))
         .min();
     match fits {
@@ -845,9 +897,10 @@ fn fitting_batch(np: &NodePlan, share: f64, declared: u32) -> u32 {
 /// that can never have work. Stage, measured: ~200 gate consumers for a system
 /// whose largest declared budget is 400 items a second.
 ///
-/// Only the UNSCOPED budgets, for the same reason `fitting_batch` uses them: a
-/// per-key budget is not a rate the node has. *100 photo deletions per listing
-/// per week* says nothing about how fast the node drains.
+/// Only NODE-WIDE budgets, for the same reason `fitting_batch` uses them: a
+/// per-key budget is not a rate the node has, and neither is one selected by
+/// `whenOp`. *100 photo deletions per listing per week* says nothing about how
+/// fast the whole node drains.
 ///
 /// And not the migration's [`PASSTHROUGH_BUDGET_ID`], which is a sentinel and
 /// not a measurement: a million a second means "this node limits nothing", and
@@ -862,8 +915,7 @@ fn fitting_batch(np: &NodePlan, share: f64, declared: u32) -> u32 {
 fn fitting_workers(np: &NodePlan, share: f64, partitions: u32, lane_capacity: u32) -> u32 {
     let capacity = lane_capacity.max(1) as f64;
     let tightest = np
-        .unscoped()
-        .filter(|b| b.id != PASSTHROUGH_BUDGET_ID)
+        .node_wide_rates()
         .map(|b| b.max_for(share) as f64 / b.window_sub_seconds.max(1) as f64)
         .fold(f64::INFINITY, f64::min);
     if !tightest.is_finite() {
@@ -1020,11 +1072,36 @@ impl Plan {
 impl NodePlan {
     /// The budgets that live on the node itself, rather than one per key.
     ///
-    /// The ETA measures a rate against these and the breaker spends them, which
-    /// is why `node-unscoped-budget` requires at least one: a node with only
-    /// per-key budgets has no lever and no denominator.
+    /// The breaker spends these. ETA and other node-wide calculations must
+    /// additionally exclude budgets with `whenOp`: a conditional counter is
+    /// not a rate every item meets.
     pub fn unscoped(&self) -> impl Iterator<Item = &CompiledBudget> {
         self.budgets.iter().filter(|b| !b.is_scoped())
+    }
+
+    /// Budgets every item through the node must meet. These are the only honest
+    /// denominator for aggregate scheduling, ETA and utilisation: `whenOp`
+    /// counters apply to a subset whose size those calculations cannot know.
+    pub fn node_wide(&self) -> impl Iterator<Item = &CompiledBudget> {
+        self.unscoped().filter(|b| b.when_op.is_none())
+    }
+
+    /// The node-wide budgets that are a MEASUREMENT, which is a different
+    /// question from [`NodePlan::node_wide`] and the reason the two are separate.
+    ///
+    /// `node-unscoped-budget` asks whether some counter every item meets exists,
+    /// and the migration's [`PASSTHROUGH_BUDGET_ID`] is there precisely to
+    /// answer it for a v1 node that declared no limit of its own. But a million
+    /// a second is a sentinel and not a rate: used as a denominator it answers
+    /// every question with "there is room" — an ETA of zero, a utilisation near
+    /// zero, a claim sized against a limit nobody declared.
+    ///
+    /// So scheduling, the ETA and utilisation read this one, and a node with
+    /// nothing here has no node-wide rate at all. That is the honest answer:
+    /// what such a node forwards is bounded by the tight node downstream of it,
+    /// not by itself.
+    pub fn node_wide_rates(&self) -> impl Iterator<Item = &CompiledBudget> {
+        self.node_wide().filter(|b| b.id != PASSTHROUGH_BUDGET_ID)
     }
 
     /// The widest ceiling any path can reach at this node — what the breaker

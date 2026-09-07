@@ -7,6 +7,7 @@
 
 #![allow(deprecated)]
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
@@ -17,7 +18,7 @@ use serde_json::{json, Value};
 
 use gate_core::{v1, GraphDoc};
 
-use crate::api::{find, ok, resolve, ApiResult, Fail, Shared};
+use crate::api::{find, ok, resolve, resolve_found, ApiResult, Fail, Shared};
 use crate::registry::GraphRuntime;
 
 // ------------------------------------------------------------------- reading a body
@@ -136,12 +137,12 @@ pub async fn get_graph(
     Path((application, name)): Path<(String, String)>,
 ) -> ApiResult {
     let rt = find(&st, &application, &name)?;
-    ok(view(&st, &rt).await)
+    ok(view(&st, &rt).await?)
 }
 
 pub async fn get_graph_default(State(st): State<Shared>, Path(name): Path<String>) -> ApiResult {
     let rt = resolve(&st, &name)?;
-    ok(view(&st, &rt).await)
+    ok(view(&st, &rt).await?)
 }
 
 pub async fn del_graph(
@@ -152,11 +153,16 @@ pub async fn del_graph(
 }
 
 pub async fn del_graph_default(State(st): State<Shared>, Path(name): Path<String>) -> ApiResult {
-    let app = match st.registry.resolve(&name) {
-        crate::registry::Resolved::One(g) => g.doc.application.clone(),
-        _ => gate_core::default_application(),
+    // The flat GET and data-plane routes refuse an ambiguous name; DELETE must
+    // obey the same rule. Falling back to `default` here could remove one of the
+    // colliding graphs precisely when the caller had not identified which one.
+    let application = match st.registry.resolve(&name) {
+        // Preserve idempotent flat deletes: with no live match, the route still
+        // removes a possibly stored default-application document.
+        crate::registry::Resolved::None => gate_core::default_application(),
+        found => resolve_found(&name, found)?.doc.application.clone(),
     };
-    ok(crate::graph::remove(&st, &app, &name).await?)
+    ok(crate::graph::remove(&st, &application, &name).await?)
 }
 
 pub async fn topology(
@@ -242,6 +248,34 @@ async fn do_sync(st: &Shared, application: &str, bodies: Vec<Value>) -> ApiResul
     let mut refused = Vec::new();
     let mut declared: Vec<String> = Vec::new();
 
+    // A sync may land on a replica before its registry has reconciled. The
+    // durable store is therefore part of the inventory to reap, not merely a
+    // place each local runtime happens to be deleted from. Incomplete is not
+    // empty: if even one page or row is unreadable, applying submitted targets
+    // is safe but treating unseen targets as absent is not.
+    let stored_targets = match crate::store::try_load_all(&st.queen).await {
+        Ok(stored) if stored.complete => stored
+            .items
+            .into_iter()
+            .filter(|doc| doc.application == application && doc.nodes.len() == 1)
+            .map(|doc| doc.graph)
+            .collect::<Vec<_>>(),
+        Ok(_) => {
+            refused.push(json!({
+                "target": "",
+                "error": "the stored target inventory is incomplete; submitted declarations may apply, but nothing omitted can be removed safely"
+            }));
+            Vec::new()
+        }
+        Err(e) => {
+            refused.push(json!({
+                "target": "",
+                "error": format!("the stored target inventory could not be read ({e}); submitted declarations may apply, but nothing omitted can be removed safely")
+            }));
+            Vec::new()
+        }
+    };
+
     for body in bodies {
         // The name comes from the document here, because a sync body is a list
         // and there is no path segment to pin it from.
@@ -271,31 +305,49 @@ async fn do_sync(st: &Shared, application: &str, bodies: Vec<Value>) -> ApiResul
 
     // Reap, and ONLY inside this application. The flat version of this reaped
     // everything the cell held, so two teams syncing against one deployment
-    // would delete each other's graphs — including from the durable store. Done
-    // AFTER the declares, so a sync that fails half way removes nothing.
+    // would delete each other's graphs — including from the durable store.
+    //
+    // A partial declaration is not an authoritative inventory. One malformed
+    // body must not turn `ok: false` into a successful deletion of every valid
+    // target the caller omitted, so a sync that refused anything removes
+    // nothing. Successfully applied documents stay applied and the caller can
+    // repair/retry the list without recovering deleted configuration first.
     let mut removed = Vec::new();
-    for rt in st.registry.of_app(application) {
-        if declared.contains(&rt.doc.graph) {
-            continue;
+    if refused.is_empty() {
+        let mut candidates: BTreeSet<String> = stored_targets.into_iter().collect();
+        candidates.extend(
+            st.registry
+                .of_app(application)
+                .into_iter()
+                .filter(|rt| rt.plan.nodes.len() == 1)
+                .map(|rt| rt.doc.graph.clone()),
+        );
+        for name in candidates {
+            if declared.contains(&name) {
+                continue;
+            }
+            // The store's copy decided that a name was a target; the RUNTIME
+            // decides whether this replica may reap it. A redeclare registers
+            // before it saves, so a graph that grew nodes and then failed to
+            // persist reads as a one-node document here and is a multi-node
+            // graph in the registry — and a sync of targets does not delete a
+            // graph. Asked before the store write, so a graph that is exempt
+            // keeps its document too.
+            let live = st.registry.get(application, &name);
+            if live.as_ref().is_some_and(|rt| rt.plan.nodes.len() > 1) {
+                continue;
+            }
+            if let Err(e) = crate::store::forget(&st.queen, application, &name).await {
+                tracing::warn!(graph = %name, error = %e, "sync: not reaped, the stored document could not be removed");
+                refused.push(json!({ "target": name, "error": format!("not reaped: {e}") }));
+                continue;
+            }
+            if let Some(rt) = live {
+                crate::supervisor::stop(&rt).await;
+                st.registry.remove(application, &name);
+            }
+            removed.push(name);
         }
-        // A sync reaps what it could have DECLARED, and nothing else. v1
-        // exempted graph nodes from a target sync because a target list does not
-        // name them and reaping one would tear down half a topology; there are
-        // no node-targets any more, so the same rule is spelt as "a sync of
-        // targets does not delete a graph". A one-node graph IS a target and is
-        // fair game.
-        if rt.plan.nodes.len() > 1 {
-            continue;
-        }
-        let name = rt.doc.graph.clone();
-        if let Err(e) = crate::store::forget(&st.queen, application, &name).await {
-            tracing::warn!(graph = %name, error = %e, "sync: not reaped, the stored document could not be removed");
-            refused.push(json!({ "target": name, "error": format!("not reaped: {e}") }));
-            continue;
-        }
-        crate::supervisor::stop(&rt).await;
-        st.registry.remove(application, &name);
-        removed.push(name);
     }
 
     ok(json!({
@@ -314,17 +366,57 @@ async fn do_sync(st: &Shared, application: &str, bodies: Vec<Value>) -> ApiResul
 /// The budget bars read the counter itself — value AND `expiresAt` — so the
 /// console can render the window's remaining time, which v1 could not: its
 /// mirror was a copy of a state document with no expiry in it.
-pub async fn view(st: &Shared, rt: &Arc<GraphRuntime>) -> Value {
+pub async fn view(st: &Shared, rt: &Arc<GraphRuntime>) -> queen_mq::Result<Value> {
     let mut nodes = Vec::new();
     for (name, np) in &rt.plan.nodes {
+        // Keep the two owners of backlog separate in the graph view, just as
+        // the metrics and ETA endpoints do. The first number is work each
+        // stage has not admitted yet; the second is work Gate has relayed to a
+        // terminal queue and the application's consumers have not picked up.
+        let mut waiting_for_budget = 0u64;
+        for s in rt.stages_of_node(name) {
+            waiting_for_budget += st
+                .depths
+                .pending_of_group(&st.queen, &s.stage.source, &s.stage.group)
+                .await?
+                .values()
+                .sum::<u64>();
+        }
+
+        let waiting_for_workers = match (&np.egress_queue, &np.egress_group) {
+            (Some(queue), Some(group)) => st
+                .depths
+                .pending_of_group(&st.queen, queue, group)
+                .await?
+                .values()
+                .sum::<u64>(),
+            (Some(queue), None) => st
+                .depths
+                .pending(&st.queen, queue)
+                .await?
+                .values()
+                .sum::<u64>(),
+            (None, _) => 0,
+        };
+
         let keys: Vec<String> = np.unscoped().map(|b| b.key.clone()).collect();
-        let states = st.budgets.read(&keys).await.unwrap_or_default();
-        let breaker = crate::breaker::held(&st.budgets, np).await;
+        let states = st.budgets.read(&keys).await?;
+        let breaker = crate::breaker::held(&st.budgets, np).await?;
 
         let budgets: Vec<Value> = np
             .budgets
             .iter()
-            .map(|b| {
+            .enumerate()
+            .map(|(index, b)| {
+                // Enforcement uses the compiled budget, while provenance is
+                // intentionally documentation-only and remains on the source
+                // document. The compiler preserves budget order.
+                let declared = rt
+                    .doc
+                    .nodes
+                    .get(name)
+                    .and_then(|node| node.budgets.get(index))
+                    .filter(|source| source.id_or(index) == b.id);
                 let s = states.iter().find(|s| s.key == b.key);
                 let ceiling = b.max_for(np.widest_share());
                 let value = s.map(|s| s.value).unwrap_or(0);
@@ -333,12 +425,15 @@ pub async fn view(st: &Shared, rt: &Arc<GraphRuntime>) -> Value {
                     "key": b.key,
                     "scopeBy": b.scope_by,
                     "sharedKey": b.shared_key,
+                    "whenOp": b.when_op,
                     "count": b.count,
                     "timeMs": b.time_ms,
                     "subWindows": b.sub_windows,
                     "countSub": b.count_sub,
                     "windowSubSeconds": b.window_sub_seconds,
                     "confidence": b.confidence,
+                    "source": declared.and_then(|source| source.source.as_ref()),
+                    "asOf": declared.and_then(|source| source.as_of.as_ref()),
                     // A per-key budget has no single counter to report: the
                     // number that matters is the worst live key, and finding it
                     // means enumerating a namespace. `null` says so rather than
@@ -367,10 +462,12 @@ pub async fn view(st: &Shared, rt: &Arc<GraphRuntime>) -> Value {
             "paths": gate_core::plan::paths_through(&rt.plan, name),
             "shares": np.shares,
             "budgets": budgets,
+            "waiting_for_budget": waiting_for_budget,
+            "waiting_for_workers": waiting_for_workers,
             "breaker": breaker.map(|b| json!({
                 "at": b.at,
                 "retryAfterSeconds": b.retry_after_seconds,
-                "until": b.at + b.retry_after_seconds * 1000,
+                "until": b.until_ms(),
                 "by": b.by,
             })),
         }));
@@ -388,7 +485,7 @@ pub async fn view(st: &Shared, rt: &Arc<GraphRuntime>) -> Value {
         let lag: u64 = st
             .depths
             .pending_of_group(&st.queen, &s.stage.source, &s.stage.group)
-            .await
+            .await?
             .values()
             .sum();
         stages.push(json!({
@@ -408,7 +505,7 @@ pub async fn view(st: &Shared, rt: &Arc<GraphRuntime>) -> Value {
         }));
     }
 
-    json!({
+    Ok(json!({
         "application": rt.doc.application,
         "graph": rt.doc.graph,
         "name": rt.doc.graph,
@@ -426,9 +523,12 @@ pub async fn view(st: &Shared, rt: &Arc<GraphRuntime>) -> Value {
             "hops": gate_core::plan::hop_names(p),
         })).collect::<Vec<_>>(),
         "spec": rt.doc,
-    })
+    }))
 }
 
 pub async fn view_response(st: &Shared, rt: &Arc<GraphRuntime>) -> impl IntoResponse {
-    Json(view(st, rt).await)
+    match view(st, rt).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => Fail::from(error).into_response(),
+    }
 }

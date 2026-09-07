@@ -72,7 +72,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use gate_server::api;
-use queen_mq::{Config, Message, Queen, SubscriptionMode};
+use queen_mq::{Config, Expiry, Message, Queen, SubscriptionMode};
 use serde_json::{json, Value};
 
 fn queen_url() -> Option<String> {
@@ -193,25 +193,27 @@ async fn sweep(queen: &Queen) {
     if ONCE.set(()).is_err() {
         return;
     }
-    let Ok(res) = queen
-        .kv()
-        .get_prefix("gate", "graph:it")
-        .limit(1000)
-        .keys_only()
-        .send()
-        .await
-    else {
-        return;
-    };
-    let rows = res.rows.unwrap_or_default();
-    for row in &rows {
-        let _ = queen.kv().delete("gate", &row.key).send().await;
-    }
-    if !rows.is_empty() {
-        eprintln!(
-            "swept {} leftover graph document(s) from an earlier run",
-            rows.len()
-        );
+    for prefix in ["graph:it", "spec:it"] {
+        let Ok(res) = queen
+            .kv()
+            .get_prefix("gate", prefix)
+            .limit(1000)
+            .keys_only()
+            .send()
+            .await
+        else {
+            return;
+        };
+        let rows = res.rows.unwrap_or_default();
+        for row in &rows {
+            let _ = queen.kv().delete("gate", &row.key).send().await;
+        }
+        if !rows.is_empty() {
+            eprintln!(
+                "swept {} leftover {prefix} document(s) from an earlier run",
+                rows.len()
+            );
+        }
     }
 }
 
@@ -410,16 +412,21 @@ impl Harness {
 /// v2 adds two failures it must cover that v1 had no equivalent of: a KV route
 /// that refuses (does the relay refund and release, or lose the batch?) and a
 /// transaction that fails AFTER a successful charge (does the refund fire?).
+type RefusalRule = Arc<parking_lot::RwLock<Option<(Option<axum::http::Method>, String)>>>;
+
 struct FaultyBroker {
     url: String,
-    refuse: Arc<parking_lot::RwLock<Option<String>>>,
+    refuse: RefusalRule,
     absent: Arc<parking_lot::RwLock<Option<String>>>,
     seen: Arc<parking_lot::RwLock<Vec<String>>>,
 }
 
 impl FaultyBroker {
     fn refuse(&self, marker: &str) {
-        *self.refuse.write() = Some(marker.to_string());
+        *self.refuse.write() = Some((None, marker.to_string()));
+    }
+    fn refuse_method(&self, method: axum::http::Method, marker: &str) {
+        *self.refuse.write() = Some((Some(method), marker.to_string()));
     }
     fn allow(&self) {
         *self.refuse.write() = None;
@@ -446,7 +453,7 @@ impl FaultyBroker {
 struct ProxyState {
     real: String,
     http: reqwest::Client,
-    refuse: Arc<parking_lot::RwLock<Option<String>>>,
+    refuse: RefusalRule,
     absent: Arc<parking_lot::RwLock<Option<String>>>,
     seen: Arc<parking_lot::RwLock<Vec<String>>>,
 }
@@ -518,9 +525,11 @@ async fn proxy(
         }
     }
 
-    if let Some(marker) = st.refuse.read().clone() {
+    if let Some((method, marker)) = st.refuse.read().clone() {
         let text = String::from_utf8_lossy(&bytes);
-        if marker.is_empty() || text.contains(&marker) || path.contains(&marker) {
+        let method_matches = method.as_ref().is_none_or(|m| m == parts.method);
+        if method_matches && (marker.is_empty() || text.contains(&marker) || path.contains(&marker))
+        {
             return (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "refused by the test",
@@ -588,6 +597,57 @@ fn one_node(egress: &str, budget: Value) -> Value {
 
 fn egress_of(tag: &str, application: &str) -> String {
     format!("test.{tag}.{application}.out")
+}
+
+/// Every flat route resolves a bare graph name across applications and refuses
+/// to guess when more than one matches. DELETE used to be the exception: it
+/// silently fell back to `default` and could remove that tenant's graph.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn a_flat_delete_refuses_an_ambiguous_graph_name() {
+    let Some(h) = harness("ambiguous-delete").await else {
+        return;
+    };
+    let other = format!("{}-other", h.application);
+    let name = "same";
+
+    for (application, suffix) in [(&h.application, "one"), (&other, "two")] {
+        let doc = one_node(
+            &format!("test.ambiguous-delete.{application}.{suffix}.out"),
+            wide("b"),
+        );
+        let (status, body) = h
+            .send(
+                reqwest::Method::PUT,
+                &format!("/v1/apps/{application}/graphs/{name}"),
+                Some(doc),
+            )
+            .await;
+        assert_eq!(status, 200, "declare {application}: {body}");
+    }
+
+    let (status, body) = h
+        .send(reqwest::Method::DELETE, &format!("/v1/graphs/{name}"), None)
+        .await;
+    assert_eq!(status, 409, "an ambiguous delete must not choose: {body}");
+
+    for application in [&h.application, &other] {
+        let (status, body) = h
+            .send(
+                reqwest::Method::GET,
+                &format!("/v1/apps/{application}/graphs/{name}"),
+                None,
+            )
+            .await;
+        assert_eq!(status, 200, "{application} was removed: {body}");
+        let _ = h
+            .send(
+                reqwest::Method::DELETE,
+                &format!("/v1/apps/{application}/graphs/{name}"),
+                None,
+            )
+            .await;
+    }
 }
 
 // ============================================================== the relay
@@ -1045,7 +1105,7 @@ async fn a_failed_transaction_after_a_successful_charge_refunds() {
     }
     tokio::time::sleep(Duration::from_secs(6)).await;
 
-    let key = h.key("g", "n", "b");
+    let key = gate_core::plan::shared_budget_key(&h.application, "vendor");
     let spent = h.counter(&key).await;
     assert_eq!(
         spent, 0,
@@ -1421,6 +1481,231 @@ async fn an_item_that_can_never_be_admitted_is_dead_lettered() {
     );
 
     h.cleanup("g").await;
+}
+
+/// A rule added after a document was stored must not take that document down.
+///
+/// `restore` and `reconcile` declare through the same path a caller does, so a
+/// refusal there does not keep anybody safe: it unregisters the graph, answers
+/// 404 to its pushes, and leaves its ingress queue filling behind one WARN
+/// line. The document was accepted by an older build and is serving traffic, so
+/// it keeps running and the breach is logged. A CALLER's declare of the same
+/// document is still refused, which is what the rule is for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn a_stored_document_that_breaks_a_later_rule_keeps_running() {
+    let Some(h) = harness("grandfather").await else {
+        return;
+    };
+    let out = egress_of("grandfather", &h.application);
+    // Only a per-key budget, which `node-unscoped-budget` refuses. Any rule that
+    // is not about naming or emptiness would do; this one has been enforced
+    // since v2 shipped, so the test needs no future rule to exist.
+    let doc = json!({
+      "version": 1,
+      "nodes": { "n": {
+        "ingress": true,
+        "egress": out,
+        "budgets": [{ "id": "per-listing", "count": 100, "timeMs": 1000,
+                      "scopeBy": "payload.listingId" }]
+      }},
+      "paths": [{ "name": "main", "nodes": ["n"] }]
+    });
+
+    let (status, body) = h.put_graph("g", doc.clone()).await;
+    assert_eq!(
+        status, 422,
+        "a caller's declare must still be refused: {body}"
+    );
+    assert!(
+        h.app.registry.get(&h.application, "g").is_none(),
+        "a refused declare must not register anything"
+    );
+
+    // The same document, already in the store — where an older build left it.
+    let mut stored: gate_core::GraphDoc =
+        serde_json::from_value(doc).expect("the document parses; only the rules refuse it");
+    stored.application = h.application.clone();
+    stored.graph = "g".into();
+    gate_server::store::save(&h.queen, &stored)
+        .await
+        .expect("plant the stored document");
+
+    gate_server::reconcile(&h.app).await;
+    let rt = h.app.registry.get(&h.application, "g");
+    assert!(
+        rt.is_some(),
+        "the stored graph was taken down by a rule added after it was written"
+    );
+    assert!(
+        rt.expect("registered").is_running(),
+        "the stored graph was registered but never started"
+    );
+
+    h.cleanup("g").await;
+}
+
+/// A non-object payload cannot carry `_gate.path`. Letting one enter an
+/// interior queue read by several path groups makes the compiler's arbitrary
+/// unstamped owner route and charge it as the wrong path. It must be
+/// dead-lettered while its path is still unambiguous, without blocking valid
+/// work behind it. A scalar remains legal on linear and terminal routes; this
+/// test exercises only the shared destination that needs provenance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn an_unstampable_item_never_enters_a_shared_interior_queue() {
+    let Some(h) = harness("unstampable").await else {
+        return;
+    };
+    let out = egress_of("unstampable", &h.application);
+    let left = format!("app.unstampable.{}.left", h.application);
+    let right = format!("app.unstampable.{}.right", h.application);
+    h.queen.queue(&left).create().await.ok();
+    h.queen.queue(&right).create().await.ok();
+
+    let doc = json!({
+      "version": 1,
+      "nodes": {
+        "left": {
+          "ingress": { "queue": left, "http": false },
+          "budgets": [wide("left")]
+        },
+        "right": {
+          "ingress": { "queue": right, "http": false },
+          "budgets": [wide("right")]
+        },
+        "join": { "budgets": [wide("join")], "egress": out }
+      },
+      "paths": [
+        { "name": "left", "nodes": ["left", "join"] },
+        { "name": "right", "nodes": ["right", "join"] }
+      ]
+    });
+    let (status, body) = h.put_graph("g", doc).await;
+    assert_eq!(status, 200, "declare: {body}");
+
+    h.queen
+        .queue(&left)
+        .push_items(vec![
+            queen_mq::PushItem {
+                queue: left.clone(),
+                partition: Some("p0".into()),
+                payload: json!("cannot carry a path stamp"),
+                transaction_id: None,
+            },
+            queen_mq::PushItem {
+                queue: left.clone(),
+                partition: Some("p0".into()),
+                payload: json!({ "n": 1 }),
+                transaction_id: None,
+            },
+        ])
+        .await
+        .expect("push");
+
+    let got = h.drain(&out, 1, Duration::from_secs(40)).await;
+    assert_eq!(got.len(), 1, "valid work behind the poison never arrived");
+    assert_eq!(got[0].data["n"], 1, "the unstampable item was forwarded");
+    assert!(
+        h.drain_for(&out, Duration::from_secs(2)).await.is_empty(),
+        "the shared queue emitted another copy"
+    );
+
+    let (_, view) = h.get_graph("g").await;
+    let dead = view["stages"]
+        .as_array()
+        .and_then(|stages| {
+            stages
+                .iter()
+                .find(|stage| stage["path"] == "left" && stage["node"] == "left")
+        })
+        .and_then(|stage| stage["counters"]["deadlettered"].as_u64())
+        .unwrap_or(0);
+    assert!(
+        dead >= 1,
+        "the rejected item was not visible as dead-lettered: {view}"
+    );
+
+    h.cleanup("g").await;
+}
+
+/// A sync of TARGETS does not delete a graph, and the runtime is what decides
+/// that — not the store's copy of it.
+///
+/// A redeclare registers before it saves. A graph that grew nodes and whose save
+/// then failed is a one-node document in the store and a multi-node graph on
+/// this replica, so an inventory built from the store alone offers it up for
+/// reaping. Master never could: it iterated runtimes and skipped the wide ones.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn a_target_sync_never_reaps_a_graph_that_grew_nodes() {
+    let Some(h) = harness("wide-reap").await else {
+        return;
+    };
+    let out = egress_of("wide-reap", &h.application);
+
+    // What the store holds: the one-node shape, as it was first declared.
+    let (status, body) = h.put_graph("wide", one_node(&out, wide("b"))).await;
+    assert_eq!(status, 200, "declare: {body}");
+
+    // What this replica runs: two nodes, registered without the store agreeing.
+    let two = json!({
+      "version": 2,
+      "nodes": {
+        "n": { "ingress": true, "budgets": [wide("b")] },
+        "m": { "budgets": [wide("c")], "egress": out }
+      },
+      "paths": [{ "name": "main", "nodes": ["n", "m"] }]
+    });
+    let (status, body) = h.put_graph("wide", two).await;
+    assert_eq!(status, 200, "redeclare: {body}");
+    gate_server::store::save(
+        &h.queen,
+        &serde_json::from_value({
+            let mut d = one_node(&out, wide("b"));
+            d["application"] = json!(h.application);
+            d["graph"] = json!("wide");
+            d
+        })
+        .expect("document"),
+    )
+    .await
+    .expect("put the store back to the one-node copy");
+
+    // A sync that names something else at all.
+    let (status, body) = h
+        .send(
+            reqwest::Method::PUT,
+            &format!("/v1/apps/{}/targets", h.application),
+            Some(json!([one_node(&out, wide("b"))
+                .as_object()
+                .map(|o| {
+                    let mut o = o.clone();
+                    o.insert("graph".into(), json!("other"));
+                    Value::Object(o)
+                })
+                .expect("object")])),
+        )
+        .await;
+    assert_eq!(status, 200, "sync: {body}");
+    assert_eq!(
+        body["removed"],
+        json!([]),
+        "the graph is wider than a target and must not be reaped: {body}"
+    );
+
+    let rt = h.app.registry.get(&h.application, "wide");
+    assert!(
+        rt.is_some(),
+        "the multi-node graph was stopped by a target sync"
+    );
+    assert!(
+        rt.expect("registered").is_running(),
+        "it was left registered and stopped"
+    );
+
+    h.cleanup("wide").await;
+    h.cleanup("other").await;
 }
 
 /// A KV route that refuses is NOT a refusal.
@@ -1979,6 +2264,58 @@ async fn a_path_added_to_a_running_graph_starts_at_the_tail() {
 
 // ============================================================== the breaker
 
+/// A failed trip changes neither half of breaker state.
+///
+/// The counter spend and the visible record used to be separate broker calls.
+/// If the latter failed, the endpoint returned 502 while leaving a node held
+/// until the TTL, with no breaker in the graph view to explain the outage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn a_failed_breaker_trip_leaves_no_invisible_hold() {
+    let Some((h, faulty)) = faulty_harness("atomic-trip").await else {
+        assert!(std::env::var("GATE_TEST_REQUIRE_LIVE").is_err());
+        return;
+    };
+    let out = egress_of("atomic-trip", &h.application);
+    let (status, body) = h
+        .put_graph(
+            "g",
+            one_node(&out, json!({ "id": "b", "count": 1000, "timeMs": 1000 })),
+        )
+        .await;
+    assert_eq!(status, 200, "declare: {body}");
+
+    let key = h.key("g", "n", "b");
+    assert_eq!(h.counter(&key).await, 0, "the counter starts empty");
+
+    // `brk` occurs only in the breaker record key. Before the fix this lets the
+    // preceding counter-only call through and refuses the second, record-only
+    // call. With one batch it refuses the whole state transition.
+    faulty.refuse("brk");
+    let (status, res) = h
+        .backoff("g", "n", json!({ "retryAfterSeconds": 30, "by": "test" }))
+        .await;
+    assert_eq!(
+        status, 502,
+        "the injected broker failure must surface: {res}"
+    );
+    faulty.allow();
+
+    assert_eq!(
+        h.counter(&key).await,
+        0,
+        "a failed trip must not leave the budget counter spent"
+    );
+    let (status, view) = h.get_graph("g").await;
+    assert_eq!(status, 200, "{view}");
+    assert!(
+        view["nodes"][0]["breaker"].is_null(),
+        "a failed trip must not publish a breaker either: {view}"
+    );
+
+    h.cleanup("g").await;
+}
+
 /// The breaker stops every path within one batch, and lifts on its own.
 ///
 /// A vendor's 429 becomes `POST .../backoff`, which SPENDS the node's window: the
@@ -2144,6 +2481,273 @@ async fn one_owner_per_ingress_queue() {
     h.cleanup("second").await;
 }
 
+/// A sync that rejects one document is not a complete inventory and may not
+/// delete an omitted target.
+///
+/// Returning `ok: false` after removing valid configuration is a destructive
+/// partial success: a typo in one replacement document would turn into an
+/// outage in an unrelated target before the caller could correct and retry it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn a_partially_refused_sync_reaps_nothing() {
+    let Some(h) = harness("sync-refusal").await else {
+        return;
+    };
+    let out = egress_of("sync-refusal", &h.application);
+    // Two targets, so the list that follows is PARTIALLY valid and one target is
+    // omitted from it. A sync naming nothing valid would prove much less.
+    for name in ["keep", "drop"] {
+        let (status, body) = h
+            .put_graph(name, one_node(&format!("{out}.{name}"), wide("b")))
+            .await;
+        assert_eq!(status, 200, "initial declare of {name}: {body}");
+    }
+
+    let mut valid = one_node(&format!("{out}.keep"), wide("b"));
+    valid["application"] = json!(h.application);
+    valid["graph"] = json!("keep");
+    let (status, result) = h
+        .send(
+            reqwest::Method::PUT,
+            &format!("/v1/apps/{}/targets", h.application),
+            Some(json!([
+                valid,
+                {
+                    "application": h.application,
+                    "graph": "broken",
+                    "version": 1,
+                    "nodes": {},
+                    "paths": []
+                }
+            ])),
+        )
+        .await;
+    assert_eq!(status, 200, "sync response: {result}");
+    assert_eq!(result["ok"], json!(false), "the invalid graph must fail");
+    assert_eq!(
+        result["applied"],
+        json!(["keep"]),
+        "a valid document in the list still applies: {result}"
+    );
+    assert_eq!(
+        result["removed"],
+        json!([]),
+        "a partial sync may reap nothing"
+    );
+
+    // `drop` is the one the caller left out. A refusal anywhere in the list is
+    // what makes the list unfit to authorise a deletion.
+    for name in ["keep", "drop"] {
+        let (status, view) = h.get_graph(name).await;
+        assert_eq!(
+            status, 200,
+            "`{name}` was deleted by a refused sync: {view}"
+        );
+        assert!(view["running"].as_bool().unwrap_or(false), "{name}: {view}");
+    }
+
+    h.cleanup("keep").await;
+    h.cleanup("drop").await;
+}
+
+/// A complete target inventory is authoritative even when it reaches a replica
+/// that has not reconciled the stored targets into its local registry yet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn a_fresh_replica_reaps_targets_from_the_stored_inventory() {
+    let Some(h) = harness("sync-store").await else {
+        return;
+    };
+    let out = egress_of("sync-store", &h.application);
+    let (status, body) = h.put_graph("old", one_node(&out, wide("b"))).await;
+    assert_eq!(status, 200, "initial declare: {body}");
+
+    // The second replica deliberately knows no runtimes. An empty sync still
+    // means this application owns no standalone targets, not merely "remove
+    // whichever targets this process happens to have seen".
+    let second = serve(&h.app.queen_url).await;
+    assert!(second.registry.all().is_empty());
+    let second_base = spawn_server(second).await;
+    let res = reqwest::Client::new()
+        .put(format!("{second_base}/v1/apps/{}/targets", h.application))
+        .json(&json!([]))
+        .send()
+        .await
+        .expect("sync on fresh replica");
+    let status = res.status().as_u16();
+    let body: Value = res.json().await.unwrap_or(Value::Null);
+    assert_eq!(status, 200, "sync response: {body}");
+    assert_eq!(body["ok"], json!(true), "sync response: {body}");
+    assert_eq!(body["removed"], json!(["old"]), "sync response: {body}");
+
+    gate_server::reconcile(&h.app).await;
+    assert!(
+        h.app.registry.get(&h.application, "old").is_none(),
+        "the omitted target survived in the durable store"
+    );
+}
+
+/// Gate-owned interior queues participate in the same fleet-wide ownership
+/// rule as declared ingress queues. Calling one a "user ingress" in another
+/// graph must not create a second consumer that forwards every internal frame.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn another_graph_cannot_claim_an_interior_queue_as_its_ingress() {
+    let Some(h) = harness("interior-owner").await else {
+        return;
+    };
+    let mut owner = chain_doc();
+    owner["nodes"]["ip"]["egress"] = json!(egress_of("interior-owner-a", &h.application));
+    let (status, body) = h.put_graph("first", owner).await;
+    assert_eq!(status, 200, "declare owner: {body}");
+
+    let interior = gate_core::plan::interior_queue(&h.application, "first", "ip");
+    let borrower = json!({
+      "version": 1,
+      "nodes": {
+        "n": {
+          "ingress": { "queue": interior },
+          "budgets": [wide("b")],
+          "egress": egress_of("interior-owner-b", &h.application)
+        }
+      },
+      "paths": [{ "name": "main", "nodes": ["n"] }]
+    });
+    let (status, refused) = h.put_graph("second", borrower).await;
+    assert!(
+        status == 409 || status == 422,
+        "an interior queue must keep its one owner, got {status}: {refused}"
+    );
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("already the source"),
+        "the refusal must identify the ownership collision: {refused}"
+    );
+
+    h.cleanup("first").await;
+    h.cleanup("second").await;
+}
+
+/// Unknown remote ownership is not the same thing as an unowned queue.
+///
+/// The local registry is deliberately empty: this is the replica on which the
+/// old best-effort store scan silently turned both a transport error and an
+/// incomplete inventory into permission to start a second consumer group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn a_fresh_replica_fails_closed_when_source_ownership_cannot_be_verified() {
+    let Some((h, faulty)) = faulty_harness("owner-unknown").await else {
+        assert!(std::env::var("GATE_TEST_REQUIRE_LIVE").is_err());
+        return;
+    };
+    let shared_in = format!("test.owner-unknown.{}.in", h.application);
+    let doc = |egress: &str| {
+        json!({
+          "version": 1,
+          "nodes": {
+            "n": { "ingress": { "queue": shared_in }, "budgets": [wide("b")], "egress": egress }
+          },
+          "paths": [{ "name": "main", "nodes": ["n"] }]
+        })
+    };
+
+    let (status, body) = h.put_graph("first", doc("test.owner-unknown.a")).await;
+    assert_eq!(status, 200, "declare: {body}");
+
+    let second = serve(&faulty.url).await;
+    assert!(second.registry.all().is_empty());
+    let second_base = spawn_server(second.clone()).await;
+    let client = reqwest::Client::new();
+
+    // A transport failure used to be swallowed by `if let Ok(stored)`.
+    faulty.refuse("getPrefix");
+    let res = client
+        .put(format!(
+            "{second_base}/v1/apps/{}/graphs/second",
+            h.application
+        ))
+        .json(&doc("test.owner-unknown.b"))
+        .send()
+        .await
+        .expect("declare against unreadable inventory");
+    faulty.allow();
+    let status = res.status().as_u16();
+    let body: Value = res.json().await.unwrap_or(Value::Null);
+    assert_eq!(status, 502, "the failed ownership read was ignored: {body}");
+    assert!(
+        body.to_string().contains("exclusive ownership"),
+        "the refusal should name the safety property: {body}"
+    );
+    assert!(second.registry.all().is_empty());
+
+    // An unreadable document is an equally incomplete inventory. It may be a
+    // newer Gate document whose source this build cannot decode.
+    let namespace = gate_server::budget::namespace();
+    let corrupt_key = format!("graph:{}:newer", h.application);
+    h.queen
+        .kv()
+        .put(
+            &namespace,
+            &corrupt_key,
+            json!({ "fromAFutureGate": true }),
+            queen_mq::Expiry::forever(),
+        )
+        .send()
+        .await
+        .expect("plant unreadable document");
+    let res = client
+        .put(format!(
+            "{second_base}/v1/apps/{}/graphs/second",
+            h.application
+        ))
+        .json(&doc("test.owner-unknown.b"))
+        .send()
+        .await
+        .expect("declare against incomplete inventory");
+    let status = res.status().as_u16();
+    let body: Value = res.json().await.unwrap_or(Value::Null);
+    assert_eq!(status, 502, "the incomplete inventory was ignored: {body}");
+    assert!(
+        body.to_string().contains("inventory is incomplete"),
+        "{body}"
+    );
+    assert!(second.registry.all().is_empty());
+
+    // But a graph whose sources Gate NAMES ITSELF is not blocked by the same
+    // unreadable row. `gate.{app}.{graph}.{node}.in` cannot be minted by another
+    // graph key, so there is no ownership question for the missing document to
+    // be hiding an answer to — and `complete` is a fact about the whole
+    // namespace, so refusing here would take every tenant's declares down for
+    // one document written by a newer build.
+    let res = client
+        .put(format!(
+            "{second_base}/v1/apps/{}/graphs/owned",
+            h.application
+        ))
+        .json(&one_node("test.owner-unknown.c", wide("b")))
+        .send()
+        .await
+        .expect("declare a graph Gate names the source of");
+    let status = res.status().as_u16();
+    let body: Value = res.json().await.unwrap_or(Value::Null);
+    assert_eq!(
+        status, 200,
+        "an unreadable row elsewhere blocked a graph it cannot collide with: {body}"
+    );
+
+    h.queen
+        .kv()
+        .delete(&namespace, &corrupt_key)
+        .send()
+        .await
+        .expect("remove unreadable document");
+    h.cleanup("first").await;
+    h.cleanup("second").await;
+    h.cleanup("owned").await;
+}
+
 /// The routes that are gone say where to go instead.
 ///
 /// A 404 would read as "wrong URL" and send somebody hunting; a 410 with the
@@ -2249,6 +2853,8 @@ async fn the_console_can_draw_what_is_running() {
     let out = egress_of("console", &h.application);
     let mut doc = chain_doc();
     doc["nodes"]["ip"]["egress"] = json!(out);
+    doc["nodes"]["ip"]["budgets"][0]["source"] = json!("vendor limits page");
+    doc["nodes"]["ip"]["budgets"][0]["asOf"] = json!("2026-08-20");
     let (status, body) = h.put_graph("g", doc).await;
     assert_eq!(status, 200, "declare: {body}");
 
@@ -2264,6 +2870,15 @@ async fn the_console_can_draw_what_is_running() {
     assert_eq!(topo["edges"][0]["to"], "ip");
     assert_eq!(topo["paths"][0]["name"], "main");
 
+    let (status, detail) = h.get_graph("g").await;
+    assert_eq!(status, 200, "{detail}");
+    let budget = &detail["nodes"]
+        .as_array()
+        .and_then(|nodes| nodes.iter().find(|n| n["node"] == "ip"))
+        .expect("ip node missing")["budgets"][0];
+    assert_eq!(budget["source"], "vendor limits page", "{detail}");
+    assert_eq!(budget["asOf"], "2026-08-20", "{detail}");
+
     let (status, graphs) = h.send(reqwest::Method::GET, "/api/graphs", None).await;
     assert_eq!(status, 200, "{graphs}");
     assert!(graphs.as_array().is_some_and(|a| !a.is_empty()));
@@ -2275,6 +2890,11 @@ async fn the_console_can_draw_what_is_running() {
         overview["queen"]["reachable"],
         json!(true),
         "the broker health must be probed: {overview}"
+    );
+    assert_eq!(
+        overview["history_error"],
+        Value::Null,
+        "a healthy history must not report one: {overview}"
     );
     assert!(
         overview["admitted_per_sec"].is_null(),
@@ -2339,6 +2959,57 @@ async fn the_console_can_draw_what_is_running() {
 }
 
 // ============================================================== lifecycle
+
+/// Declaring a graph must not reconfigure the application's egress queue.
+///
+/// Queen's `create()` is implemented as `/configure` with an empty option bag,
+/// and `/configure` is a full replace rather than a patch. Calling it merely to
+/// ensure the queue exists resets every setting the application chose. An absent
+/// egress needs no eager setup: Queen creates it atomically on Gate's first push.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn declaring_a_graph_preserves_its_egress_queue_configuration() {
+    let Some(h) = harness("egress-config").await else {
+        return;
+    };
+    let out = egress_of("egress-config", &h.application);
+    h.queen
+        .queue(&out)
+        .configure(queen_mq::QueueOptions {
+            lease_time: Some(127),
+            retry_limit: Some(41),
+            ..Default::default()
+        })
+        .await
+        .expect("configure application-owned egress");
+
+    let (status, body) = h.put_graph("g", one_node(&out, wide("b"))).await;
+    assert_eq!(status, 200, "declare: {body}");
+
+    let detail = h
+        .queen
+        .admin()
+        .queue_detail(&out, &[])
+        .await
+        .expect("read egress configuration");
+    assert_eq!(
+        detail["queue"]["config"]["leaseTime"],
+        json!(127),
+        "Gate replaced the application's lease setting: {detail}"
+    );
+    assert_eq!(
+        detail["queue"]["config"]["retryLimit"],
+        json!(41),
+        "Gate replaced the application's retry setting: {detail}"
+    );
+
+    h.cleanup("g").await;
+    h.queen
+        .queue(&out)
+        .delete()
+        .await
+        .expect("delete application-owned egress");
+}
 
 /// A failed provisioning leaves the old document serving.
 ///
@@ -2421,7 +3092,7 @@ async fn a_declare_that_cannot_be_stored_is_not_acknowledged() {
     // Refuse only the store write. It is a path-route `PUT /api/v1/kv/{ns}/{key}`,
     // so the key reaches the proxy URL-ENCODED and the marker has to be spelt the
     // way the wire spells it — `graph:` matches nothing.
-    faulty.refuse("graph%3A");
+    faulty.refuse_method(axum::http::Method::PUT, "graph%3A");
     let (status, res) = h.put_graph("g", one_node(&out, wide("b"))).await;
     faulty.allow();
     assert_eq!(
@@ -2462,7 +3133,7 @@ async fn a_declare_that_cannot_be_stored_is_not_acknowledged() {
     let mut v2 = one_node(&out, wide("b"));
     v2["version"] = json!(2);
     v2["nodes"]["n"]["budgets"][0]["count"] = json!(7);
-    faulty.refuse("graph%3A");
+    faulty.refuse_method(axum::http::Method::PUT, "graph%3A");
     let (status, res) = h.put_graph("g", v2).await;
     faulty.allow();
     assert_eq!(status, 502, "{res}");
@@ -2481,6 +3152,60 @@ async fn a_declare_that_cannot_be_stored_is_not_acknowledged() {
     );
 
     h.cleanup("g").await;
+}
+
+/// An ambiguous store write cannot make a later delete resurrect the graph.
+///
+/// A broker can commit a PUT and lose only its response. The caller correctly
+/// gets an error in that case, but the local runtime cannot know that the
+/// document is already durable and keeps its `persisted` marker false. A
+/// reconcile that observes the exact document is the missing proof: if it does
+/// not repair the marker, a subsequent delete from another replica is read as
+/// "my first save never landed" and the deleted graph is written back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn reconcile_confirms_an_ambiguous_save_before_honouring_a_remote_delete() {
+    let Some(h) = harness("persisted-proof").await else {
+        return;
+    };
+    let out = egress_of("persisted-proof", &h.application);
+    let (status, body) = h.put_graph("g", one_node(&out, wide("b"))).await;
+    assert_eq!(status, 200, "declare: {body}");
+
+    // Model the only unknowable part of a lost response: the store has the
+    // exact document, while this replica believes its PUT failed.
+    let rt = h.app.registry.get(&h.application, "g").expect("serving");
+    rt.persisted
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+
+    gate_server::reconcile(&h.app).await;
+    let rt = h.app.registry.get(&h.application, "g").expect("serving");
+    assert!(
+        rt.persisted.load(std::sync::atomic::Ordering::Relaxed),
+        "observing the exact stored document must confirm persistence"
+    );
+
+    // A different replica deletes the durable document. This replica must now
+    // honour the deletion; with the stale marker it would save the graph again.
+    gate_server::store::forget(&h.queen, &h.application, "g")
+        .await
+        .expect("remote delete");
+    gate_server::reconcile(&h.app).await;
+    assert!(
+        h.app.registry.get(&h.application, "g").is_none(),
+        "the deleted graph was resurrected"
+    );
+
+    let stored = gate_server::store::try_load_all(&h.queen)
+        .await
+        .expect("read store");
+    assert!(
+        stored
+            .items
+            .iter()
+            .all(|doc| { doc.application != h.application || doc.graph != "g" }),
+        "the reconcile pass wrote the remotely deleted document back"
+    );
 }
 
 /// A declare that cannot be RESTORED leaves nothing registered.
@@ -2505,9 +3230,10 @@ async fn a_declare_that_cannot_be_restored_leaves_nothing_registered() {
     assert_eq!(status, 200, "declare: {body}");
     assert!(h.app.registry.get(&h.application, "g").is_some());
 
-    // Nothing gets through now, so neither the new plan nor the old one can be
-    // provisioned.
-    faulty.refuse("");
+    // No queue can be configured now, so neither the new plan nor the old one
+    // can be provisioned. Reads remain available: this test is about a failed
+    // swap, not about the predecessor check failing closed.
+    faulty.refuse("configure");
     let mut v2 = one_node(&out, wide("b"));
     v2["version"] = json!(2);
     v2["nodes"]["n"]["budgets"][0]["count"] = json!(7);
@@ -2646,6 +3372,60 @@ async fn deleting_a_graph_that_was_never_declared_is_a_success() {
     assert_eq!(res["registered"], json!(false), "{res}");
 }
 
+/// A v1 target may be qualified as `graph.node`, while its v2 graph identity is
+/// the final segment. Deleting that migrated graph must remove the qualified
+/// source row too, or the next restore brings it back from the dead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn deleting_a_migrated_dotted_target_removes_its_v1_source() {
+    let Some(h) = harness("delete-v1-dotted").await else {
+        return;
+    };
+    let old_key = format!("spec:{}:legacy.ip", h.application);
+    let old = json!({
+        "application": h.application,
+        "name": "legacy.ip",
+        "version": 1,
+        "budgets": [{
+            "id": "api", "cap": 1000, "periodSeconds": 60,
+            "alignment": "rolling", "confidence": "inferred"
+        }],
+        "cost": { "field": "cost", "default": 1, "max": 1 }
+    });
+    h.queen
+        .kv()
+        .put("gate", &old_key, old, queen_mq::Expiry::forever())
+        .send()
+        .await
+        .expect("seed the v1 target row");
+
+    gate_server::restore(&h.app).await;
+    assert!(
+        h.app.registry.get(&h.application, "ip").is_some(),
+        "the qualified v1 target must migrate to its leaf graph"
+    );
+
+    let (status, body) = h
+        .send(
+            reqwest::Method::DELETE,
+            &format!("/v1/apps/{}/targets/ip", h.application),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "delete the migrated target: {body}");
+
+    let stored = gate_server::store::try_load_all(&h.queen)
+        .await
+        .expect("read the store after delete");
+    assert!(
+        stored
+            .items
+            .iter()
+            .all(|doc| doc.key() != format!("{}/ip", h.application)),
+        "the legacy source survived and would restore the deleted graph"
+    );
+}
+
 /// A second replica converges on the stored document.
 ///
 /// A declare lands on ONE replica. Without the store and the reconcile the fleet
@@ -2695,6 +3475,42 @@ async fn a_second_replica_converges_on_the_stored_document() {
         second.registry.by_key(&key).is_none(),
         "a delete on one replica must reach the others"
     );
+}
+
+/// A caller cannot evade the version-bump rule by reaching a replica before
+/// that replica's reconcile loop has loaded the graph.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn a_fresh_replica_checks_the_stored_version_before_redeclaring() {
+    let Some(h) = harness("remote-version").await else {
+        return;
+    };
+    let out = egress_of("remote-version", &h.application);
+    let (status, body) = h.put_graph("g", one_node(&out, wide("b"))).await;
+    assert_eq!(status, 200, "declare: {body}");
+
+    // This replica deliberately has no local runtime. Renaming the budget
+    // re-founds its counter and therefore needs a bump above the stored v1.
+    let second = serve(&h.app.queen_url).await;
+    assert!(second.registry.all().is_empty());
+    let second_base = spawn_server(second).await;
+    let mut changed = one_node(&out, wide("renamed"));
+    changed["version"] = json!(1);
+    let res = reqwest::Client::new()
+        .put(format!("{second_base}/v1/apps/{}/graphs/g", h.application))
+        .json(&changed)
+        .send()
+        .await
+        .expect("declare on the fresh replica");
+    let status = res.status().as_u16();
+    let body: Value = res.json().await.unwrap_or(Value::Null);
+    assert_eq!(status, 409, "the stored predecessor was ignored: {body}");
+    assert!(
+        body.to_string().contains("bump version above 1"),
+        "the refusal should identify the required version: {body}"
+    );
+
+    h.cleanup("g").await;
 }
 
 /// A replica converges on a redeclared graph instead of wedging.
@@ -2778,14 +3594,14 @@ async fn the_reconcile_loop_converges_a_second_replica_on_its_own() {
 
 // ============================================================== depth and eta
 
-/// A depth the broker will not report falls back to the last one it did.
+/// A depth the broker will not report is unavailable, not the last value it did.
 ///
-/// An outage costs one round trip per TTL instead of one per caller: a console
-/// polling every few seconds across a dozen graphs would otherwise hammer an
-/// admin API that is already unhappy.
+/// The failure is cached for one TTL, so an honest outage still costs one Queen
+/// request (the client retries that request three times) rather than one request
+/// per caller.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
-async fn a_depth_the_broker_will_not_report_falls_back_to_the_last_one() {
+async fn a_depth_the_broker_will_not_report_never_becomes_zero_or_stale() {
     let Some((h, faulty)) = faulty_harness("depth").await else {
         assert!(std::env::var("GATE_TEST_REQUIRE_LIVE").is_err());
         return;
@@ -2799,16 +3615,30 @@ async fn a_depth_the_broker_will_not_report_falls_back_to_the_last_one() {
         .await
         .expect("push");
 
-    let first: u64 = h.app.depths.pending(&h.queen, &queue).await.values().sum();
+    let first: u64 = h
+        .app
+        .depths
+        .pending(&h.queen, &queue)
+        .await
+        .expect("initial depth")
+        .values()
+        .sum();
     assert_eq!(first, 1);
 
     // Wait past the cache TTL, then refuse.
     tokio::time::sleep(Duration::from_secs(3)).await;
     faulty.refuse("/depth");
-    let stale: u64 = h.app.depths.pending(&h.queen, &queue).await.values().sum();
+    faulty.forget();
+    for _ in 0..5 {
+        assert!(
+            h.app.depths.pending(&h.queen, &queue).await.is_err(),
+            "neither zero nor a stale depth is a live answer"
+        );
+    }
     assert_eq!(
-        stale, 1,
-        "the last answer is served rather than a zero, which would read as an empty queue"
+        faulty.hits("/depth"),
+        3,
+        "the failure must be cached after one client request and its retries"
     );
     faulty.allow();
 }
@@ -2839,6 +3669,258 @@ async fn an_eta_against_an_older_broker_still_costs_one_probe_per_ttl() {
         faulty.hits("/depth")
     );
     faulty.allow();
+}
+
+/// A broker depth outage is not an empty graph or an immediate ETA.
+///
+/// Every endpoint below used to consume the cache's default or stale map as if
+/// it were a live answer. They now fail together, while the cached failure
+/// keeps several page requests from repeating the same broken admin call. The
+/// default Queen client makes three HTTP attempts for that one call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn live_state_endpoints_do_not_invent_zero_during_a_depth_outage() {
+    let Some((h, faulty)) = faulty_harness("depthstate").await else {
+        assert!(std::env::var("GATE_TEST_REQUIRE_LIVE").is_err());
+        return;
+    };
+    let out = egress_of("depthstate", &h.application);
+    let (status, body) = h
+        .put_graph(
+            "g",
+            one_node(&out, json!({ "id": "b", "count": 1000, "timeMs": 1000 })),
+        )
+        .await;
+    assert_eq!(status, 200, "declare: {body}");
+
+    // The declaration response populated the depth cache. Once it expires, a
+    // failed refresh must not resurrect that old value as if it were current.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    faulty.refuse("/depth");
+    faulty.forget();
+    let paths = [
+        format!("/v1/apps/{}/graphs/g", h.application),
+        format!("/v1/apps/{}/graphs/g/nodes/n/eta", h.application),
+        "/api/targets".into(),
+        "/api/graphs".into(),
+        format!("/v1/apps/{}/metrics", h.application),
+    ];
+    for path in paths {
+        let (status, body) = h.send(reqwest::Method::GET, &path, None).await;
+        assert_eq!(
+            status, 502,
+            "{path} invented a backlog while depth was unavailable: {body}"
+        );
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("live broker state"),
+            "{path}: {body}"
+        );
+    }
+    assert_eq!(
+        faulty.hits("/depth"),
+        3,
+        "the failed read must be cached across page endpoints after one client request"
+    );
+
+    faulty.allow();
+    h.cleanup("g").await;
+}
+
+/// Live state is either read from the broker or reported as unavailable. A KV
+/// outage used to become an empty vector at every call site, which made the
+/// same graph appear to have zero usage, no active breaker and an immediate ETA
+/// while the source of truth was unreachable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn live_state_endpoints_do_not_invent_zero_during_a_kv_outage() {
+    let Some((h, faulty)) = faulty_harness("stateread").await else {
+        assert!(std::env::var("GATE_TEST_REQUIRE_LIVE").is_err());
+        return;
+    };
+    let out = egress_of("stateread", &h.application);
+    let budget = json!({
+        "id": "b",
+        "sharedKey": "vendor",
+        "count": 1000,
+        "timeMs": 1000
+    });
+    let (status, body) = h.put_graph("g", one_node(&out, budget)).await;
+    assert_eq!(status, 200, "declare: {body}");
+
+    faulty.refuse("/api/v1/kv");
+    let paths = [
+        format!("/v1/apps/{}/graphs/g", h.application),
+        format!("/v1/apps/{}/graphs/g/nodes/n/eta", h.application),
+        "/api/targets".into(),
+        "/api/budgets".into(),
+        "/api/breaches/recent".into(),
+        format!("/v1/apps/{}/metrics", h.application),
+    ];
+    for path in paths {
+        let (status, body) = h.send(reqwest::Method::GET, &path, None).await;
+        assert_eq!(
+            status, 502,
+            "{path} invented live state while KV was unavailable: {body}"
+        );
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("live broker state"),
+            "{path}: {body}"
+        );
+    }
+
+    faulty.allow();
+    h.cleanup("g").await;
+}
+
+/// A present counter whose VALUE is not a number is corrupt state, not zero.
+///
+/// The two halves of a counter row fail differently, on purpose. A value that
+/// is not an integer cannot be reasoned about at all, so it is an error and the
+/// charge gives back anything it can prove it wrote first. A missing or
+/// unreadable EXPIRY costs only the park deadline, which degrades to "retry
+/// now" — failing the charge over it would stop every path on that counter for
+/// ever, because a failed charge is redelivered and fails again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn malformed_budget_state_is_reported_and_a_failed_decode_is_refunded() {
+    let Some(h) = harness("badbudgetstate").await else {
+        return;
+    };
+    let out = egress_of("badbudgetstate", &h.application);
+    let budget = json!({
+        "id": "b",
+        "sharedKey": "vendor",
+        "count": 100,
+        "timeMs": 1000
+    });
+    let (status, body) = h.put_graph("g", one_node(&out, budget)).await;
+    assert_eq!(status, 200, "declare: {body}");
+
+    let key = gate_core::plan::shared_budget_key(&h.application, "vendor");
+    h.queen
+        .kv()
+        .put(
+            h.app.budgets.ns(),
+            &key,
+            json!("three"),
+            Expiry::seconds(60),
+        )
+        .send()
+        .await
+        .expect("plant a counter whose value is not a number");
+
+    let paths = [
+        format!("/v1/apps/{}/graphs/g", h.application),
+        format!("/v1/apps/{}/graphs/g/nodes/n/eta", h.application),
+        "/api/targets".into(),
+        "/api/budgets".into(),
+        format!("/v1/apps/{}/metrics", h.application),
+    ];
+    for path in paths {
+        let (status, body) = h.send(reqwest::Method::GET, &path, None).await;
+        assert_eq!(
+            status, 502,
+            "{path} reported the corrupt counter as zero: {body}"
+        );
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("live broker state"),
+            "{path}: {body}"
+        );
+    }
+
+    let error = h
+        .app
+        .budgets
+        .charge(&[gate_server::budget::Charge {
+            key: key.clone(),
+            max: 100,
+            ttl: 1,
+            delta: 2,
+            budget_id: "b".into(),
+        }])
+        .await
+        .expect_err("a returned counter whose value is not an integer must fail decoding");
+    assert!(error.to_string().contains("not an integer"), "{error}");
+    let raw = h
+        .app
+        .budgets
+        .get_raw(std::slice::from_ref(&key))
+        .await
+        .expect("read counter after refund");
+    assert_eq!(
+        raw.first().and_then(|row| row.value.clone()),
+        Some(json!("three")),
+        "the applied increment must be refunded before the decode error escapes"
+    );
+
+    // The other half: a counter with a real value and no expiry is READABLE.
+    // It loses its deadline and nothing else, so the graph keeps admitting.
+    h.app
+        .budgets
+        .clear(std::slice::from_ref(&key))
+        .await
+        .expect("remove corrupt counter");
+    h.queen
+        .kv()
+        .put(h.app.budgets.ns(), &key, json!(3), Expiry::forever())
+        .send()
+        .await
+        .expect("plant a counter with no window expiry");
+
+    let states = h
+        .app
+        .budgets
+        .read(std::slice::from_ref(&key))
+        .await
+        .expect("a counter without an expiry is readable, not an error");
+    assert_eq!(states.first().map(|s| s.value), Some(3), "{states:?}");
+    assert_eq!(
+        states.first().and_then(|s| s.expires_at_ms),
+        None,
+        "an unreadable expiry degrades to `retry now`"
+    );
+
+    let attempt = h
+        .app
+        .budgets
+        .charge(&[gate_server::budget::Charge {
+            key: key.clone(),
+            max: 100,
+            ttl: 1,
+            delta: 2,
+            budget_id: "b".into(),
+        }])
+        .await
+        .expect("a missing expiry must not fail the charge and stall the node");
+    assert!(
+        attempt.all_applied(),
+        "the charge is decided by the counter, not by its deadline: {attempt:?}"
+    );
+
+    let (status, body) = h
+        .send(
+            reqwest::Method::GET,
+            &format!("/v1/apps/{}/graphs/g", h.application),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "a readable counter must not 502: {body}");
+
+    h.app
+        .budgets
+        .clear(std::slice::from_ref(&key))
+        .await
+        .expect("remove the expiryless counter");
+    h.cleanup("g").await;
 }
 
 /// An ETA answers from the DECLARED schedule when the window is spent.
@@ -2895,6 +3977,20 @@ async fn an_eta_answers_from_the_declared_schedule_when_the_window_is_spent() {
         "the answer is a bound and must read as one: {eta}"
     );
 
+    let (_, targets) = h.send(reqwest::Method::GET, "/api/targets", None).await;
+    let mine = targets
+        .as_array()
+        .and_then(|rows| {
+            rows.iter()
+                .find(|t| t["application"] == h.application && t["name"] == "g")
+        })
+        .expect("graph missing from target index");
+    assert_eq!(
+        mine["state"], "pacing",
+        "current backlog must drive state: {mine}"
+    );
+    assert!(mine["backlog"].as_u64().unwrap_or(0) > 0, "{mine}");
+
     h.cleanup("g").await;
 }
 
@@ -2944,6 +4040,30 @@ async fn an_eta_tells_a_budget_backlog_from_a_worker_one() {
     }
     assert_eq!(eta["waitingForBudget"], json!(0), "{eta}");
     assert_eq!(eta["state"], "waiting-workers", "{eta}");
+
+    // The graph detail is what the topology diagram reads. These fields used
+    // to be absent, which the Vue component silently rendered as two zeroes.
+    let (status, view) = h.get_graph("g").await;
+    assert_eq!(status, 200, "{view}");
+    let node = &view["nodes"][0];
+    assert_eq!(node["waiting_for_budget"], json!(0), "{view}");
+    assert!(
+        node["waiting_for_workers"].as_u64().unwrap_or(0) as usize >= N,
+        "the graph must show the worker backlog instead of a fallback zero: {view}"
+    );
+
+    let (_, targets) = h.send(reqwest::Method::GET, "/api/targets", None).await;
+    let mine = targets
+        .as_array()
+        .and_then(|rows| {
+            rows.iter()
+                .find(|t| t["application"] == h.application && t["name"] == "g")
+        })
+        .expect("graph missing from target index");
+    assert_eq!(
+        mine["state"], "flowing",
+        "worker backlog is not budget pacing: {mine}"
+    );
 
     h.cleanup("g").await;
 }
@@ -3253,6 +4373,7 @@ async fn an_ack_settles_the_whole_claim_or_pays_a_lease() {
         .depths
         .pending_of_group(&h.queen, &q, "g")
         .await
+        .expect("group depth")
         .values()
         .sum();
     assert_eq!(owed, 3, "nothing is lost: the group still owes the tail");

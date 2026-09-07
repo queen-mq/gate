@@ -34,19 +34,25 @@ const data = ref(undefined)
 const error = ref('')
 
 async function load() {
+  const minutes = range.value.minutes
   try {
-    const r = await api.get(`/api/flow?minutes=${range.value.minutes}`)
+    const r = await api.get(`/api/flow?minutes=${minutes}`)
+    if (minutes !== range.value.minutes) return
     data.value = r?.minutes?.length ? r : null
     error.value = ''
   } catch (e) {
+    if (minutes !== range.value.minutes) return
     error.value = e.message
   }
 }
 /* Slower than the live gauges on this page: the series is one point per
    minute, so refreshing it every four seconds would redraw the same picture
    fifteen times to add nothing. */
-usePoll(load, 15000)
-watch(range, load)
+const refresh = usePoll(load, 15000)
+watch(range, () => {
+  data.value = undefined
+  refresh()
+})
 
 const series = computed(() => data.value?.applications ?? [])
 const minutes = computed(() => data.value?.minutes ?? [])
@@ -221,7 +227,7 @@ function toneOf(u) {
                  would read as a limit of zero, which is the opposite of idle. -->
             <span class="ml-auto text-[12px] text-fg-3 tabular-nums hidden sm:inline">
               <template v-if="r.point.ceiling">
-                {{ rate((r.point.admitted ?? 0) / 60) }}/s of {{ rate(r.point.ceiling / 60) }}/s
+                {{ rate((r.point.cost ?? 0) / 60) }} cost/s of {{ rate(r.point.ceiling / 60) }} cost/s
               </template>
               <template v-else>idle</template>
             </span>

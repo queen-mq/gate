@@ -59,13 +59,14 @@ pub async fn start(
         }));
     }
 
+    let stopped = Arc::new(AtomicBool::new(false));
     let rt = Arc::new(GraphRuntime {
         doc,
         plan,
         stages,
         handles: parking_lot::RwLock::new(Vec::new()),
         persisted: AtomicBool::new(false),
-        stopped: AtomicBool::new(false),
+        stopped: stopped.clone(),
         cancel,
     });
 
@@ -80,6 +81,7 @@ pub async fn start(
             budgets.clone(),
             st.clone(),
             traces.clone(),
+            stopped.clone(),
         ));
     }
     *rt.handles.write() = handles;
@@ -113,14 +115,13 @@ async fn provision(queen: &Queen, plan: &Plan) -> Result<()> {
                     .configure(opts)
                     .await?;
             }
-            // The application's queue. Created so its consumers can subscribe
-            // before Gate has pushed anything — a group that finds no queue is a
-            // 404 an application has to code around — and never configured: its
-            // retention, its lease and its partition count belong to whoever
-            // made it.
-            QueueKind::Egress => {
-                queen.queue(&q.name).create().await.ok();
-            }
+            // Produced into, never configured. `QueueBuilder::create` is a
+            // `/configure` with an empty option bag, and that endpoint is a FULL
+            // replace: calling it here would silently reset an application's
+            // retention, lease, retry and dedup settings on every declare. Queen
+            // creates an absent queue atomically on the first push; applications
+            // that need to subscribe before then own its explicit provisioning.
+            QueueKind::Egress => {}
             // Consumed, never created. If it does not exist yet, Gate finds it
             // on its first message; declare-time validation says so as a
             // warning.

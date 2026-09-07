@@ -36,7 +36,10 @@ mod common;
 
 use common::{airbnb, rules};
 use gate_core::doc::{Egress, Ingress, PathElem};
-use gate_core::{validate, warnings, GraphDoc};
+use gate_core::{
+    compile_with, validate, validate_plan_with, warnings, Counters, ExternalFacts, GraphDoc,
+    PlanOpts, MAX_GRAPH_WORKERS,
+};
 
 /// The single most valuable test in the file: the flagship fixture must validate
 /// clean, in the new vocabulary. If it cannot, the schema is wrong.
@@ -80,6 +83,17 @@ fn broken(f: impl FnOnce(&mut GraphDoc)) -> Vec<&'static str> {
     let mut doc = airbnb();
     f(&mut doc);
     rules(&validate(&doc))
+}
+
+#[test]
+fn counters_only_accept_the_window_the_runtime_emits() {
+    assert!(
+        broken(|d| d.counters = Some(Counters { window_seconds: 30 })).contains(&"counters-window")
+    );
+    assert!(
+        !broken(|d| d.counters = Some(Counters { window_seconds: 60 }))
+            .contains(&"counters-window")
+    );
 }
 
 // -------------------------------------------------------------------- naming
@@ -189,6 +203,42 @@ fn a_node_needs_at_least_one_unscoped_budget() {
     assert!(got.contains(&"node-unscoped-budget"), "{got:?}");
 }
 
+/// A conditional counter is not a breaker lever for operations it does not
+/// select. At least one unscoped counter must therefore take every item.
+#[test]
+fn a_node_needs_an_unconditional_unscoped_budget() {
+    let got = broken(|d| {
+        let n = d.nodes.get_mut("audit").unwrap();
+        n.budgets[0].when_op = Some(vec!["photo.delete".into()]);
+    });
+    assert!(got.contains(&"node-unscoped-budget"), "{got:?}");
+}
+
+#[test]
+fn a_breaker_must_fit_its_counters_and_record_in_one_atomic_call() {
+    let fill = |d: &mut GraphDoc, count: usize| {
+        let n = d.nodes.get_mut("audit").unwrap();
+        let template = n.budgets[0].clone();
+        n.budgets = (0..count)
+            .map(|i| {
+                let mut b = template.clone();
+                b.id = Some(format!("breaker-{i}"));
+                b
+            })
+            .collect();
+    };
+
+    let mut at_limit = airbnb();
+    fill(&mut at_limit, gate_core::MAX_BREAKER_COUNTERS);
+    assert!(
+        !rules(&validate(&at_limit)).contains(&"breaker-width"),
+        "255 counters plus the record must fit exactly"
+    );
+
+    let got = broken(|d| fill(d, gate_core::MAX_BREAKER_COUNTERS + 1));
+    assert!(got.contains(&"breaker-width"), "{got:?}");
+}
+
 #[test]
 fn a_budget_that_cannot_admit_anything_never_will() {
     assert!(
@@ -203,6 +253,14 @@ fn the_window_floor_is_a_hundred_milliseconds() {
         broken(|d| d.nodes.get_mut("audit").unwrap().budgets[0].time_ms = 50)
             .contains(&"budget-window")
     );
+}
+
+#[test]
+fn warning_about_an_extreme_window_does_not_overflow() {
+    let mut doc = airbnb();
+    doc.nodes.get_mut("audit").unwrap().budgets[0].time_ms = i64::MAX;
+    let got = rules(&warnings(&doc));
+    assert!(got.contains(&"window-sub-second"), "{got:?}");
 }
 
 #[test]
@@ -278,9 +336,29 @@ fn a_cost_path_is_a_payload_path() {
 }
 
 #[test]
+fn a_cost_path_cannot_read_gates_provenance_stamp() {
+    let got = broken(|d| {
+        d.nodes.get_mut("audit").unwrap().cost = gate_core::Cost::Path(gate_core::CostPath {
+            path: "payload._gate.hop".into(),
+            default: 1,
+            max: Some(10),
+        })
+    });
+    assert!(got.contains(&"cost-path"), "{got:?}");
+}
+
+#[test]
 fn a_scope_path_is_a_payload_path() {
     let got = broken(|d| {
         d.nodes.get_mut("photos").unwrap().budgets[1].scope_by = Some("listingId".into())
+    });
+    assert!(got.contains(&"scope-path"), "{got:?}");
+}
+
+#[test]
+fn a_scope_path_cannot_key_on_gates_provenance_stamp() {
+    let got = broken(|d| {
+        d.nodes.get_mut("photos").unwrap().budgets[1].scope_by = Some("payload._gate.path".into())
     });
     assert!(got.contains(&"scope-path"), "{got:?}");
 }
@@ -378,6 +456,40 @@ fn an_ingress_queue_claimed_elsewhere_in_the_fleet_is_refused() {
     };
     let got = rules(&gate_core::validate_with(&airbnb(), &facts));
     assert!(got.contains(&"ingress-owner"), "{got:?}");
+}
+
+/// A named ingress can spell one of Gate's derived interior names. It is still
+/// one physical queue, so treating the two appearances as different logical
+/// sources duplicates the stream under two consumer groups.
+#[test]
+fn a_named_ingress_may_not_alias_an_interior_queue() {
+    let got = broken(|d| {
+        d.nodes.get_mut("messages").unwrap().ingress =
+            Some(Ingress::Named(gate_core::IngressSpec {
+                queue: Some("gate.channel.airbnb.ip.in".into()),
+                partitions: None,
+                http: None,
+                shed: None,
+            }));
+    });
+    assert!(got.contains(&"ingress-owner"), "{got:?}");
+}
+
+/// Node-cycle validation cannot see a loop made only by physical queue names.
+/// Without this refusal the relay acks each input and atomically pushes its
+/// output back into the same queue, for ever.
+#[test]
+fn an_egress_may_not_feed_a_source_of_the_same_graph() {
+    let doc: GraphDoc = serde_json::from_str(
+        r#"{"application":"a","graph":"g","version":1,
+            "nodes":{"n":{"ingress":{"queue":"loop"},
+                          "budgets":[{"id":"b","count":100,"timeMs":1000}],
+                          "egress":"loop"}},
+            "paths":[{"name":"main","nodes":["n"]}]}"#,
+    )
+    .unwrap();
+    let got = rules(&validate(&doc));
+    assert!(got.contains(&"queue-cycle"), "{got:?}");
 }
 
 // ------------------------------------------------------------------ warnings
@@ -524,6 +636,49 @@ fn a_batch_has_a_range_and_a_scoped_budget_is_why() {
     );
 }
 
+/// `queen-mq` preallocates a vector and spawns one task for every resolved
+/// worker. Before this rule, `concurrency: 4294967295` could abort the process
+/// while handling a tiny, otherwise valid declaration.
+#[test]
+fn a_graph_has_a_bounded_total_worker_width() {
+    let mut doc: GraphDoc = serde_json::from_str(
+        r#"{"application":"a","graph":"g","version":1,
+            "nodes":{"n":{"ingress":true,"concurrency":4096,
+                          "budgets":[{"count":100,"timeMs":1000}],
+                          "egress":"a.g.out"}},
+            "paths":[{"name":"main","nodes":["n"]}]}"#,
+    )
+    .unwrap();
+    assert_eq!(MAX_GRAPH_WORKERS, 4096);
+    assert!(!rules(&validate(&doc)).contains(&"graph-workers"));
+
+    doc.nodes.get_mut("n").unwrap().concurrency = Some(4097);
+    assert!(rules(&validate(&doc)).contains(&"graph-workers"));
+}
+
+/// The server compiles with `GATE_STAGE_CONCURRENCY`; validation must inspect
+/// that exact plan rather than recompiling the document with default options.
+#[test]
+fn a_resolved_global_worker_override_is_bounded_too() {
+    let doc: GraphDoc = serde_json::from_str(
+        r#"{"application":"a","graph":"g","version":1,
+            "nodes":{"n":{"ingress":true,
+                          "budgets":[{"count":100,"timeMs":1000}],
+                          "egress":"a.g.out"}},
+            "paths":[{"name":"main","nodes":["n"]}]}"#,
+    )
+    .unwrap();
+    let plan = compile_with(
+        &doc,
+        &PlanOpts {
+            concurrency: Some(4097),
+            ..Default::default()
+        },
+    );
+    let got = validate_plan_with(&doc, &plan, &ExternalFacts::default());
+    assert!(rules(&got).contains(&"graph-workers"), "{got:#?}");
+}
+
 #[test]
 fn a_shared_egress_queue_is_legal_and_named() {
     let facts = gate_core::ExternalFacts {
@@ -561,4 +716,85 @@ fn ingress_true_is_a_queue_gate_owns() {
     // application already pushes to with its own SDK.
     assert!(doc.nodes["prices"].ingress.as_ref().unwrap().http());
     assert!(!doc.nodes["messages"].ingress.as_ref().unwrap().http());
+}
+
+/// A rule added after a document was written must not be the thing that takes
+/// that document down on the next restart. Only a document whose plan cannot be
+/// built or addressed at all is refused on the way back out of the store.
+#[test]
+fn a_stored_document_is_refused_only_for_a_rule_it_cannot_be_served_under() {
+    for fatal in [
+        "nodes",
+        "paths",
+        "application",
+        "graph-name",
+        "node-name",
+        "path-name",
+        // Not a naming or emptiness rule: a plan over the worker cap would
+        // exhaust the replica before it served anything, which is not a graph
+        // kept running and takes every other graph on the replica down too.
+        "graph-workers",
+    ] {
+        assert!(
+            gate_core::refuses_stored_document(fatal),
+            "`{fatal}` leaves no plan that can run and must still refuse"
+        );
+    }
+    for kept in [
+        "node-unscoped-budget",
+        "budget-count",
+        "cost-fits",
+        "shares",
+        "ingress-owner",
+        "counters-window",
+        "breaker-width",
+        "queue-cycle",
+        "a-rule-that-does-not-exist-yet",
+    ] {
+        assert!(
+            !gate_core::refuses_stored_document(kept),
+            "`{kept}` would strand a graph that was serving traffic a moment ago"
+        );
+    }
+}
+
+/// A queue that is both an egress and a source is only a cycle when work put
+/// there can come back to it. Two paths chained through one queue — `in` to
+/// `mid`, then `mid` to `out` — is a legal linear topology, and rejecting it
+/// would also stop the graph from restarting on the next boot.
+#[test]
+fn a_chain_through_one_queue_is_not_a_cycle() {
+    let chain: GraphDoc = serde_json::from_str(
+        r#"{"application":"a","graph":"g","version":1,
+            "nodes":{
+              "first": {"ingress":{"queue":"app.in"},
+                        "budgets":[{"id":"b1","count":100,"timeMs":1000}],
+                        "egress":"app.mid"},
+              "second":{"ingress":{"queue":"app.mid"},
+                        "budgets":[{"id":"b2","count":100,"timeMs":1000}],
+                        "egress":"app.out"}},
+            "paths":[{"name":"p1","nodes":["first"]},
+                     {"name":"p2","nodes":["second"]}]}"#,
+    )
+    .unwrap();
+    assert!(
+        !rules(&validate(&chain)).contains(&"queue-cycle"),
+        "`app.mid` is a hop, not a loop: {:?}",
+        validate(&chain)
+    );
+
+    // The real thing: what a node admits goes straight back to what it reads.
+    let loop_doc: GraphDoc = serde_json::from_str(
+        r#"{"application":"a","graph":"g","version":1,
+            "nodes":{"n":{"ingress":{"queue":"app.in"},
+                          "budgets":[{"id":"b","count":100,"timeMs":1000}],
+                          "egress":"app.in"}},
+            "paths":[{"name":"main","nodes":["n"]}]}"#,
+    )
+    .unwrap();
+    assert!(
+        rules(&validate(&loop_doc)).contains(&"queue-cycle"),
+        "{:?}",
+        validate(&loop_doc)
+    );
 }

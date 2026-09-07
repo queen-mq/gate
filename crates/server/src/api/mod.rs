@@ -23,14 +23,14 @@ pub mod reenter;
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use parking_lot::RwLock;
 use queen_mq::Queen;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::budget::Budgets;
 use crate::obs::Traces;
@@ -42,6 +42,7 @@ pub struct App {
     pub budgets: Budgets,
     pub registry: Registry,
     pub depths: Arc<crate::depth::Depths>,
+    pub backlogs: crate::obs::BacklogTrends,
     pub traces: Arc<Traces>,
     pub history: Option<Arc<crate::history::History>>,
     pub queen_url: String,
@@ -75,6 +76,7 @@ impl App {
             queen,
             registry: Default::default(),
             depths: Arc::new(crate::depth::Depths::default()),
+            backlogs: Default::default(),
             traces: Arc::new(Traces::default()),
             history: None,
             queen_url,
@@ -128,13 +130,28 @@ pub fn public_router(app: Shared) -> Router {
     routes()
         .route("/api/auth/google/login", get(crate::auth::login))
         .route("/api/auth/google/callback", get(crate::auth::callback))
-        .route("/api/auth/logout", get(crate::auth::logout))
+        .route("/api/auth/logout", post(crate::auth::logout))
         .merge(crate::webapp::router())
         .layer(axum::middleware::from_fn_with_state(
             app.clone(),
             crate::auth::require_session,
         ))
         .with_state(app)
+}
+
+/// The body limit the four push routes carry, and only they.
+///
+/// A push is a BATCH: one request stands for as many items as the caller managed
+/// to group, and the honest bound on it is memory. Everything else on this
+/// surface takes a document — a graph declaration, a breaker poke, a console
+/// read — and keeps axum's 2 MiB, which no document has ever come near.
+///
+/// Applied per route rather than as one `.layer()` on the Router for exactly
+/// that reason: a limit on the whole surface would raise the ceiling on
+/// endpoints that have no batch to justify it, and this service holds every
+/// buffered body in a 512 MiB pod.
+fn push_body_limit() -> DefaultBodyLimit {
+    DefaultBodyLimit::max(crate::knobs::knobs().max_push_body)
 }
 
 fn routes() -> Router<Shared> {
@@ -154,11 +171,11 @@ fn routes() -> Router<Shared> {
         )
         .route(
             "/v1/apps/:app/graphs/:graph/nodes/:node/push",
-            post(data::graph_push),
+            post(data::graph_push).layer(push_body_limit()),
         )
         .route(
             "/v1/graphs/:graph/nodes/:node/push",
-            post(data::graph_push_default),
+            post(data::graph_push_default).layer(push_body_limit()),
         )
         .route(
             "/v1/apps/:app/graphs/:graph/nodes/:node/eta",
@@ -206,11 +223,11 @@ fn routes() -> Router<Shared> {
         )
         .route(
             "/v1/apps/:app/targets/:name/lanes/:lane/push",
-            post(data::target_push),
+            post(data::target_push).layer(push_body_limit()),
         )
         .route(
             "/v1/targets/:name/lanes/:lane/push",
-            post(data::target_push_default),
+            post(data::target_push_default).layer(push_body_limit()),
         )
         .route("/v1/apps/:app/targets/:name/eta", get(eta::target_eta))
         .route("/v1/targets/:name/eta", get(eta::target_eta_default))
@@ -289,6 +306,32 @@ pub fn ok(v: serde_json::Value) -> ApiResult {
     Ok(Json(v).into_response())
 }
 
+/// Gate's HTTP doors add `_gate` metadata to the application payload. Refuse a
+/// shape that cannot carry that metadata instead of silently replacing the
+/// caller's data with an empty object.
+pub(crate) fn object_payload(payload: Option<Value>) -> Result<Value, Fail> {
+    // An ABSENT payload is not a payload Gate would be erasing: there is nothing
+    // to lose, and `{"op": "publish", "txn": "t1"}` has always been a legal push
+    // of an item that carries only its envelope. `serde` cannot tell an absent
+    // field from an explicit `null`, so the distinction is drawn here, on
+    // `Option`, rather than on `Value::Null`.
+    let Some(payload) = payload else {
+        return Ok(json!({}));
+    };
+    if payload.is_object() {
+        return Ok(payload);
+    }
+    Err(Fail(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        format!(
+            "payload must be a JSON object: Gate must add `{}` metadata without changing the \
+             application value. Omit the field entirely to push an item that carries only its \
+             envelope.",
+            gate_core::GATE_META
+        ),
+    ))
+}
+
 impl From<crate::graph::Refusal> for Fail {
     fn from(r: crate::graph::Refusal) -> Self {
         match r {
@@ -296,6 +339,15 @@ impl From<crate::graph::Refusal> for Fail {
             crate::graph::Refusal::Conflict(m) => Fail(StatusCode::CONFLICT, m),
             crate::graph::Refusal::Gateway(m) => Fail(StatusCode::BAD_GATEWAY, m),
         }
+    }
+}
+
+impl From<queen_mq::Error> for Fail {
+    fn from(error: queen_mq::Error) -> Self {
+        Fail(
+            StatusCode::BAD_GATEWAY,
+            format!("could not read live broker state: {error}"),
+        )
     }
 }
 
@@ -315,7 +367,14 @@ pub fn find(
 /// The one case the server refuses to guess: two applications with a graph of
 /// one name. Picking either would run somebody else's declaration.
 pub fn resolve(st: &Shared, name: &str) -> Result<Arc<crate::registry::GraphRuntime>, Fail> {
-    match st.registry.resolve(name) {
+    resolve_found(name, st.registry.resolve(name))
+}
+
+pub(crate) fn resolve_found(
+    name: &str,
+    found: crate::registry::Resolved,
+) -> Result<Arc<crate::registry::GraphRuntime>, Fail> {
+    match found {
         crate::registry::Resolved::One(g) => Ok(g),
         crate::registry::Resolved::None => {
             Err(Fail(StatusCode::NOT_FOUND, format!("no graph `{name}`")))
@@ -350,4 +409,42 @@ pub fn refuse_if_stopped(rt: &Arc<crate::registry::GraphRuntime>) -> Result<(), 
             rt.key()
         ),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_http_payload_must_be_an_object_instead_of_being_discarded() {
+        let kept = object_payload(Some(json!({ "kept": true })))
+            .ok()
+            .expect("object refused");
+        assert_eq!(kept["kept"], true);
+        for value in [json!(7), json!("lost"), json!([1, 2])] {
+            let err = object_payload(Some(value)).expect_err("non-object accepted");
+            assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+            assert!(err.1.contains("must be a JSON object"));
+        }
+    }
+
+    /// An omitted `payload` erases nothing, so it is not the shape this refusal
+    /// is about: `{"op": "publish", "txn": "t1"}` is a push of an item that
+    /// carries only its envelope, and it answered 200 before this rule existed.
+    #[test]
+    fn an_omitted_payload_is_an_empty_object_and_not_a_refusal() {
+        let absent = object_payload(None)
+            .ok()
+            .expect("an absent payload was refused");
+        assert_eq!(absent, json!({}));
+        let body: crate::api::data::PushBody =
+            serde_json::from_value(json!({ "op": "publish", "txn": "t1" })).expect("body");
+        assert_eq!(body.payload, None, "an absent field must not read as null");
+        // `serde` maps an explicit `null` onto `None` as well, and that is the
+        // right reading: both spellings say "this item carries no payload", and
+        // neither has anything for Gate to erase.
+        let body: crate::api::data::PushBody =
+            serde_json::from_value(json!({ "payload": null })).expect("body");
+        assert_eq!(body.payload, None);
+    }
 }

@@ -83,6 +83,28 @@ fn a_v1_target_becomes_a_one_node_graph_that_validates() {
     );
 }
 
+/// A v1 period is seconds in an i64; v2 stores milliseconds in the same width.
+/// Multiplying an otherwise valid old document used to panic in debug builds
+/// (and wrap in release builds) before the migration could answer.
+#[test]
+fn an_extreme_v1_period_is_clamped_and_named_instead_of_overflowing() {
+    let mut spec: v1::TargetSpec = serde_json::from_str(V1_TARGET).unwrap();
+    spec.budgets[0].period_seconds = i64::MAX;
+    spec.budgets[0].cap = i64::MAX as f64;
+
+    let migrated = migrate::from_v1_target(&spec).expect("the old shape remains readable");
+
+    assert_eq!(migrated.doc.nodes["airbnb"].budgets[0].time_ms, i64::MAX);
+    assert!(
+        rules(&migrated.warnings).contains(&"period-clamped"),
+        "the unavoidable loss of range must be visible: {:#?}",
+        migrated.warnings
+    );
+    // The resolved-warning pass is part of the PUT response and used to have
+    // a second overflow of its own (fixed by the base PR).
+    let _ = gate_core::warnings(&migrated.doc);
+}
+
 /// §12.4's stability promise, which is the whole reason a migration is a
 /// migration and not a rewrite: the queue the application's consumers are
 /// already popping does not move.
@@ -126,6 +148,24 @@ fn a_class_node_with_no_budget_gets_a_passthrough_and_a_warning() {
         m.doc.nodes["prices"].budgets[0].id.as_deref(),
         Some("passthrough")
     );
+    assert!(rules(&m.warnings).contains(&"node-budget"));
+}
+
+/// A v1 selector deliberately lets non-matching operations pass. Preserve that
+/// behavior, but add the unconditional lever v2's node-wide breaker requires.
+#[test]
+fn a_node_with_only_conditional_budgets_gets_a_passthrough() {
+    let mut spec: v1::TargetSpec = serde_json::from_str(V1_TARGET).unwrap();
+    spec.budgets[0].matcher = Some(v1::Match {
+        op: vec!["photo.delete".into()],
+    });
+
+    let m = migrate::from_v1_target(&spec).unwrap();
+    let budgets = &m.doc.nodes["airbnb"].budgets;
+    assert_eq!(budgets.len(), 2);
+    assert_eq!(budgets[1].id.as_deref(), Some("passthrough"));
+    assert!(budgets[1].when_op.is_none());
+    assert!(gate_core::validate(&m.doc).is_empty());
     assert!(rules(&m.warnings).contains(&"node-budget"));
 }
 

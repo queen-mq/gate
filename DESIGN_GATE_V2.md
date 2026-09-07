@@ -112,7 +112,7 @@ be unreadable by an older one, because that is what makes the store's `complete:
 
   "nodes": {
     "<node>": {
-      "budgets": [ <Budget>, ... ],   // >= 1, and >= 1 of them unscoped
+      "budgets": [ <Budget>, ... ],   // >= 1; >= 1 unconditional and unscoped
       "cost":    <Cost>,              // default: 1
       "ingress": <Ingress>,           // optional; absent = fed only by paths
       "egress":  <Egress>             // optional; required on a terminal node
@@ -381,9 +381,9 @@ function, and echoed in the declare response so a caller never has to reconstruc
 | interior queue | `gate.{app}.{graph}.{node}.in` | every non-ingress node has one |
 | egress queue | whatever the declaration names | Gate pushes, the app consumes |
 | **stage consumer group** | `gate.{app}.{graph}.{path}.{node}` | one per (path, node) — this is the whole group taxonomy |
-| budget key (node) | `b:{app}:{graph}:{node}:{bid}` | namespace `gate` |
-| budget key (scoped) | `b:{app}:{graph}:{node}:{bid}:{scopeValue}` | one row per value, TTL-reaped |
-| budget key (shared) | `b:{app}:shared:{sharedKey}` | one row per app, across graphs |
+| budget key (node) | `b:{enc(app)}:{localGraph(graph)}:{enc(node)}:{enc(bid)}` | namespace `gate` |
+| budget key (scoped) | node key + `:{enc(scopeValue)}` | one row per value, TTL-reaped |
+| budget key (shared) | `b:{enc(app)}:shared:{enc(sharedKey)}` | one row per app, across graphs |
 | breaker record | `brk:{app}:{graph}:{node}` | TTL = `retryAfterSeconds` |
 | spec store | `graph:{app}:{name}` | namespace `gate`, `Expiry::forever()` — unchanged from v1 |
 
@@ -392,6 +392,11 @@ the reason for it is unchanged and still measured: a near-miss on a consumer gro
 fail loudly, because the broker answers a group with no cursor with the queue's whole
 retained range — so an ETA built on a misspelling reports every message ever pushed as
 waiting for budget, plausibly, for ever.
+
+`enc` percent-escapes `%` as `%25` and the structural `:` separator as `%3A`. Ordinary names
+therefore keep their existing keys, while free-form budget ids, shared keys and scope values cannot
+smuggle a separator. `localGraph` applies the same encoding and spells the legal graph name
+`shared` as `%73hared`, because the unescaped word is the shared-budget namespace marker.
 
 **One group per (path, node), not per node.** Two paths sharing an ingress node is
 **pub-sub**: each path's group gets **every** message, so the message traverses both paths.
@@ -443,7 +448,7 @@ queen.queue(stage.source)
      //                     .subscription_from(runtime_start - INTERIOR_SEED_SKEW)
      .batch(stage.batch)                         // default 200
      .partitions(1)                              // ONE source partition per claim — §6.4
-     .concurrency(stage.concurrency)             // default = max(4, source partitions)
+     .concurrency(stage.concurrency)             // default derived from node-wide rate
      .auto_ack(false)                            // the relay settles inside its own txn
      .lease_seconds(30)                          // a WORK lease, not a pacing quantum
      .renew_lease(Duration::from_secs(10))
@@ -553,7 +558,8 @@ serving four read shapes. v2 runs **7 consumers, 1 reconcile loop, 1 history pru
 ### 5.1 One key, one counter, no window index
 
 ```
-key   = b:{app}:{graph}:{node}:{bid}[:{scope}]     (or b:{app}:shared:{sharedKey})
+key   = b:{enc(app)}:{localGraph(graph)}:{enc(node)}:{enc(bid)}[:{enc(scope)}]
+        (or b:{enc(app)}:shared:{enc(sharedKey)}[:{enc(scope)}])
 max   = round(count_sub * share(path))
 ttl   = window_sub_seconds
 delta = cost
@@ -896,8 +902,9 @@ The one piece of per-item provenance v2 keeps, unchanged in spirit from v1:
 "_gate": { "graph": "airbnb", "path": "prices", "hop": 2, "at": 1755763200000 }
 ```
 
-One reserved object, not four top-level keys, so it cannot collide with a `scopeBy` path or a
-cost path. Stamped by the ingress push (HTTP front door) or by the first relay that handles an
+One reserved object, not four top-level keys. The declaration path grammar explicitly rejects
+`payload._gate` and anything below it, so neither `scopeBy` nor a cost path can read provenance as
+producer data. Stamped by the ingress push (HTTP front door) or by the first relay that handles an
 unstamped message (which is how a user-owned ingress queue works — producers know nothing
 about Gate). Carried verbatim by every relay, rewritten per hop. It is **not signed and not
 verified**: it is trusted because it is written server-side and because writing to an interior
@@ -1028,10 +1035,10 @@ Two broker calls:
 
 ```
 depth  = GET /api/v1/resources/queues/{node.source_queue}/depth?group={stage.group}
-state  = kv.batch([ getMany(NS, node.unscoped_budget_keys) ])
+state  = kv.batch([ getMany(NS, node.node_wide_budget_keys) ])
 ```
 
-Then, per budget `b`:
+Then, per unconditional, unscoped budget `b`:
 
 ```
 cap_p     = round(count_sub(b) * share(path))
@@ -1049,6 +1056,12 @@ else:
 etaSeconds = max over b of seconds_b               // the slowest budget binds
 boundBy    = the b that produced it
 ```
+
+`whenOp` budgets are deliberately excluded from this queue-level bound. Depth
+does not say which operations are waiting, so charging every queued item to a
+selective counter would produce a late, false answer for non-matching work. The
+ETA keeps the unconditional lower bound and names the unresolved selectors in
+`assumes`.
 
 `cap_p <= 0` (a share that rounds a path out of existence — refused at declare time, but a
 stored document from an older build can still carry it) answers `null`, never infinity.
@@ -1089,9 +1102,10 @@ should now be near `batch` rather than near 1.
 
 ### 10.3 The optional counters stream
 
-`"counters": { "windowSeconds": 60 }` on the graph turns on **one** streams job per graph: a
-tumbling-window aggregate over the egress queue producing `{ path, node, count, cost }` per
-window, written to `gate.rollups`. This is opt-in, per graph, and off by default — the point
+`"counters": { "windowSeconds": 60 }` on the graph turns on durable one-minute roll-ups. The
+storage schema and history API are minute-keyed, so `60` is currently the only accepted value.
+The runtime snapshots each replica's in-process stage counters and writes their deltas to
+`gate.rollups`. This is opt-in, per graph, and off by default — the point
 of the architecture is that observability is a thing you switch on, not a thing that runs
 whether or not anyone is looking. It is the source for `avgCost`, `/api/flow`, `/api/rollups`
 and the console's charts.
@@ -1131,12 +1145,14 @@ Rule names are asserted on in tests, so they are API.
 |---|---|---|
 | `nodes` | empty | `a graph with no nodes limits nothing.` |
 | `paths` | empty | `` a graph with no paths has no way in and no way out: declare at least one path naming the nodes a message visits, in order. `` |
+| `counters-window` | `counters.windowSeconds != 60` | `` counters.windowSeconds is {n}, but Gate currently stores and serves fixed one-minute roll-ups. Set windowSeconds to 60, or omit counters to leave durable roll-ups off. `` |
 | `path-node` | a path names an undeclared node | `` path `{p}` visits `{n}`, which is not a declared node. Declared nodes are: {list}. `` |
 | `path-length` | a path has fewer than 1 element | `` path `{p}` is empty. `` |
 | `acyclic` | the union of all path edges has a cycle | `` these nodes form a cycle: {a} -> {b} -> {a}. An item would traverse it for ever, re-paying every budget on the way round. `` |
 | `path-entry` | a path's first node has no `ingress` | `` path `{p}` starts at `{n}`, which declares no ingress. Work cannot enter a node that has no queue to enter by: give `{n}` an `ingress`, or start the path at a node that has one. `` |
 | `path-terminal` | a path's last element contains a node with no `egress` | `` path `{p}` ends at `{n}`, which declares no egress. Work would be admitted and then have nowhere to go. Name the queue your consumers read: `"egress": "{app}.{graph}.out"`. `` |
 | `node-orphan` | a declared node appears in no path | `` node `{n}` is declared and no path visits it: it can never hold work. `` |
+| `graph-workers` | the resolved stages total more than 4096 consumer workers | `` this graph resolves to {workers} consumer workers across {stages} stages; the maximum is 4096. Each worker allocates a task and a broker long-poll before the graph starts, so an unbounded value can exhaust a replica. Lower `nodes[].concurrency` or `GATE_STAGE_CONCURRENCY`, or split the topology into separate graphs. `` |
 | `fanout-branch` | a fan-out array has fewer than 2 elements, or nested arrays | `` path `{p}` hop {i}: a fan-out is a flat array of at least two node names. `` |
 | `fanout-terminal` | a fan-out is not the last hop of its path | `` path `{p}` fans out to {list} at hop {i}, which is not the last hop. After a fan-out the branches are separate streams; give each one its own path. `` |
 
@@ -1145,7 +1161,8 @@ Rule names are asserted on in tests, so they are API.
 | rule | when | detail |
 |---|---|---|
 | `node-budget` | a node declares no budgets | `` node `{n}` declares no budget, so it limits nothing — it would admit everything straight through, which is a queue with extra steps. `` |
-| `node-unscoped-budget` | every budget of a node has `scopeBy` | `` node `{n}` has only per-key budgets. It needs at least one budget on the node itself: it is what the ETA measures a rate against and what the breaker spends when a vendor says 429. `` |
+| `node-unscoped-budget` | every budget of a node has `scopeBy` or `whenOp` | `` node `{n}` has no unconditional budget on the node itself. It needs at least one budget without scopeBy or whenOp: every item must meet that counter, so the ETA has a node-wide rate and the breaker can stop every operation when a vendor says 429. `` |
+| `breaker-width` | a node compiles to more than 255 distinct unscoped counter keys | `` node `{n}` compiles to {k} distinct node-wide counters. A breaker must spend them and write its audit record atomically, but the broker accepts at most 256 operations in one call. Keep at most 255 distinct unscoped counters; budgets with the same sharedKey count once. `` |
 | `budget-count` | `count < 1` | `` budget `{b}` of node `{n}` has count {c}. A budget that cannot admit anything never will — no schedule refills it. `` |
 | `budget-window` | `timeMs < 100` | `` budget `{b}` of node `{n}` declares timeMs {t}. The floor is 100. `` |
 | `budget-window-floor` | `timeMs < 1000` | **WARNING, not a refusal** — see `window-sub-second` below. |
@@ -1155,8 +1172,8 @@ Rule names are asserted on in tests, so they are API.
 | `cost-fits` | `cost.max > count_sub` for any budget | `` node `{n}`: an item may cost up to {max} and budget `{b}` admits {cs} per sub-window. An item that cannot fit a window can never be admitted — it parks the head of its partition for ever and never reaches a DLQ, because a lease that expires charges no retry. Raise the budget, lower cost.max, or lower subWindows. `` |
 | `cost-max` | `cost.max < cost.default` | `` node `{n}`: cost.max {m} is below cost.default {d}, so the default cost is itself inadmissible. `` |
 | `cost-integer` | a constant `cost` that is not an integer >= 1 | `` node `{n}`: cost must be a whole number of at least 1. The budget counter is an integer on this wire, so a fractional cost is not expressible — express the unit differently (count tenths, and multiply the budget by ten). `` |
-| `cost-path` | a `path` that is not a dotted payload path | `` node `{n}`: cost.path `{p}` is not a payload path. Write it as `payload.field` or `payload.a.b`. `` |
-| `scope-path` | `scopeBy` is not a dotted payload path | `` budget `{b}` of node `{n}`: scopeBy `{p}` is not a payload path. `` |
+| `cost-path` | a `path` that is not a dotted payload path, or starts with reserved `payload._gate` | `` node `{n}`: cost.path `{p}` is not a payload path. Write it as `payload.field` or `payload.a.b`; `payload._gate` is reserved for Gate's routing stamp. `` |
+| `scope-path` | `scopeBy` is not a dotted payload path, or starts with reserved `payload._gate` | `` budget `{b}` of node `{n}`: scopeBy `{p}` is not a payload path. Write it as `payload.field` or `payload.a.b`; `payload._gate` is reserved for Gate's routing stamp. `` |
 | `shared-conflict` | two budgets in this document share a `sharedKey` with different `count`/`timeMs`/`subWindows` | `` `{k}` is declared as {c1} per {t1}ms in node `{n1}` and {c2} per {t2}ms in node `{n2}`. They are one counter, so one of those declarations is a lie about what it enforces. Make them agree or give them different keys. `` |
 | `whenop-empty` | `whenOp: []` | `` budget `{b}` of node `{n}`: an empty whenOp matches nothing, so the budget charges nothing. Drop the field to take everything. `` |
 | `provenance` | `confidence: documented` with no `source` or no `asOf` | `` budget `{b}` of node `{n}` claims to be documented but names no {source/asOf}. A guess must never look like a measurement. `` |
@@ -1260,7 +1277,9 @@ up to one old window to land, and the declare response says so.
 
 The rule is enforced for a **caller's** declare only, never for one applied from the store —
 enforcing it against a replica-local runtime is how a replica wedges on a legal
-delete-and-redeclare at the same version. That asymmetry is v1's and it is kept verbatim.
+delete-and-redeclare at the same version. A caller's declare compares both the local runtime and
+the exact stored document, so reaching a replica before its reconcile pass cannot make an existing
+graph look new and bypass the bump. That asymmetry is v1's and it is kept verbatim.
 
 ### 12.4 Drain and redeclare
 
@@ -1404,7 +1423,7 @@ three hardcoded fields are fixed (§13.12).
 |---|---|---|
 | `PUT /v1/apps/:app/targets/:name` | R | Declares a one-node graph. Response keeps `resolved` (now: ingress queue, egress queue, stage groups, budget keys) and `warnings`. Still 502 on a store write failure — a 200 with a 15-second fuse is a lie. |
 | `PUT /v1/targets/:name` (flat) | R | Kept, **and the parity trap is fixed**: the flat form now pins `application` from the resolved default rather than letting a body declare into another team's namespace. |
-| `PUT /v1/apps/:app/targets` (sync, reap) | R | Kept verbatim, including reap-after-declare and application scoping. Graph-owned nodes are exempt. |
+| `PUT /v1/apps/:app/targets` (sync, reap) | R | Kept, including reap-after-declare and application scoping. The authoritative inventory is read from the durable store as well as the local registry, because a sync may reach a replica before reconcile. An incomplete/refused sync reaps nothing. Multi-node graphs are exempt. |
 | `GET` target view (4 routes) | R | Fields re-sourced: budgets carry `key`, `count`, `timeMs`, `subWindows`, `value`, `expiresAt`, `utilisation` read live from KV. `utilisation` is still the **worst** counter, now across shared/scoped keys instead of across shards. |
 | `DELETE` target | R | Store-first, verbatim, including `registered: false` being a success. |
 | 409 version-bump | R | §12.3, with a much shorter trigger list. |
@@ -1638,7 +1657,7 @@ worth keeping.
 | knob | default | why |
 |---|---|---|
 | `GATE_STAGE_BATCH` | 200 | the per-claim batch when a node declares none |
-| `GATE_STAGE_CONCURRENCY` | `max(4, partitions)` | worker count per stage |
+| `GATE_STAGE_CONCURRENCY` | unset (derive from the node-wide rate) | fleet-wide worker-count override |
 | `GATE_LEASE_SECONDS` | 30 | the work lease |
 | `GATE_POLL_TIMEOUT_SECONDS` | 30 | the parked long-poll window |
 | `GATE_PARK_THRESHOLD_MS` | 1500 | park-vs-release (§6.5) |
@@ -1707,7 +1726,8 @@ for a system whose largest declared budget is 400 items a second.
 workers = clamp(ceil(cap_rate_per_sec / GATE_LANE_CAPACITY), 1, partitions)
 ```
 
-from the stage's tightest unscoped budget with its `share` applied. For the three graphs we
+from the stage's tightest unconditional, unscoped budget with its `share` applied. A `whenOp`
+budget limits only the selected traffic and cannot size the whole node. For the three graphs we
 run — sixteen stages, caps between 1.7 and 400 items a second — that is **one worker per
 stage**: sixteen parked polls per replica, about 1,900 pops an hour, against v1's ~275,000.
 `airbnb` is six of those sixteen, `vrbo` six and `google` four — a stage being one node on one

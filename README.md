@@ -183,7 +183,10 @@ reaches it — and `GATE_PUBLIC_BIND` requires a Google session on every route. 
 the local sign-in bypass and Gate refuses to boot with it set on an `https` public URL;
 `GATE_ADMIN_EMAILS` is what makes that identity able to write rather than only read.
 
+Building from source requires Node.js 24 for the embedded console; the root `.nvmrc` selects it.
+
 ```bash
+nvm use                                     # Node.js 24, from the root .nvmrc
 cd ui && npm ci && npm run build && cd ..   # the console is compiled into the binary
 cargo build --release --workspace
 cargo test --workspace                      # the live suite reports as ignored
@@ -209,6 +212,7 @@ with no broker configured, which is green lines that verified nothing. CI sets
 | `GATE_MAX_PARK_MS` | 30000 | how long a handler holds its claim waiting for a window before releasing |
 | `GATE_INTERIOR_SEED_SKEW_SECONDS` | 120 | how far before a graph's start a new group on an **interior** queue is seeded; a margin for Gate's clock against the broker's, capped at 600 |
 | `GATE_RECONCILE_SECONDS` | 15 | how often a replica re-reads the store |
+| `GATE_MAX_PUSH_BODY_BYTES` | 8388608 | the largest body a **push** route buffers, clamped to 2 MiB–64 MiB. 2 MiB is axum's default, which is what applied to everything until 2026-09-04 because nothing set one; the ceiling is there because the limit is a per-request memory reservation and nothing bounds how many requests hold one at once. Document routes keep the default |
 
 **Where a new consumer group starts, and it is two rules.** On an **ingress** queue — yours, or
 Gate's own HTTP front door — a new group is seeded at the *head* of the retained log, because a
@@ -231,8 +235,9 @@ there are counters (`popped`, `admitted`, `deferred`, `parked`, `released`, `for
 explains a stage's throughput. `wedged` is the one to alert on: it counts a stage whose ack the
 broker keeps refusing at a claim head that never moves, which is a stuck cursor and not a budget
 backlog — the stage says so once at `ERROR` with the `seek` that fixes it. Denials are kept in a bounded in-process ring; admissions are counted, never
-traced. Rollups are opt-in per graph (`"counters": { "windowSeconds": 60 }`), because observability
-is a thing you switch on, not a thing that runs whether or not anyone is looking.
+traced. Rollups are opt-in per graph (`"counters": { "windowSeconds": 60 }`); the current storage
+and API contract is a fixed one-minute window, so `60` is the only accepted value. Observability is
+a thing you switch on, not a thing that runs whether or not anyone is looking.
 
 **One thing to say out loud.** The declaration names your egress queue, and:
 

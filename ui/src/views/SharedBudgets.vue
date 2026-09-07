@@ -27,15 +27,15 @@ import {
 } from '../lib/api.js'
 import { usePoll } from '../lib/poll.js'
 
-// `undefined` while the first request is in flight, `null` when the endpoint is
-// not answering at all. A shared budget is an optional thing to have declared,
-// so its absence is a fact about the deployment and not an error to shout.
+// `undefined` while the first request is in flight. An absent shared budget is
+// a successful empty array; a failed live-state read belongs in `error` and
+// must not be presented as the same fact.
 const budgets = ref(undefined)
 const error = ref('')
 
 async function load() {
   try {
-    const r = await api.get('/api/budgets').catch(() => null)
+    const r = await api.get('/api/budgets')
     budgets.value = r === null ? null : (Array.isArray(r) ? r : (r?.budgets ?? []))
     error.value = ''
   } catch (e) {
@@ -146,7 +146,7 @@ function enforcedOf(b) {
         </div>
 
         <div class="mt-2.5">
-          <BudgetBar :used="b.used ?? 0" :cap="ceilingOf(b)"
+          <BudgetBar :used="b.used" :cap="ceilingOf(b)"
                      :assumed="b.confidence === 'assumed'" :height="7" />
         </div>
 

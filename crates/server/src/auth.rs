@@ -7,9 +7,10 @@
 //! rule can expose something by accident, and the same router serves both ports
 //! unchanged.
 //!
-//! Two exemptions, both structural rather than chosen: `/auth/*`, because you
-//! cannot require a session in order to obtain one, and the static shell, which
-//! has to render the page the sign-in button lives on.
+//! Two exemptions, both structural rather than chosen: the two sign-in
+//! bootstrap routes, because you cannot require a session in order to obtain
+//! one, and the static shell, which has to render the page the sign-in button
+//! lives on. Logout is deliberately not a bootstrap route.
 //!
 //! The claim checks mirror `queen-proxy`'s `validate_google_claims`, including
 //! its `hd` OR email-domain form. Diverging would give two products in one house
@@ -20,7 +21,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use axum::extract::{Query, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use jsonwebtoken::{
     decode, decode_header, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation,
@@ -39,6 +40,10 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 /// The signed `state` only has to survive one round trip through Google.
 const STATE_TTL_S: i64 = 300;
 pub const COOKIE: &str = "gate_session";
+const OAUTH_STATE_COOKIE: &str = "gate_oauth_state";
+const OAUTH_LOGIN_PATH: &str = "/api/auth/google/login";
+const OAUTH_CALLBACK_PATH: &str = "/api/auth/google/callback";
+const LOGOUT_PATH: &str = "/api/auth/logout";
 
 #[derive(Clone)]
 pub struct AuthConfig {
@@ -216,23 +221,45 @@ static JWKS: RwLock<Option<(Value, Instant)>> = RwLock::new(None);
 
 /// Google's keys, cached. On a refresh failure a stale copy is preferable to
 /// locking everyone out: the keys rotate slowly and an outage at Google should
-/// not become an outage here.
-async fn jwks(http: &reqwest::Client) -> Result<Value, String> {
-    if let Some((v, at)) = JWKS.read().as_ref() {
-        if at.elapsed() < JWKS_TTL {
-            return Ok(v.clone());
+/// not become an outage here. `force` is used only after a token names a key
+/// absent from the otherwise-fresh cache; in that case the stale set is already
+/// known to be unusable, so a failed download is returned rather than disguised
+/// as a successful refresh.
+async fn jwks(http: &reqwest::Client, force: bool) -> Result<Value, String> {
+    if !force {
+        if let Some((v, at)) = JWKS.read().as_ref() {
+            if at.elapsed() < JWKS_TTL {
+                return Ok(v.clone());
+            }
         }
     }
-    match http.get(GOOGLE_JWKS_URL).timeout(HTTP_TIMEOUT).send().await {
-        Ok(r) => match r.json::<Value>().await {
-            Ok(v) => {
-                *JWKS.write() = Some((v.clone(), Instant::now()));
-                Ok(v)
-            }
-            Err(e) => stale_or(format!("jwks decode: {e}")),
-        },
-        Err(e) => stale_or(format!("jwks fetch: {e}")),
+    match download_jwks(http).await {
+        Ok(v) => {
+            *JWKS.write() = Some((v.clone(), Instant::now()));
+            Ok(v)
+        }
+        Err(e) if force => Err(e),
+        Err(e) => stale_or(e),
     }
+}
+
+async fn download_jwks(http: &reqwest::Client) -> Result<Value, String> {
+    let response = http
+        .get(GOOGLE_JWKS_URL)
+        .timeout(HTTP_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| format!("jwks fetch: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("jwks fetch: {e}"))?;
+    let value = response
+        .json::<Value>()
+        .await
+        .map_err(|e| format!("jwks decode: {e}"))?;
+    if value.get("keys").and_then(Value::as_array).is_none() {
+        return Err("jwks decode: response has no keys array".into());
+    }
+    Ok(value)
 }
 
 fn stale_or(err: String) -> Result<Value, String> {
@@ -252,20 +279,8 @@ async fn verify_id_token(
 ) -> Result<GoogleClaims, String> {
     let header = decode_header(id_token).map_err(|e| format!("id_token header: {e}"))?;
     let kid = header.kid.ok_or("id_token has no kid")?;
-    let keys = jwks(http).await?;
-    let (n, e) = keys["keys"]
-        .as_array()
-        .and_then(|ks| {
-            ks.iter()
-                .find(|k| k["kid"].as_str() == Some(&kid))
-                .map(|k| {
-                    (
-                        k["n"].as_str().unwrap_or("").to_string(),
-                        k["e"].as_str().unwrap_or("").to_string(),
-                    )
-                })
-        })
-        .ok_or("no matching jwks key")?;
+    let keys = jwks(http, false).await?;
+    let (n, e) = matching_jwk(keys, &kid, || jwks(http, true)).await?;
     let key = DecodingKey::from_rsa_components(&n, &e).map_err(|e| format!("jwks key: {e}"))?;
     let mut v = Validation::new(Algorithm::RS256);
     v.set_audience(std::slice::from_ref(&cfg.client_id));
@@ -273,6 +288,37 @@ async fn verify_id_token(
     decode::<GoogleClaims>(id_token, &key, &v)
         .map(|d| d.claims)
         .map_err(|e| format!("id_token: {e}"))
+}
+
+fn jwk_components(keys: &Value, kid: &str) -> Option<(String, String)> {
+    keys["keys"].as_array().and_then(|ks| {
+        ks.iter()
+            .filter(|k| k["kid"].as_str() == Some(kid))
+            .find_map(|k| {
+                let n = k["n"].as_str()?.to_string();
+                let e = k["e"].as_str()?.to_string();
+                Some((n, e))
+            })
+    })
+}
+
+/// Select a key from the cache, refreshing once when rotation introduced a
+/// `kid` the cached set does not contain. A token with a genuinely unknown key
+/// still fails after that one bounded retry.
+async fn matching_jwk<F, Fut>(
+    keys: Value,
+    kid: &str,
+    refresh: F,
+) -> Result<(String, String), String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Value, String>>,
+{
+    if let Some(key) = jwk_components(&keys, kid) {
+        return Ok(key);
+    }
+    let refreshed = refresh().await?;
+    jwk_components(&refreshed, kid).ok_or_else(|| format!("no matching jwks key for `{kid}`"))
 }
 
 // ------------------------------------------------------------------ routes
@@ -314,17 +360,40 @@ fn now() -> i64 {
     crate::now_ms() / 1000
 }
 
-/// A nonce with no dependency on a random crate: the session secret is already
-/// the thing whose secrecy everything here rests on, so a keyed hash of it plus
-/// a monotonic instant is as unguessable as the secret itself.
-fn nonce(secret: &[u8]) -> String {
-    let t = crate::now_ms();
-    let mut h: u64 = 1469598103934665603;
-    for b in secret.iter().chain(t.to_le_bytes().iter()) {
-        h ^= *b as u64;
-        h = h.wrapping_mul(1099511628211);
+/// A fresh 128-bit OpenID Connect nonce from the operating system.
+///
+/// This value is public in the authorization URL, so deriving it from the
+/// session secret with a non-cryptographic hash does not make it unpredictable:
+/// FNV-1a is reversible once its timestamp suffix is known. Entropy is the
+/// property the nonce needs, not secrecy of its input.
+fn nonce() -> Result<String, getrandom::Error> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes)?;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[usize::from(b >> 4)] as char);
+        out.push(HEX[usize::from(b & 0x0f)] as char);
     }
-    format!("{h:016x}{:x}", t)
+    Ok(out)
+}
+
+/// A post-login destination is always local to this console. The state is
+/// signed against tampering, but the caller chooses the value before it is
+/// signed, so signature verification alone does not prevent an open redirect.
+fn safe_next(candidate: Option<&str>) -> String {
+    let Some(path) = candidate else {
+        return "/".into();
+    };
+    if path.starts_with('/')
+        && !path.starts_with("//")
+        && !path.contains('\\')
+        && !path.chars().any(char::is_control)
+    {
+        path.to_string()
+    } else {
+        "/".into()
+    }
 }
 
 pub async fn login(
@@ -334,10 +403,16 @@ pub async fn login(
     let Some(auth) = app.auth.as_ref() else {
         return (StatusCode::NOT_FOUND, "sign-in is not configured").into_response();
     };
-    let n = nonce(&auth.cfg.secret);
+    let n = match nonce() {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!(error = %e, "could not generate OAuth nonce");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "could not start sign-in").into_response();
+        }
+    };
     let state = match auth.sign(&StateClaims {
         nonce: n.clone(),
-        next: q.get("next").cloned().unwrap_or_else(|| "/".into()),
+        next: safe_next(q.get("next").map(String::as_str)),
         exp: now() + STATE_TTL_S,
     }) {
         Ok(s) => s,
@@ -354,12 +429,24 @@ pub async fn login(
         // returned token is checked and this is not.
         urlencode(auth.cfg.allowed_domains.first().map(String::as_str).unwrap_or("")),
     );
-    Redirect::to(&url).into_response()
+    let secure = auth.cfg.public_url.starts_with("https://");
+    let mut response = Redirect::to(&url).into_response();
+    let cookie = oauth_state_cookie(&state, STATE_TTL_S, secure);
+    let Ok(cookie) = HeaderValue::from_str(&cookie) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not bind the OAuth state",
+        )
+            .into_response();
+    };
+    response.headers_mut().append(header::SET_COOKIE, cookie);
+    response
 }
 
 pub async fn callback(
     State(app): State<crate::api::Shared>,
     Query(q): Query<HashMap<String, String>>,
+    headers: HeaderMap,
 ) -> Response {
     let Some(auth) = app.auth.as_ref() else {
         return (StatusCode::NOT_FOUND, "sign-in is not configured").into_response();
@@ -367,6 +454,18 @@ pub async fn callback(
     let (Some(code), Some(state)) = (q.get("code"), q.get("state")) else {
         return (StatusCode::BAD_REQUEST, "missing code or state").into_response();
     };
+
+    // A signature proves that Gate minted the state; it does not prove that
+    // THIS browser initiated the transaction. Without this binding an attacker
+    // can complete their own Google login and make a victim visit the callback,
+    // replacing the victim's session with the attacker's identity (login CSRF).
+    if cookie_value(&headers, OAUTH_STATE_COOKIE) != Some(state.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "invalid or expired OAuth transaction",
+        )
+            .into_response();
+    }
 
     let mut v = Validation::new(Algorithm::HS256);
     v.set_required_spec_claims(&["exp"]);
@@ -448,40 +547,58 @@ pub async fn callback(
     };
 
     let secure = auth.cfg.public_url.starts_with("https://");
+    // Validate again after state verification so a state minted by an older
+    // version cannot retain an unsafe destination through a rolling deploy.
+    let next = safe_next(Some(&st.next));
     let cookie = format!(
         "{COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}{}",
         8 * 3600,
         if secure { "; Secure" } else { "" }
     );
-    (
+    let mut response = (
         StatusCode::SEE_OTHER,
-        [(header::SET_COOKIE, cookie), (header::LOCATION, st.next)],
+        [(header::SET_COOKIE, cookie), (header::LOCATION, next)],
     )
-        .into_response()
+        .into_response();
+    // One transaction, one use. Matching the original Path is required for the
+    // browser to remove the cookie rather than leaving a replayable binding
+    // behind for the rest of its five-minute lifetime.
+    if let Ok(clear) = HeaderValue::from_str(&oauth_state_cookie("", 0, secure)) {
+        response.headers_mut().append(header::SET_COOKIE, clear);
+    }
+    response
 }
 
-pub async fn logout() -> Response {
+pub async fn logout(axum::Json(()): axum::Json<()>) -> Response {
     (
-        StatusCode::SEE_OTHER,
-        [
-            (
-                header::SET_COOKIE,
-                format!("{COOKIE}=; Path=/; HttpOnly; Max-Age=0"),
-            ),
-            (header::LOCATION, "/".to_string()),
-        ],
+        StatusCode::NO_CONTENT,
+        [(
+            header::SET_COOKIE,
+            format!("{COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"),
+        )],
     )
         .into_response()
 }
 
 pub fn session_of(headers: &axum::http::HeaderMap, auth: &Auth) -> Option<Session> {
-    let raw = headers.get(header::COOKIE)?.to_str().ok()?;
-    let token = raw
-        .split(';')
-        .filter_map(|c| c.trim().split_once('='))
-        .find(|(k, _)| *k == COOKIE)
-        .map(|(_, v)| v)?;
+    let token = cookie_value(headers, COOKIE)?;
     auth.verify_session(token)
+}
+
+fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    let raw = headers.get(header::COOKIE)?.to_str().ok()?;
+    raw.split(';')
+        .filter_map(|c| c.trim().split_once('='))
+        .find(|(k, _)| *k == name)
+        .map(|(_, v)| v)
+}
+
+fn oauth_state_cookie(value: &str, max_age: i64, secure: bool) -> String {
+    format!(
+        "{OAUTH_STATE_COOKIE}={value}; Path={OAUTH_CALLBACK_PATH}; HttpOnly; SameSite=Lax; \
+         Max-Age={max_age}{}",
+        if secure { "; Secure" } else { "" }
+    )
 }
 
 /// A signed-in identity conjured without Google, for running the console on a
@@ -524,14 +641,13 @@ pub async fn require_session(
     next: axum::middleware::Next,
 ) -> Response {
     let path = req.uri().path().to_string();
-    let exempt = path.starts_with("/api/auth/") || path == "/health" || is_shell(&path);
-    if exempt {
+    if session_exempt(&path) {
         return next.run(req).await;
     }
     // The laptop case: no Google client at all, or one that is configured but
     // deliberately stood down for local work.
     if let Some(dev) = dev_identity(app.auth.as_ref().map(|a| &a.cfg)) {
-        if writes(req.method()) && !is_admin(&dev.email) {
+        if requires_admin(req.method(), &path) && !is_admin(&dev.email) {
             return (
                 StatusCode::FORBIDDEN,
                 "read-only: this account is not in GATE_ADMIN_EMAILS",
@@ -552,7 +668,7 @@ pub async fn require_session(
             // Keyed on the METHOD rather than on a list of paths, so a route
             // added tomorrow cannot be born unprotected because someone forgot
             // to enumerate it.
-            if writes(req.method()) && !is_admin(&s.email) {
+            if requires_admin(req.method(), &path) && !is_admin(&s.email) {
                 return (
                     StatusCode::FORBIDDEN,
                     "read-only: this account is not in GATE_ADMIN_EMAILS",
@@ -593,6 +709,16 @@ fn writes(m: &axum::http::Method) -> bool {
     !matches!(*m, axum::http::Method::GET | axum::http::Method::HEAD)
 }
 
+/// Logout mutates only the caller's own browser cookie. It still requires a
+/// valid session, but a read-only operator must be able to end that session.
+fn requires_admin(method: &axum::http::Method, path: &str) -> bool {
+    writes(method) && path != LOGOUT_PATH
+}
+
+fn session_exempt(path: &str) -> bool {
+    path == OAUTH_LOGIN_PATH || path == OAUTH_CALLBACK_PATH || path == "/health" || is_shell(path)
+}
+
 fn is_shell(path: &str) -> bool {
     path == "/" || path.starts_with("/assets/") || path == "/favicon.ico"
 }
@@ -606,4 +732,138 @@ fn urlencode(s: &str) -> String {
             _ => format!("%{b:02X}"),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::http::{header, HeaderMap, HeaderValue, Method};
+    use serde_json::json;
+
+    use super::{
+        cookie_value, matching_jwk, nonce, oauth_state_cookie, requires_admin, safe_next,
+        session_exempt, LOGOUT_PATH, OAUTH_CALLBACK_PATH, OAUTH_LOGIN_PATH, OAUTH_STATE_COOKIE,
+    };
+
+    #[tokio::test]
+    async fn an_unknown_google_key_refreshes_the_cache_once() {
+        let refreshes = AtomicUsize::new(0);
+        let key = matching_jwk(
+            json!({ "keys": [{ "kid": "old", "n": "old-n", "e": "AQAB" }] }),
+            "new",
+            || async {
+                refreshes.fetch_add(1, Ordering::Relaxed);
+                Ok(json!({ "keys": [{ "kid": "new", "n": "new-n", "e": "AQAB" }] }))
+            },
+        )
+        .await
+        .expect("the rotated key is present after refresh");
+
+        assert_eq!(key, ("new-n".into(), "AQAB".into()));
+        assert_eq!(refreshes.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn a_cached_google_key_does_not_refresh() {
+        let refreshes = AtomicUsize::new(0);
+        let key = matching_jwk(
+            json!({ "keys": [{ "kid": "current", "n": "current-n", "e": "AQAB" }] }),
+            "current",
+            || async {
+                refreshes.fetch_add(1, Ordering::Relaxed);
+                Err("refresh should not run".into())
+            },
+        )
+        .await
+        .expect("the cached key is enough");
+
+        assert_eq!(key, ("current-n".into(), "AQAB".into()));
+        assert_eq!(refreshes.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn a_key_unknown_after_refresh_is_rejected_without_looping() {
+        let refreshes = AtomicUsize::new(0);
+        let result = matching_jwk(json!({ "keys": [] }), "missing", || async {
+            refreshes.fetch_add(1, Ordering::Relaxed);
+            Ok(json!({ "keys": [] }))
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(refreshes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn oauth_nonces_are_fresh_128_bit_hex_values() {
+        let first = nonce().expect("the operating system provides randomness");
+        let second = nonce().expect("the operating system provides randomness");
+        assert_eq!(first.len(), 32);
+        assert!(first.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn logout_requires_a_session_but_not_an_admin() {
+        assert!(session_exempt(OAUTH_LOGIN_PATH));
+        assert!(session_exempt(OAUTH_CALLBACK_PATH));
+        assert!(!session_exempt(LOGOUT_PATH));
+        assert!(!session_exempt("/api/auth/future-route"));
+
+        assert!(!requires_admin(&Method::POST, LOGOUT_PATH));
+        assert!(requires_admin(&Method::POST, "/v1/apps/a/graphs/g"));
+        assert!(!requires_admin(&Method::GET, "/api/graphs"));
+    }
+
+    #[test]
+    fn oauth_next_accepts_only_local_absolute_paths() {
+        for path in ["/", "/graphs", "/#/apps/a/graphs/g?path=main"] {
+            assert_eq!(safe_next(Some(path)), path);
+        }
+        for path in [
+            "https://evil.example",
+            "//evil.example/path",
+            "/\\evil.example/path",
+            "graphs",
+            "",
+            "/graphs\r\nLocation: https://evil.example",
+        ] {
+            assert_eq!(safe_next(Some(path)), "/", "accepted {path:?}");
+        }
+        assert_eq!(safe_next(None), "/");
+    }
+
+    #[test]
+    fn oauth_state_is_bound_to_the_browser_that_started_it() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(cookie_value(&headers, OAUTH_STATE_COOKIE), None);
+
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("other=x; gate_oauth_state=signed-state"),
+        );
+        assert_eq!(
+            cookie_value(&headers, OAUTH_STATE_COOKIE),
+            Some("signed-state")
+        );
+        assert_ne!(
+            cookie_value(&headers, OAUTH_STATE_COOKIE),
+            Some("attacker-state")
+        );
+    }
+
+    #[test]
+    fn oauth_state_cookie_is_short_lived_scoped_and_secure_in_production() {
+        let cookie = oauth_state_cookie("signed-state", 300, true);
+        assert!(cookie.starts_with("gate_oauth_state=signed-state;"));
+        assert!(cookie.contains("Path=/api/auth/google/callback"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Lax"));
+        assert!(cookie.contains("Max-Age=300"));
+        assert!(cookie.ends_with("; Secure"));
+
+        let cleared = oauth_state_cookie("", 0, true);
+        assert!(cleared.contains("Max-Age=0"));
+    }
 }

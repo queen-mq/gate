@@ -145,6 +145,24 @@ fn the_worker_count_comes_from_the_budget_and_not_from_the_partitions() {
         16,
         "the per-key budget is not a rate"
     );
+
+    // Nor is a selector a node-wide rate. A rare operation capped at one per
+    // hour must not reduce unrelated traffic from four lanes to one.
+    let conditional = doc(json!({
+      "application": "a", "graph": "g", "version": 1,
+      "nodes": { "n": { "ingress": { "queue": "theirs.in" }, "egress": "theirs.out",
+                        "budgets": [
+                          { "id": "node", "count": 4000, "timeMs": 1000 },
+                          { "id": "rare", "count": 1, "timeMs": 3600000,
+                            "subWindows": 1, "whenOp": ["photo.delete"] }
+                        ] } },
+      "paths": [{ "name": "main", "nodes": ["n"] }]
+    }));
+    assert_eq!(
+        with_partitions(&conditional, 16),
+        4,
+        "a conditional budget is not the node's rate"
+    );
 }
 
 /// A path's SHARE is part of its ceiling, so it is part of its worker count: a
@@ -293,6 +311,23 @@ fn a_claim_is_sized_by_the_nodes_own_rate_and_never_by_a_per_key_one() {
         "a batch of two hundred messages across two hundred different keys spends one unit of \
          each: sizing on a per-key allowance is how a node stops draining"
     );
+
+    let conditional = doc(json!({
+      "application": "a", "graph": "g", "version": 1,
+      "nodes": { "n": { "ingress": true,
+                        "budgets": [
+                          { "id": "node", "count": 500, "timeMs": 1000 },
+                          { "id": "rare", "count": 1, "timeMs": 3600000,
+                            "subWindows": 1, "whenOp": ["photo.delete"] }
+                        ],
+                        "egress": "out" } },
+      "paths": [{ "name": "main", "nodes": ["n"] }]
+    }));
+    assert_eq!(
+        gate_core::compile(&conditional).stages[0].batch,
+        gate_core::DEFAULT_BATCH,
+        "a selector for one operation must not shrink every claim"
+    );
 }
 
 /// `null` rather than infinity when nothing is moving: "we cannot say" is an
@@ -333,6 +368,17 @@ fn the_knobs_default_to_what_the_design_says() {
     assert_eq!(
         k.retry_limit, 3,
         "the DLQ is back: v1 had to disarm it because it paced by nacking"
+    );
+    assert!(
+        k.max_push_body <= gate_server::knobs::MAX_PUSH_BODY_CEILING,
+        "the knob is floored at axum's default and capped: a per-request buffer is a memory \
+         reservation, and nothing limits how many requests hold one at once"
+    );
+    assert_eq!(
+        k.max_push_body,
+        8 * 1024 * 1024,
+        "four times axum's 2 MiB default, which was the real ceiling on every push \
+         until 2026-09-04 because nothing here ever set one"
     );
 }
 
@@ -376,5 +422,105 @@ fn the_trace_ring_drops_the_oldest_and_never_grows() {
         (gate_server::obs::TRACE_RING + 49) as i64,
         "newest first"
     );
+    assert_eq!(recent[0].view()["budget_id"], "b");
+    assert_eq!(recent[0].view()["budgetId"], "b", "compatibility alias");
     assert!(t.recent(Some("admitted"), 10).is_empty(), "denials only");
+}
+
+// ----------------------------------------------------------- the body limit
+
+/// A push carries a BATCH and everything else carries a document, so only the
+/// push routes get the raised body limit.
+///
+/// The limit is asserted through the ROUTER rather than by reading the knob back,
+/// because the knob was never the thing that was wrong: axum applies a 2 MiB
+/// default to every route unless a layer says otherwise, and for the life of this
+/// service nothing did. A test that reads `knobs().max_push_body` would have
+/// passed just as happily on the day a caller was being refused.
+///
+/// No broker is needed and none is reached: a body over the limit is rejected by
+/// the extractor, so the handler never runs.
+mod body_limit {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    fn app() -> gate_server::api::Shared {
+        // Deliberately unreachable: nothing in these cases gets far enough to
+        // speak to it, and a test that needed a broker would belong in live.rs.
+        let queen = queen_mq::Queen::connect(queen_mq::Config::new("http://127.0.0.1:1"))
+            .expect("the client is constructed, not connected");
+        Arc::new(gate_server::api::App::new(
+            queen,
+            "http://127.0.0.1:1".into(),
+        ))
+    }
+
+    fn body_of(bytes: usize) -> Body {
+        Body::from(vec![b'x'; bytes])
+    }
+
+    const MIB: usize = 1024 * 1024;
+
+    #[tokio::test]
+    async fn a_push_accepts_a_body_axums_default_would_have_refused() {
+        let res = gate_server::api::router(app())
+            .oneshot(
+                Request::post("/v1/apps/channel-go/graphs/google/nodes/hotel/push")
+                    .header("content-type", "application/json")
+                    .body(body_of(3 * MIB))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            res.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "a 3 MiB push was refused for its size: this is the 2 MiB default that \
+             cost a caller a week of undelivered pushes, and raising it is the point"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_push_over_the_ceiling_is_still_refused() {
+        let over = gate_server::knobs::knobs().max_push_body + MIB;
+        let res = gate_server::api::router(app())
+            .oneshot(
+                Request::post("/v1/apps/channel-go/graphs/google/nodes/hotel/push")
+                    .header("content-type", "application/json")
+                    .body(body_of(over))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "the ceiling is a ceiling: a body past it must be refused, or the limit \
+             is memory nobody is bounding"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_document_route_keeps_the_default() {
+        // Declaring a graph is a document, not a batch. Raising its ceiling would
+        // buy nothing and would let a caller hand a 512 MiB pod a body per
+        // request that no declaration has ever needed.
+        let res = gate_server::api::router(app())
+            .oneshot(
+                Request::put("/v1/apps/channel-go/graphs/google")
+                    .header("content-type", "application/json")
+                    .body(body_of(3 * MIB))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "a document route accepted 3 MiB: the raise must be scoped to the push \
+             routes, not applied to the whole surface"
+        );
+    }
 }

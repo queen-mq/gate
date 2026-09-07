@@ -89,46 +89,111 @@ pub async fn declare_locked(
     let key = doc.key();
     let (plan, facts) = compile(app, &doc).await;
 
-    let problems = gate_core::validate_with(&doc, &facts);
-    if !problems.is_empty() {
-        return Err(Refusal::Invalid(join(&problems)));
+    // Validate the resolved plan, not a second compilation with library
+    // defaults. In particular this includes the fleet-wide worker override:
+    // an unsafe `GATE_STAGE_CONCURRENCY` must be refused before the SDK
+    // preallocates and spawns that many consumer tasks.
+    //
+    // A caller's declare is held to every rule. A document coming back from the
+    // store is not: it was accepted by some version of Gate and is, in the
+    // ordinary case, already serving traffic, so a rule added since then must
+    // not be the thing that takes it down. See `refuses_stored_document`.
+    let problems = gate_core::validate_plan_with(&doc, &plan, &facts);
+    let (fatal, kept): (Vec<_>, Vec<_>) = if from_caller {
+        (problems, Vec::new())
+    } else {
+        problems
+            .into_iter()
+            .partition(|p| gate_core::refuses_stored_document(p.rule))
+    };
+    if !kept.is_empty() {
+        tracing::warn!(
+            graph = %key,
+            rules = %kept.iter().map(|p| p.rule).collect::<Vec<_>>().join(", "),
+            "a stored document breaks a rule this build enforces; it keeps running rather than \
+             being taken down, and the next declare of it must fix this: {}",
+            join(&kept)
+        );
+    }
+    if !fatal.is_empty() {
+        return Err(Refusal::Invalid(join(&fatal)));
     }
 
     let old = app.registry.get(&doc.application, &doc.graph);
     if from_caller {
         if let Some(old) = &old {
-            if gate_core::needs_version_bump(&old.doc, &doc) && doc.version <= old.doc.version {
-                return Err(Refusal::Conflict(format!(
-                    "this change re-founds a counter or strands a queue (a new key starts at zero \
-                     while the old one counts down its TTL, and work already in an interior queue \
-                     has no consumer in the new plan): bump version above {}. Drain first — stop \
-                     pushing, wait for `waitingForBudget` to reach zero on every node, then \
-                     declare.",
-                    old.doc.version
-                )));
+            require_version_bump(&old.doc, &doc)?;
+        }
+
+        // Ask the STORE the same question, because a declare lands on ONE
+        // replica: a graph declared a second ago on another pod is not in this
+        // registry yet. This is an exact key read rather than the fleet-wide
+        // prefix scan below, so pagination cannot make an existing graph look
+        // new. A failed read refuses the mutation: without the predecessor Gate
+        // cannot prove that replacing it at this version is safe.
+        match crate::store::load_one(&app.queen, &doc.application, &doc.graph).await {
+            Ok(Some(stored)) => require_version_bump(&stored, &doc)?,
+            Ok(None) => {}
+            Err(e) => {
+                return Err(Refusal::Gateway(format!(
+                    "`{key}` was not declared: its stored predecessor could not be read ({e}), so \
+                     Gate cannot safely decide whether this change needs a version bump"
+                )))
             }
         }
-        // The same question of the STORE, because a declare lands on ONE
-        // replica: a graph declared a second ago on another pod is not in this
-        // registry yet. A store that will not answer is not a reason to refuse —
-        // the local check still stands.
-        if let Ok(stored) = crate::store::try_load_all(&app.queen).await {
-            for other in stored.items.iter().filter(|d| d.key() != key) {
-                let mine = gate_core::compile(other);
-                for (node, np) in &mine.nodes {
-                    let Some(q) = &np.ingress_queue else { continue };
-                    if plan
-                        .nodes
-                        .values()
-                        .any(|n| n.ingress_queue.as_deref() == Some(q.as_str()))
-                    {
-                        return Err(Refusal::Conflict(format!(
-                            "`{q}` is already the ingress of node `{node}` in graph `{}` (declared \
-                             on another replica). Two consumers of one queue in different groups \
-                             each get every message, which doubles what leaves.",
-                            other.key()
-                        )));
-                    }
+        // Ask the STORE the same ownership question, because a declare lands on
+        // ONE replica: a graph declared on another pod need not be in this
+        // registry yet. This check must fail closed. An error, a clamped page,
+        // or an unreadable newer document all mean "ownership is unknown", not
+        // "the source is free".
+        let stored = crate::store::try_load_all(&app.queen).await.map_err(|e| {
+            Refusal::Gateway(format!(
+                "`{key}` was not declared: Gate could not read the stored graph inventory ({e}), \
+                 so it cannot safely prove exclusive ownership of the source queues"
+            ))
+        })?;
+        // An incomplete inventory only hides an answer for a source Gate does
+        // NOT name: an owned ingress and an interior queue are derived from
+        // `{app}.{graph}.{node}`, so no other graph key can mint the same name
+        // and no unreadable document can be claiming one. A user-declared
+        // ingress is free-form and another graph really may name it.
+        //
+        // Scoping the refusal there matters because `complete` is a fact about
+        // the whole namespace: `deny_unknown_fields` is deliberate, so ONE
+        // document written by a newer build makes every declare in every
+        // application unreadable-and-therefore-refused, which is a rolling
+        // deploy taking the control plane down for tenants that share nothing
+        // but a broker.
+        let user_sources: Vec<&str> = plan
+            .stages
+            .iter()
+            .map(|s| s.source.as_str())
+            .filter(|source| {
+                plan.queue(source)
+                    .is_some_and(|q| q.kind == gate_core::QueueKind::UserIngress)
+            })
+            .collect();
+        if !stored.complete && !user_sources.is_empty() {
+            return Err(Refusal::Gateway(format!(
+                "`{key}` was not declared: the stored graph inventory is incomplete (a page was \
+                 clamped or a document could not be read), so Gate cannot prove that {} is not \
+                 already consumed by another graph. A queue Gate names itself would not need \
+                 this check.",
+                user_sources.join(", ")
+            )));
+        }
+        for other in stored.items.iter().filter(|d| d.key() != key) {
+            let mine = gate_core::compile(other);
+            for owner in &mine.stages {
+                let q = &owner.source;
+                if plan.stages.iter().any(|candidate| candidate.source == *q) {
+                    return Err(Refusal::Conflict(format!(
+                        "`{q}` is already the source of node `{}` in graph `{}` (declared on \
+                         another replica). Two consumers of one queue in different groups each \
+                         get every message, which doubles what leaves.",
+                        owner.node,
+                        other.key()
+                    )));
                 }
             }
         }
@@ -256,6 +321,19 @@ fn join(problems: &[Problem]) -> String {
         .join("; ")
 }
 
+fn require_version_bump(old: &GraphDoc, new: &GraphDoc) -> Result<(), Refusal> {
+    if gate_core::needs_version_bump(old, new) && new.version <= old.version {
+        return Err(Refusal::Conflict(format!(
+            "this change re-founds a counter or strands a queue (a new key starts at zero while \
+             the old one counts down its TTL, and work already in an interior queue has no \
+             consumer in the new plan): bump version above {}. Drain first — stop pushing, wait \
+             for `waitingForBudget` to reach zero on every node, then declare.",
+            old.version
+        )));
+    }
+    Ok(())
+}
+
 /// What the declare answers: the whole compiled plan, so a caller never has to
 /// reconstruct it and never has to guess a queue name.
 pub fn resolved(rt: &Arc<GraphRuntime>, warnings: &[Problem]) -> Value {
@@ -333,6 +411,7 @@ fn stage_view(s: &gate_core::plan::Stage) -> Value {
             "node": d.node,
             "queue": d.queue,
             "derivesTransactionId": d.derive_id,
+            "requiresPathStamp": d.requires_stamp,
             "terminal": d.terminal,
         })).collect::<Vec<_>>(),
     })

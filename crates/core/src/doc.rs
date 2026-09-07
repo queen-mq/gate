@@ -100,11 +100,16 @@ pub struct Counters {
     pub window_seconds: u32,
 }
 
+/// Roll-ups are stored in minute-keyed rows and every history endpoint reads
+/// those rows as minutes. Keep the one supported value named in one place so a
+/// declaration cannot promise a window the runtime does not actually emit.
+pub const COUNTERS_WINDOW_SECONDS: u32 = 60;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Node {
-    /// At least one, and at least one of them unscoped — see `node-budget` and
-    /// `node-unscoped-budget`.
+    /// At least one, and at least one of them unconditional and unscoped — see
+    /// `node-budget` and `node-unscoped-budget`.
     #[serde(default)]
     pub budgets: Vec<Budget>,
 
@@ -129,9 +134,9 @@ pub struct Node {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch: Option<u32>,
 
-    /// How many workers drain this node's stages. Defaults to
-    /// `max(4, source partitions)`. More workers than partitions is harmless
-    /// (the extras find nothing and park); fewer is a throughput ceiling.
+    /// How many workers drain this node's stages. By default this is derived
+    /// from the tightest unconditional, unscoped rate and capped at the source
+    /// partition count; an explicit value overrides that derivation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<u32>,
 }

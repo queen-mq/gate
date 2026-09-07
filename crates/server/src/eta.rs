@@ -67,7 +67,7 @@ pub fn admits(
     now_ms: i64,
 ) -> Schedule {
     let window_seconds = window_seconds.max(1);
-    let resets_at = now_ms + resets_in_ms.max(0);
+    let resets_at = now_ms.saturating_add(resets_in_ms.max(0));
 
     // A cap that cannot admit anything never will — no schedule refills it — so
     // "we cannot say" is the only answer that is not a lie.
@@ -89,8 +89,11 @@ pub fn admits(
     // capful after the first. This is what makes "nothing until it rotates, then
     // 150 per second" expressible at all.
     let windows_after_this = ((need / cap as f64).ceil() as i64 - 1).max(0);
+    // Multiply after widening to f64. Both operands are valid i64 values, but
+    // a very deep backlog can span enough windows for their integer product to
+    // overflow before it ever reaches this display-only estimate.
     let seconds =
-        resets_in_ms.max(0) as f64 / 1000.0 + (windows_after_this * window_seconds) as f64;
+        resets_in_ms.max(0) as f64 / 1000.0 + windows_after_this as f64 * window_seconds as f64;
     Schedule {
         seconds: Some(seconds),
         resets_at,
@@ -98,9 +101,18 @@ pub fn admits(
 }
 
 /// The answer, for one path through one node.
-pub async fn view(app: &Shared, rt: &Arc<GraphRuntime>, node: &str, path: &str) -> Option<Value> {
-    let stage = rt.plan.stage(path, node)?;
-    let np = rt.plan.node(node)?;
+pub async fn view(
+    app: &Shared,
+    rt: &Arc<GraphRuntime>,
+    node: &str,
+    path: &str,
+) -> queen_mq::Result<Option<Value>> {
+    let Some(stage) = rt.plan.stage(path, node) else {
+        return Ok(None);
+    };
+    let Some(np) = rt.plan.node(node) else {
+        return Ok(None);
+    };
     let now = crate::now_ms();
 
     // ---- position.
@@ -111,7 +123,7 @@ pub async fn view(app: &Shared, rt: &Arc<GraphRuntime>, node: &str, path: &str) 
     let waiting_for_budget: u64 = app
         .depths
         .pending_of_group(&app.queen, &stage.source, &stage.group)
-        .await
+        .await?
         .values()
         .sum();
 
@@ -125,7 +137,7 @@ pub async fn view(app: &Shared, rt: &Arc<GraphRuntime>, node: &str, path: &str) 
                 worker_group_known = true;
                 app.depths
                     .pending_of_group(&app.queen, q, g)
-                    .await
+                    .await?
                     .values()
                     .sum()
             }
@@ -133,7 +145,7 @@ pub async fn view(app: &Shared, rt: &Arc<GraphRuntime>, node: &str, path: &str) 
             // it is at or above the group being asked about: it can only make
             // the answer later, never earlier, which is the safe direction for a
             // bound.
-            None => app.depths.pending(&app.queen, q).await.values().sum(),
+            None => app.depths.pending(&app.queen, q).await?.values().sum(),
         };
     }
 
@@ -143,34 +155,15 @@ pub async fn view(app: &Shared, rt: &Arc<GraphRuntime>, node: &str, path: &str) 
     // A breaker holding the node is the one caveat that explains the whole
     // answer rather than qualifying it: the window is spent on purpose and the
     // long `etaSeconds` below is a vendor's `Retry-After`, not a backlog.
-    let held = crate::breaker::held(&app.budgets, np).await;
+    let held = crate::breaker::held(&app.budgets, np).await?;
     let cost_per_item = measured.unwrap_or(np.cost.default_value() as f64);
     let want = waiting_for_budget as f64 * cost_per_item;
 
     // ---- rate.
-    let keys: Vec<String> = np.unscoped().map(|b| b.key.clone()).collect();
-    let states = app.budgets.read(&keys).await.unwrap_or_default();
+    let keys: Vec<String> = np.node_wide_rates().map(|b| b.key.clone()).collect();
+    let states = app.budgets.read(&keys).await?;
 
-    let mut bound: Option<(&CompiledBudget, Schedule)> = None;
-    for b in np.unscoped() {
-        let s = states.iter().find(|s| s.key == b.key);
-        let sched = admits(
-            b.max_for(stage.share),
-            b.window_sub_seconds,
-            s.map(|s| s.value).unwrap_or(0),
-            s.and_then(|s| s.expires_at_ms)
-                .map(|e| e - now)
-                .unwrap_or(0),
-            want,
-            now,
-        );
-        // The slowest binds, and "never" beats every number.
-        let key = |x: &Schedule| x.seconds.unwrap_or(f64::INFINITY);
-        bound = match bound {
-            Some(a) if key(&a.1) >= key(&sched) => Some(a),
-            _ => Some((b, sched)),
-        };
-    }
+    let bound = binding_schedule(np, stage.share, &states, want, now);
 
     let (bound_by, eta_seconds, resets_at) = match bound {
         Some((b, s)) => (
@@ -187,7 +180,7 @@ pub async fn view(app: &Shared, rt: &Arc<GraphRuntime>, node: &str, path: &str) 
         "waiting-workers"
     };
 
-    Some(json!({
+    Ok(Some(json!({
         "at": now,
         "application": rt.doc.application,
         "graph": rt.doc.graph,
@@ -203,7 +196,40 @@ pub async fn view(app: &Shared, rt: &Arc<GraphRuntime>, node: &str, path: &str) 
         "waitingForBudget": waiting_for_budget,
         "waitingForWorkers": waiting_for_workers,
         "assumes": assumes(rt, np, stage, measured, cost_per_item, worker_group_known, held.as_ref()),
-    }))
+    })))
+}
+
+/// The slowest schedule every queued item is guaranteed to meet. A conditional
+/// budget may delay selected operations, but applying it to the whole queue
+/// would turn an unknown mix into a confidently late (and false) bound.
+fn binding_schedule<'a>(
+    np: &'a NodePlan,
+    share: f64,
+    states: &[crate::budget::State],
+    want: f64,
+    now: i64,
+) -> Option<(&'a CompiledBudget, Schedule)> {
+    let mut bound: Option<(&CompiledBudget, Schedule)> = None;
+    for b in np.node_wide_rates() {
+        let s = states.iter().find(|s| s.key == b.key);
+        let sched = admits(
+            b.max_for(share),
+            b.window_sub_seconds,
+            s.map(|s| s.value).unwrap_or(0),
+            s.and_then(|s| s.expires_at_ms)
+                .map(|e| e.saturating_sub(now))
+                .unwrap_or(0),
+            want,
+            now,
+        );
+        // The slowest binds, and "never" beats every number.
+        let key = |x: &Schedule| x.seconds.unwrap_or(f64::INFINITY);
+        bound = match bound {
+            Some(a) if key(&a.1) >= key(&sched) => Some(a),
+            _ => Some((b, sched)),
+        };
+    }
+    bound
 }
 
 /// What an item was measured costing, over the counters stream when it is on.
@@ -279,6 +305,20 @@ fn assumes(
         ));
     }
 
+    let conditional: Vec<&str> = np
+        .budgets
+        .iter()
+        .filter(|b| b.when_op.is_some())
+        .map(|b| b.id.as_str())
+        .collect();
+    if !conditional.is_empty() {
+        parts.push(format!(
+            "budget {} applies only to selected operations and this queue-level number cannot \
+             resolve which operations are ahead",
+            conditional.join(", ")
+        ));
+    }
+
     // §9 closes the caveat list with this one, and it is the one that changes
     // how the number should be read: a node whose window a breaker has just
     // spent answers a long `etaSeconds` because a vendor said 429, not because
@@ -286,7 +326,7 @@ fn assumes(
     if let Some(r) = held {
         parts.push(format!(
             "a breaker is holding this node until {} ({}s from {}{}), so the window is spent on              purpose and this number is that deadline rather than a backlog",
-            r.at + r.retry_after_seconds * 1000,
+            r.until_ms(),
             r.retry_after_seconds,
             r.at,
             match &r.by {
@@ -386,5 +426,39 @@ mod tests {
     fn a_spent_window_still_answers_from_the_declared_schedule() {
         let s = admits(150, 10, 150, 9_500, 150.0, 0);
         assert_eq!(s.seconds, Some(9.5));
+    }
+
+    /// Queue depth has no operation breakdown. Applying a selective limit to
+    /// every item would produce a confidently late bound for unrelated work.
+    #[test]
+    fn a_conditional_budget_does_not_bind_the_whole_queues_eta() {
+        let doc: gate_core::GraphDoc = serde_json::from_value(serde_json::json!({
+          "application": "a", "graph": "g", "version": 1,
+          "nodes": { "n": { "ingress": true, "egress": "out",
+                            "budgets": [
+                              { "id": "base", "count": 100, "timeMs": 1000 },
+                              { "id": "rare", "count": 1, "timeMs": 3600000,
+                                "subWindows": 1, "whenOp": ["photo.delete"] }
+                            ] } },
+          "paths": [{ "name": "main", "nodes": ["n"] }]
+        }))
+        .expect("document");
+        let plan = gate_core::compile(&doc);
+        let np = plan.node("n").expect("node");
+
+        let (budget, schedule) =
+            binding_schedule(np, 1.0, &[], 50.0, 1_000_000).expect("base budget");
+        assert_eq!(budget.id, "base");
+        assert_eq!(schedule.seconds, Some(0.0));
+    }
+
+    #[test]
+    fn an_extreme_schedule_remains_an_estimate_instead_of_overflowing() {
+        let s = admits(1, i64::MAX, 1, 10, 3.0, i64::MAX - 5);
+        assert_eq!(s.resets_at, i64::MAX);
+        assert!(
+            s.seconds.is_some_and(|seconds| seconds > i64::MAX as f64),
+            "the two post-edge windows should be represented without integer overflow: {s:?}"
+        );
     }
 }

@@ -236,6 +236,37 @@ fn a_convergence_derives_even_without_a_fanout() {
     );
 }
 
+/// Ownership on a shared interior queue is encoded in `_gate.path`. The
+/// immediate writers must therefore know that an unstampable payload cannot be
+/// forwarded there; unrelated fan-out branches and linear hops do not inherit
+/// that restriction.
+#[test]
+fn only_destinations_with_multiple_readers_require_a_path_stamp() {
+    let p = compile(&airbnb());
+    let photos = p.stage("photos", "photos").unwrap();
+    let ip = photos.destinations.iter().find(|d| d.node == "ip").unwrap();
+    let audit = photos
+        .destinations
+        .iter()
+        .find(|d| d.node == "audit")
+        .unwrap();
+    assert!(ip.requires_stamp, "three path groups read ip.in");
+    assert!(!audit.requires_stamp, "only one path group reads audit.in");
+
+    let chain: gate_core::GraphDoc = serde_json::from_str(
+        r#"{"application":"a","graph":"g","version":1,
+            "nodes":{"one":{"ingress":true,"budgets":[{"id":"b","count":100,"timeMs":1000}]},
+                     "two":{"budgets":[{"id":"b","count":100,"timeMs":1000}],"egress":"a.g.out"}},
+            "paths":[{"name":"main","nodes":["one","two"]}]}"#,
+    )
+    .unwrap();
+    let chain = compile(&chain);
+    assert!(
+        !chain.stage("main", "one").unwrap().destinations[0].requires_stamp,
+        "one reader needs no ownership stamp"
+    );
+}
+
 // ---------------------------------------------------------------- ceilings
 
 /// Priority is a per-path `max` on ONE counter. The top half of `ip` is an
@@ -489,6 +520,76 @@ fn a_scoped_budget_keys_on_the_value() {
     assert_eq!(b.key_for(None), "b:channel:airbnb:photos:per-listing");
 }
 
+#[test]
+fn a_scope_is_required_only_when_its_budget_applies() {
+    let p = compile(&airbnb());
+    let budgets = &p.node("photos").unwrap().budgets;
+
+    assert_eq!(
+        gate_core::missing_scope(
+            budgets,
+            &serde_json::json!({ "op": "photo.delete", "rooms": 1 })
+        ),
+        Some(("per-listing", "payload.listingId"))
+    );
+    assert_eq!(
+        gate_core::missing_scope(
+            budgets,
+            &serde_json::json!({ "op": "photo.upload", "rooms": 1 })
+        ),
+        None,
+        "a non-matching whenOp must not require this budget's scope"
+    );
+    assert_eq!(
+        gate_core::missing_scope(
+            budgets,
+            &serde_json::json!({
+                "op": "photo.delete", "rooms": 1, "listingId": "l-42"
+            })
+        ),
+        None
+    );
+}
+
+#[test]
+fn budget_key_components_cannot_smuggle_separators() {
+    let mut doc = airbnb();
+    doc.nodes.get_mut("photos").unwrap().budgets[1].id = Some("per:listing%v2".into());
+    let p = compile(&doc);
+    let b = p
+        .node("photos")
+        .unwrap()
+        .budgets
+        .iter()
+        .find(|b| b.id == "per:listing%v2")
+        .unwrap();
+
+    assert_eq!(
+        b.key_for(Some("listing:42%blue")),
+        "b:channel:airbnb:photos:per%3Alisting%25v2:listing%3A42%25blue"
+    );
+    assert_ne!(
+        plan::budget_key("channel", "airbnb", "photos", "per:listing"),
+        format!(
+            "{}:listing",
+            plan::budget_key("channel", "airbnb", "photos", "per")
+        )
+    );
+}
+
+#[test]
+fn local_and_shared_budget_namespaces_cannot_collide() {
+    let local = plan::budget_key("channel", "shared", "vendor", "minute");
+    let shared_scoped = format!("{}:minute", plan::shared_budget_key("channel", "vendor"));
+    assert_eq!(local, "b:channel:%73hared:vendor:minute");
+    assert_ne!(local, shared_scoped);
+
+    assert_ne!(
+        plan::shared_budget_key("channel", "vendor:minute"),
+        shared_scoped
+    );
+}
+
 // ---------------------------------------------------------------------- cost
 
 #[test]
@@ -521,16 +622,55 @@ fn cost_is_a_payload_path() {
 }
 
 #[test]
+fn a_cost_outside_the_brokers_integer_range_is_refused_instead_of_saturated() {
+    let cost = gate_core::Cost::Path(gate_core::CostPath {
+        path: "payload.rooms".into(),
+        default: 1,
+        max: Some(i64::MAX),
+    });
+
+    assert_eq!(
+        gate_core::cost_of(&cost, &serde_json::json!({ "rooms": i64::MAX })).unwrap(),
+        i64::MAX,
+        "the actual wire boundary remains valid"
+    );
+
+    for value in [serde_json::json!(u64::MAX), serde_json::json!(1.0e100)] {
+        let error = gate_core::cost_of(&cost, &serde_json::json!({ "rooms": value }))
+            .expect_err("an unrepresentable cost must not be charged as i64::MAX");
+        assert!(
+            error
+                .to_string()
+                .contains("outside the signed 64-bit range"),
+            "{error}"
+        );
+    }
+
+    assert_eq!(
+        gate_core::cost_of(&cost, &serde_json::json!({ "rooms": -1.0e100 })).unwrap(),
+        1,
+        "negative costs retain the documented fallback-to-default behaviour"
+    );
+}
+
+#[test]
 fn a_payload_path_must_start_at_the_payload_root() {
     assert!(gate_core::ok_payload_path("payload.a"));
     assert!(gate_core::ok_payload_path("payload.a.b"));
     assert!(!gate_core::ok_payload_path("payload"));
     assert!(!gate_core::ok_payload_path("data.a"));
     assert!(!gate_core::ok_payload_path("payload."));
-    // `_gate` is Gate's own stamp and must stay unaddressable from a document.
-    assert!(
-        gate_core::resolve(&serde_json::json!({"_gate": {"path": "x"}}), "_gate.path").is_none()
-    );
+    // `_gate` is Gate's own root stamp and must stay unaddressable from a
+    // document even through the otherwise-required `payload` prefix.
+    assert!(!gate_core::ok_payload_path("payload._gate.path"));
+    assert!(gate_core::resolve(
+        &serde_json::json!({"_gate": {"path": "x"}}),
+        "payload._gate.path"
+    )
+    .is_none());
+    // A producer may still use the same spelling below another object. Only
+    // the root key is reserved for Gate.
+    assert!(gate_core::ok_payload_path("payload.vendor._gate"));
 }
 
 #[test]
@@ -798,3 +938,40 @@ const VRBO: &str = r#"
 
 const PATHS_WITH_REVIEWS: &str = r#""paths": [
     { "name": "reviews", "nodes": ["reviews", "partner"] },"#;
+
+/// The migration's passthrough is a sentinel, not a measurement, and every
+/// node-wide aggregate has to agree about that. `fitting_workers` always did;
+/// the batch, the ETA and the flow ceiling reached it through `node_wide` and
+/// would have read a million a second as this node's real rate.
+#[test]
+fn the_passthrough_sentinel_is_not_a_node_wide_rate() {
+    let mut doc: gate_core::GraphDoc = serde_json::from_str(
+        r#"{"application":"a","graph":"g","version":1,
+            "nodes":{"n":{"ingress":true,"egress":"a.g.out","budgets":[
+                {"id":"real","count":100,"timeMs":1000,"whenOp":["listing.update"]}]}},
+            "paths":[{"name":"main","nodes":["n"]}]}"#,
+    )
+    .unwrap();
+    // What the v1 migration adds to a node carrying only conditional budgets.
+    doc.nodes.get_mut("n").unwrap().budgets.push(
+        serde_json::from_str(r#"{"id":"passthrough","count":1000000,"timeMs":1000}"#).unwrap(),
+    );
+
+    let p = compile(&doc);
+    let np = p.node("n").unwrap();
+    assert_eq!(
+        np.node_wide().count(),
+        1,
+        "`node-unscoped-budget` is satisfied: the sentinel IS met by every item"
+    );
+    assert_eq!(
+        np.node_wide_rates().count(),
+        0,
+        "but it is not a rate, so no aggregate may divide by it"
+    );
+    assert!(
+        gate_core::validate(&doc).is_empty(),
+        "a migrated node must still declare clean: {:?}",
+        gate_core::validate(&doc)
+    );
+}

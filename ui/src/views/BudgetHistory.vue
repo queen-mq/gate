@@ -41,26 +41,47 @@ const RANGES = [
 const range = ref(RANGES[1])
 
 async function load() {
+  const app = application.value
+  const name = props.name
+  const node = props.node
+  const budget = props.budget
+  const key = rollupKey.value
+  const minutes = range.value.minutes
   try {
     const [d, r] = await Promise.all([
-      api.get(graphApi(application.value, props.name)),
-      fetchRollups(application.value, rollupKey.value, range.value.minutes),
+      api.get(graphApi(app, name)),
+      fetchRollups(app, key, minutes),
     ])
+    if (
+      app !== application.value || name !== props.name || node !== props.node ||
+      budget !== props.budget || key !== rollupKey.value || minutes !== range.value.minutes
+    ) return
     target.value = d
     rows.value = r === null ? null : perMinute(r)
     error.value = ''
   } catch (e) {
+    if (
+      app !== application.value || name !== props.name || node !== props.node ||
+      budget !== props.budget || key !== rollupKey.value || minutes !== range.value.minutes
+    ) return
     error.value = e.message
   }
 }
 // Slower than the gauges: the series is one point per minute, and it does not
 // change between two four-second polls.
-usePoll(load, 15000)
-watch([() => props.app, () => props.name, () => props.node, () => props.budget, range], load)
+const refresh = usePoll(load, 15000)
+watch([() => props.app, () => props.name, () => props.node, () => props.budget, range], () => {
+  target.value = null
+  rows.value = undefined
+  refresh()
+})
 
 const node = computed(() => (target.value?.nodes ?? []).find((n) => n.node === props.node) ?? null)
 const spec = computed(() => (node.value?.budgets ?? []).find((b) => b.id === props.budget) ?? null)
 
+const historicalComparable = computed(
+  () => !spec.value?.scopeBy && !(spec.value?.whenOp?.length)
+)
 const points = computed(() => (spec.value ? budgetSeries(rows.value, spec.value) ?? [] : []))
 const peak = computed(() => points.value.reduce((a, w) => Math.max(a, w.utilisation ?? 0), 0))
 const totals = computed(() =>
@@ -201,7 +222,7 @@ const tone = computed(() => (peak.value > 1 ? 'text-bad' : peak.value >= 0.85 ? 
             {{ spec.confidence }} cap
           </span>
         </div>
-        <BudgetBar :used="spec.value ?? 0" :cap="ceilingOf(spec)"
+        <BudgetBar :used="spec.value" :cap="ceilingOf(spec)"
                    :assumed="spec.confidence === 'assumed'" :height="8" />
       </section>
 
@@ -221,6 +242,15 @@ const tone = computed(() => (peak.value > 1 ? 'text-bad' : peak.value >= 0.85 ? 
 
         <div v-else-if="rows === undefined" class="card px-6 py-12">
           <div class="skeleton h-[140px] w-full" />
+        </div>
+
+        <div v-else-if="!historicalComparable" class="card px-6 py-12 text-center">
+          <p class="text-[13.5px] text-fg-2">Historical utilisation is not attributable.</p>
+          <p class="text-[12.5px] text-fg-3 mt-1 max-w-[58ch] mx-auto leading-relaxed">
+            This budget selects a scope value or operation, while roll-ups aggregate the whole node.
+            The live gauge remains authoritative; drawing a percentage from unrelated admissions would
+            be misleading.
+          </p>
         </div>
 
         <div v-else-if="!points.length" class="card px-6 py-12 text-center">
@@ -328,9 +358,9 @@ const tone = computed(() => (peak.value > 1 ? 'text-bad' : peak.value >= 0.85 ? 
           <p :class="spec.confidence === 'documented' ? 'text-fg-2' : 'text-warn'">
             {{ spec.confidence }}<template v-if="spec.source"> — {{ spec.source }}</template>
           </p>
-          <p v-if="spec.as_of" class="text-fg-3 text-[12.5px]">as of {{ spec.as_of }}</p>
-          <p v-if="spec.scope?.length" class="text-fg-3 text-[12.5px]">
-            counted per {{ spec.scope.join(' + ') }}
+          <p v-if="spec.asOf" class="text-fg-3 text-[12.5px]">as of {{ spec.asOf }}</p>
+          <p v-if="spec.scopeBy" class="text-fg-3 text-[12.5px]">
+            counted per {{ spec.scopeBy }}
           </p>
         </div>
       </section>

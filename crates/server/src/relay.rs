@@ -40,7 +40,7 @@
 //! rotation cursor and `MAX_IN_FLIGHT` all existed to do, badly, what the broker
 //! does here for free.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -50,7 +50,7 @@ use queen_mq::{Cancel, Message, Queen, SubscriptionMode, TxnPushItem};
 use serde_json::{json, Value};
 
 use gate_core::plan::{NodePlan, Stage};
-use gate_core::{cost_of, op_matches, op_of, scope_value, GATE_META};
+use gate_core::{cost_of, missing_scope, op_matches, op_of, scope_value, GATE_META};
 
 use crate::budget::{Budgets, Charge, Ledger};
 use crate::knobs::knobs;
@@ -228,6 +228,7 @@ pub fn spawn(
     budgets: Budgets,
     st: Arc<StageRuntime>,
     traces: Arc<Traces>,
+    graph_stopped: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
     let k = knobs();
     let q = queen.clone();
@@ -276,10 +277,16 @@ pub fn spawn(
                 }
             })
             .await;
+        // A consumer normally returns only because its graph was deliberately
+        // cancelled. Any other return leaves this stage's source without a
+        // reader, so fail the whole runtime closed and stop its siblings. The
+        // reconcile loop can then see `is_running() == false` and replace it.
+        let unexpected = stop_graph_after_stage_exit(&graph_stopped, &st.cancel);
         match res {
             Ok(summary) => tracing::info!(
                 stage = %st.key(), queue = %st.stage.source,
                 processed = summary.processed, reason = ?summary.stopped_by,
+                unexpected,
                 "stage stopped"
             ),
             // A stage that exits is a stopped graph, which is the failure v1's
@@ -294,6 +301,17 @@ pub fn spawn(
             ),
         }
     })
+}
+
+/// Mark a runtime unhealthy when a stage returns without a graph cancellation.
+/// Returns whether this exit initiated the stop, for the terminal log line.
+fn stop_graph_after_stage_exit(stopped: &AtomicBool, cancel: &queen_mq::Cancel) -> bool {
+    if cancel.is_cancelled() {
+        return false;
+    }
+    stopped.store(true, Ordering::Relaxed);
+    cancel.cancel();
+    true
 }
 
 struct Ctx {
@@ -361,21 +379,7 @@ async fn handle(ctx: &Ctx, msgs: Vec<Message>) {
         return;
     }
 
-    let kinds: Vec<Kind> = msgs
-        .iter()
-        .map(|m| {
-            // §6.7. Three groups read `ip.in` in the flagship graph and each sees
-            // every message; only the one whose `_gate.path` matches forwards it.
-            // The others must SETTLE it or their cursor never advances.
-            if st.stage.check_foreign && !owns(&st.stage, &m.data) {
-                return Kind::Foreign;
-            }
-            match cost_of(&st.node.cost, &m.data) {
-                Ok(_) => Kind::Work,
-                Err(e) => Kind::Poison(format!("gate: node `{}`: {e}", st.node.name)),
-            }
-        })
-        .collect();
+    let kinds: Vec<Kind> = msgs.iter().map(|m| classify(st, m)).collect();
 
     // A poison message at the HEAD is nacked on its own, because a nack and an
     // ack in one transaction contradict each other: the nack releases the lease
@@ -411,6 +415,44 @@ async fn handle(ctx: &Ctx, msgs: Vec<Message>) {
         .position(|k| matches!(k, Kind::Poison(_)))
         .unwrap_or(kinds.len());
     admit(ctx, &msgs[..cut], &kinds[..cut]).await;
+}
+
+fn classify(st: &StageRuntime, message: &Message) -> Kind {
+    // §6.7. Three groups read `ip.in` in the flagship graph and each sees every
+    // message; only the one whose `_gate.path` matches forwards it. The others
+    // must SETTLE it or their cursor never advances, even when its payload would
+    // be invalid for this other path.
+    if st.stage.check_foreign && !owns(&st.stage, &message.data) {
+        return Kind::Foreign;
+    }
+    // A shared interior queue has one consumer group per path. Those groups
+    // can tell their frames apart only from `_gate.path`, and a JSON scalar or
+    // array cannot carry that stamp. Forwarding one anyway makes the compiler's
+    // arbitrary unstamped owner charge and route every copy as its own path.
+    // Refuse it at the last unambiguous stage instead. Linear and terminal
+    // routes remain shape-preserving because neither needs path provenance.
+    if !message.data.is_object()
+        && st
+            .stage
+            .destinations
+            .iter()
+            .any(|destination| destination.requires_stamp)
+    {
+        return Kind::Poison(format!(
+            "gate: node `{}`: payload must be a JSON object before a shared interior queue",
+            st.node.name
+        ));
+    }
+    if let Err(error) = cost_of(&st.node.cost, &message.data) {
+        return Kind::Poison(format!("gate: node `{}`: {error}", st.node.name));
+    }
+    if let Some((budget, path)) = missing_scope(&st.node.budgets, &message.data) {
+        return Kind::Poison(format!(
+            "gate: node `{}`: budget `{budget}` counts per `{path}` and this item carries none",
+            st.node.name
+        ));
+    }
+    Kind::Work
 }
 
 /// §6.1 – §6.5. `window` is in offset order and all from one source partition.
@@ -721,18 +763,35 @@ impl Grouped {
     /// touches is dropped rather than charged zero.
     fn charges(&self, n: usize) -> Vec<Charge> {
         let mut deltas = vec![0i64; self.keys.len()];
+        let mut overflowed = vec![false; self.keys.len()];
         for contributions in self.per_msg.iter().take(n) {
             for (idx, cost) in contributions {
-                deltas[*idx] += cost;
+                match deltas[*idx].checked_add(*cost) {
+                    Some(total) => deltas[*idx] = total,
+                    None => {
+                        // The wire cannot express this batch's total. Ask for a
+                        // deliberately impossible increment so the ordinary
+                        // refusal path computes the largest representable
+                        // prefix instead of wrapping the delta and admitting it.
+                        deltas[*idx] = i64::MAX;
+                        overflowed[*idx] = true;
+                    }
+                }
             }
         }
         self.keys
             .iter()
-            .zip(deltas.iter())
-            .filter(|(_, d)| **d > 0)
-            .map(|(k, d)| Charge {
+            .zip(deltas.iter().zip(overflowed.iter()))
+            .filter(|(_, (d, _))| **d > 0)
+            .map(|(k, (d, overflowed))| Charge {
                 key: k.key.clone(),
-                max: k.max,
+                // With the largest legal ceiling, delta == max would otherwise
+                // apply even though the true (unrepresentable) sum is larger.
+                max: if *overflowed {
+                    k.max.min(i64::MAX - 1)
+                } else {
+                    k.max
+                },
                 ttl: k.ttl,
                 delta: *d,
                 budget_id: k.budget_id.clone(),
@@ -761,18 +820,19 @@ impl Grouped {
                 .map(|s| s.value)
                 .unwrap_or(0)
                 .saturating_sub(mine);
-            remaining[i] = (key.max - current).max(0);
+            remaining[i] = key.max.saturating_sub(current).max(0);
         }
 
         let mut used = vec![0i64; self.keys.len()];
         for (n, contributions) in self.per_msg.iter().enumerate() {
             for (idx, cost) in contributions {
-                if used[*idx] + cost > remaining[*idx] {
+                let Some(total) = used[*idx].checked_add(*cost) else {
+                    return n;
+                };
+                if total > remaining[*idx] {
                     return n;
                 }
-            }
-            for (idx, cost) in contributions {
-                used[*idx] += cost;
+                used[*idx] = total;
             }
         }
         self.per_msg.len()
@@ -796,12 +856,9 @@ fn group(st: &StageRuntime, msgs: &[Message]) -> Grouped {
             let key = match &b.scope_by {
                 Some(path) => match scope_value(&m.data, path) {
                     Some(v) => b.key_for(Some(&v)),
-                    // A counter keyed on an absent value measures the wrong
-                    // thing. The HTTP front door refuses this with a 422; an
-                    // item that arrived on a user-owned ingress queue without it
-                    // is charged against the node's other budgets and skips this
-                    // one, because dropping the item would be a limiter losing
-                    // work it was asked to pace.
+                    // `classify` makes an applicable missing scope poison before
+                    // grouping. Keep this defensive branch for recomputed
+                    // refunds, which must never invent a scope key.
                     None => continue,
                 },
                 None => b.key.clone(),
@@ -818,7 +875,13 @@ fn group(st: &StageRuntime, msgs: &[Message]) -> Grouped {
                     keys.len() - 1
                 }
             };
-            here.push((idx, cost));
+            // A shared key is one counter even when more than one budget on
+            // this node names it. The validator permits identical declarations
+            // deliberately; charging the same key once per declaration would
+            // multiply this message's cost and enforce a smaller limit.
+            if !here.iter().any(|(seen, _)| *seen == idx) {
+                here.push((idx, cost));
+            }
         }
         per_msg.push(here);
     }
@@ -1079,7 +1142,7 @@ async fn stage_and_commit(
             continue;
         }
         forwarded += 1;
-        cost += cost_of(&st.node.cost, &m.data).unwrap_or(1);
+        cost = cost.saturating_add(cost_of(&st.node.cost, &m.data).unwrap_or(1));
         for dest in &st.stage.destinations {
             match tx.push_item(push_for(st, m, dest)) {
                 Ok(next) => tx = next,
@@ -1100,9 +1163,13 @@ async fn stage_and_commit(
             st.counters.admitted.fetch_add(forwarded, Ordering::Relaxed);
             st.counters.foreign.fetch_add(foreign, Ordering::Relaxed);
             st.counters.commits.fetch_add(1, Ordering::Relaxed);
-            st.counters
+            let delta = cost.max(0) as u64;
+            let _ = st
+                .counters
                 .cost
-                .fetch_add(cost.max(0) as u64, Ordering::Relaxed);
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    Some(value.saturating_add(delta))
+                });
             // The cursor moved, so whatever was being counted at the old head is
             // over. The head comparison in `note_failed_settle` would notice on
             // its own; this keeps the count honest without waiting for a second
@@ -1138,8 +1205,15 @@ fn push_for(st: &StageRuntime, m: &Message, dest: &gate_core::Destination) -> Tx
 async fn settle_head(ctx: &Ctx, m: &Message, kind: &Kind) -> bool {
     let st = &ctx.st;
     if !matches!(kind, Kind::Work) {
-        let _ = ctx.queen.transaction().ack(m).commit().await;
-        st.counters.foreign.fetch_add(1, Ordering::Relaxed);
+        match ctx.queen.transaction().ack(m).commit().await {
+            Ok(_) => {
+                st.counters.foreign.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => tracing::warn!(
+                stage = %st.key(), error = %e,
+                "could not settle a foreign item at the head; its lease will lapse"
+            ),
+        }
         return false;
     }
 
@@ -1153,13 +1227,21 @@ async fn settle_head(ctx: &Ctx, m: &Message, kind: &Kind) -> bool {
     }
     let Some(tx) = tx else {
         // Nack with the reason so it reaches the DLQ, never dropped.
-        let _ = ctx
+        match ctx
             .queen
             .transaction()
             .nack(m, "gate: this item cannot be staged for its destination")
             .commit()
-            .await;
-        st.counters.deadlettered.fetch_add(1, Ordering::Relaxed);
+            .await
+        {
+            Ok(_) => {
+                st.counters.deadlettered.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => tracing::warn!(
+                stage = %st.key(), error = %e,
+                "could not dead-letter an item that cannot be staged; its lease will lapse"
+            ),
+        }
         return false;
     };
     match tx.commit().await {
@@ -1167,6 +1249,17 @@ async fn settle_head(ctx: &Ctx, m: &Message, kind: &Kind) -> bool {
             st.counters.forwarded.fetch_add(1, Ordering::Relaxed);
             st.counters.admitted.fetch_add(1, Ordering::Relaxed);
             st.counters.commits.fetch_add(1, Ordering::Relaxed);
+            // The same weight the batch path records, and for the same reason:
+            // the budget was charged for this item, so a roll-up that counts the
+            // admission and not the cost measures a node as idler than it is.
+            // Utilisation is read from this number.
+            let cost = cost_of(&st.node.cost, &m.data).unwrap_or(1).max(0) as u64;
+            let _ = st
+                .counters
+                .cost
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    Some(value.saturating_add(cost))
+                });
             true
         }
         // Already downstream: settle it and move on. It does NOT count as
@@ -1302,6 +1395,26 @@ fn jitter_ms(wait_ms: i64) -> i64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn an_unexpected_stage_exit_stops_the_graph_and_its_siblings() {
+        let stopped = AtomicBool::new(false);
+        let cancel = Cancel::new();
+
+        assert!(stop_graph_after_stage_exit(&stopped, &cancel));
+        assert!(stopped.load(Ordering::Relaxed));
+        assert!(cancel.is_cancelled());
+    }
+
+    #[test]
+    fn a_planned_stage_exit_does_not_reclassify_the_stop() {
+        let stopped = AtomicBool::new(false);
+        let cancel = Cancel::new();
+        cancel.cancel();
+
+        assert!(!stop_graph_after_stage_exit(&stopped, &cancel));
+        assert!(!stopped.load(Ordering::Relaxed));
+    }
+
     fn budget(id: &str, count_sub: i64) -> gate_core::CompiledBudget {
         gate_core::CompiledBudget {
             id: id.into(),
@@ -1391,6 +1504,61 @@ mod tests {
         assert_eq!(charges.len(), 1, "one key, one incr");
         assert_eq!(charges[0].delta, 12);
         assert_eq!(charges[0].max, 100);
+    }
+
+    /// Two identical declarations may intentionally share one counter. They
+    /// remain one spend per message, not one spend per declaration.
+    #[test]
+    fn duplicate_shared_budgets_charge_their_counter_once() {
+        let mut first = budget("first", 100);
+        first.shared_key = Some("vendor".into());
+        let mut second = budget("second", 100);
+        second.key = first.key.clone();
+        second.shared_key = first.shared_key.clone();
+        let st = runtime(vec![first, second], 1.0);
+        let msgs: Vec<Message> = (0..3)
+            .map(|i| msg(&format!("t{i}"), json!({ "w": 4 })))
+            .collect();
+
+        let charges = group(&st, &msgs).charges(msgs.len());
+        assert_eq!(charges.len(), 1, "one shared key must produce one incr");
+        assert_eq!(charges[0].delta, 12, "the declarations doubled the cost");
+    }
+
+    /// `kv.incr` carries an i64 delta. A valid variable-cost declaration can
+    /// still put two individually legal values in one batch whose sum is above
+    /// that wire ceiling; it must take the refusal/prefix path, never wrap to a
+    /// small or negative charge.
+    #[test]
+    fn an_unrepresentable_batch_cost_fails_closed_to_a_prefix() {
+        let mut st = runtime(vec![budget("b", i64::MAX)], 1.0);
+        st.node.cost = gate_core::Cost::Path(gate_core::CostPath {
+            path: "payload.w".into(),
+            default: 1,
+            max: Some(i64::MAX),
+        });
+        let item_cost = i64::MAX / 2 + 1;
+        let msgs = vec![
+            msg("t0", json!({ "w": item_cost })),
+            msg("t1", json!({ "w": item_cost })),
+        ];
+        let grouped = group(&st, &msgs);
+        let charges = grouped.charges(2);
+
+        assert_eq!(charges[0].delta, i64::MAX);
+        assert_eq!(charges[0].max, i64::MAX - 1, "the overflow must refuse");
+
+        let attempt = crate::budget::Attempt {
+            applied: vec![false],
+            post: vec![None],
+            states: vec![crate::budget::State {
+                key: charges[0].key.clone(),
+                value: 0,
+                expires_at_ms: None,
+            }],
+        };
+        assert_eq!(grouped.prefix(&charges, &attempt), 1);
+        assert_eq!(grouped.charges(1)[0].delta, item_cost);
     }
 
     /// A path's share IS the ceiling it carries: `round(count_sub * share)`.
@@ -1512,6 +1680,26 @@ mod tests {
         assert_eq!(l1.delta, 2);
     }
 
+    #[test]
+    fn an_applicable_missing_scope_is_poison_on_direct_ingress() {
+        let mut scoped = budget("per-listing", 100);
+        scoped.scope_by = Some("payload.listingId".into());
+        scoped.when_op = Some(vec!["photo.delete".into()]);
+        let st = runtime(vec![budget("all", 100), scoped], 1.0);
+
+        let missing = msg("t0", json!({ "w": 1, "op": "photo.delete" }));
+        match classify(&st, &missing) {
+            Kind::Poison(reason) => {
+                assert!(reason.contains("per-listing"), "{reason}");
+                assert!(reason.contains("payload.listingId"), "{reason}");
+            }
+            _ => panic!("a missing applicable scope was allowed through"),
+        }
+
+        let unrelated = msg("t1", json!({ "w": 1, "op": "photo.upload" }));
+        assert!(matches!(classify(&st, &unrelated), Kind::Work));
+    }
+
     fn stage_named(path: &str, owns_unstamped: bool) -> Stage {
         let mut s = runtime(vec![budget("b", 10)], 1.0).stage;
         s.path = path.into();
@@ -1549,6 +1737,34 @@ mod tests {
         // the same way.
         assert!(owns(&owner, &json!({})));
         assert!(!owns(&other, &json!({})));
+    }
+
+    #[test]
+    fn an_unstampable_payload_never_enters_a_shared_interior_queue() {
+        let mut st = runtime(vec![budget("b", 10)], 1.0);
+        st.stage.destinations.push(gate_core::Destination {
+            node: "next".into(),
+            queue: "shared.in".into(),
+            label: "app/g/p/next".into(),
+            derive_id: true,
+            requires_stamp: true,
+            terminal: false,
+        });
+
+        match classify(&st, &msg("scalar", json!("cannot carry _gate"))) {
+            Kind::Poison(reason) => assert!(reason.contains("JSON object"), "{reason}"),
+            _ => panic!("an unstampable payload was allowed into a shared queue"),
+        }
+        assert!(matches!(
+            classify(&st, &msg("object", json!({ "w": 1 }))),
+            Kind::Work
+        ));
+
+        st.stage.destinations[0].requires_stamp = false;
+        assert!(matches!(
+            classify(&st, &msg("linear", json!("shape is preserved"))),
+            Kind::Work
+        ));
     }
 
     #[test]

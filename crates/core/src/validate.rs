@@ -16,15 +16,34 @@
 //! `max-keys`, `store-fits`, `kv-chunk`: cardinality is Postgres rows with a
 //! TTL, not entries in a document Gate re-reads whole every cycle).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use crate::cost::ok_payload_path;
-use crate::doc::{ok_name, Confidence, Cost, GraphDoc, PathElem};
+use crate::doc::{ok_name, Confidence, Cost, GraphDoc, PathElem, COUNTERS_WINDOW_SECONDS};
 use crate::plan::{self, Plan};
 
 /// The largest claim a node may ask for. §12.2's clamp on v1's `pacing.batch`,
 /// enforced as a refusal.
 pub const MAX_BATCH: u32 = 1000;
+
+/// The most distinct node-wide counters one breaker can hold.
+///
+/// Queen accepts 256 operations in one KV batch and the final operation is the
+/// breaker record. Splitting that batch would make the hold and its audit record
+/// observably non-atomic.
+pub const MAX_BREAKER_COUNTERS: usize = 255;
+
+/// The largest number of consumer workers one graph may start across all of
+/// its stages.
+///
+/// `queen-mq` allocates a task and a long-poll loop for every worker before the
+/// consumer starts. Without a graph-wide bound, a small declaration containing
+/// a large `concurrency` integer can make the process reserve billions of task
+/// slots and abort before it can return a refusal. 4096 is already roughly four
+/// million items/s at the deliberately pessimistic one-lane capacity; larger
+/// deployments should be split into graphs so one declaration cannot exhaust a
+/// replica on its own.
+pub const MAX_GRAPH_WORKERS: u64 = 4096;
 
 /// The most re-entries a document may allow one item (§16.6). v1's
 /// `breach-attempts` policed the same number for the same reason.
@@ -56,7 +75,8 @@ impl std::fmt::Display for Problem {
 #[derive(Debug, Clone, Default)]
 pub struct ExternalFacts {
     pub queues: BTreeMap<String, QueueFacts>,
-    /// Ingress queues already claimed elsewhere in the fleet:
+    /// Stage source queues already claimed elsewhere in the fleet (both
+    /// ingress and Gate-owned interior queues):
     /// `(queue, "app/graph", node)`. This graph's own entries must be excluded
     /// by the caller, or a redeclare would collide with itself.
     pub ingress_owners: Vec<(String, String, String)>,
@@ -79,11 +99,55 @@ fn p(rule: &'static str, detail: String) -> Problem {
 
 // -------------------------------------------------------------------- refusals
 
+/// Whether a stored document must be REFUSED for this rule, or may keep running.
+///
+/// Every rule here is enforced without exception against a CALLER's declare.
+/// The question this answers is a different one: what should happen when a
+/// document already in the store violates a rule that did not exist when it was
+/// written.
+///
+/// Refusing it is not the safe direction. `restore` and `reconcile` both go
+/// through the same declare path, so a refusal leaves the graph unregistered:
+/// its pushes answer 404, its ingress queue fills with nobody draining it, and
+/// the only trace is one WARN line. That is strictly worse than the condition
+/// the new rule describes — the graph was serving traffic a moment ago, and the
+/// rule was added to stop the NEXT declare, not to stop this one.
+///
+/// So a rule stops a stored document only when the plan cannot be built or
+/// addressed at all — no nodes, no paths, or a name that cannot become a queue
+/// name and a kv key — or when starting it would exhaust the replica before it
+/// served anything (`graph-workers`): a WARN written while the process runs out
+/// of task slots is not a graph kept running, and it takes every other graph on
+/// the replica down with it. Everything else is logged and kept running, and
+/// the next caller declare still has to fix it.
+pub fn refuses_stored_document(rule: &str) -> bool {
+    matches!(
+        rule,
+        "nodes"
+            | "paths"
+            | "application"
+            | "graph-name"
+            | "node-name"
+            | "path-name"
+            | "graph-workers"
+    )
+}
+
 pub fn validate(doc: &GraphDoc) -> Vec<Problem> {
     validate_with(doc, &ExternalFacts::default())
 }
 
 pub fn validate_with(doc: &GraphDoc, facts: &ExternalFacts) -> Vec<Problem> {
+    let plan = plan::compile(doc);
+    validate_plan_with(doc, &plan, facts)
+}
+
+/// Validate the exact plan a caller is about to start.
+///
+/// Most callers use [`validate_with`]. The server compiles with broker facts
+/// and operator overrides first, however, so it must validate that resolved
+/// plan rather than silently recompile with library defaults.
+pub fn validate_plan_with(doc: &GraphDoc, plan: &Plan, facts: &ExternalFacts) -> Vec<Problem> {
     let mut out = Vec::new();
     naming(doc, &mut out);
     if doc.nodes.is_empty() {
@@ -100,12 +164,47 @@ pub fn validate_with(doc: &GraphDoc, facts: &ExternalFacts) -> Vec<Problem> {
         return out;
     }
 
-    let plan = plan::compile(doc);
     shape(doc, &mut out);
-    budgets(doc, &plan, &mut out);
-    shares(doc, &plan, &mut out);
-    ownership(doc, facts, &mut out);
+    counters(doc, &mut out);
+    worker_width(plan, &mut out);
+    budgets(doc, plan, &mut out);
+    shares(doc, plan, &mut out);
+    ownership(plan, facts, &mut out);
     out
+}
+
+fn counters(doc: &GraphDoc, out: &mut Vec<Problem>) {
+    let Some(counters) = &doc.counters else {
+        return;
+    };
+    if counters.window_seconds != COUNTERS_WINDOW_SECONDS {
+        out.push(p(
+            "counters-window",
+            format!(
+                "counters.windowSeconds is {}, but Gate currently stores and serves fixed \
+                 one-minute roll-ups. Set windowSeconds to {COUNTERS_WINDOW_SECONDS}, or omit \
+                 counters to leave durable roll-ups off.",
+                counters.window_seconds
+            ),
+        ));
+    }
+}
+
+fn worker_width(plan: &Plan, out: &mut Vec<Problem>) {
+    let workers: u64 = plan.stages.iter().map(|s| u64::from(s.concurrency)).sum();
+    if workers > MAX_GRAPH_WORKERS {
+        out.push(p(
+            "graph-workers",
+            format!(
+                "this graph resolves to {workers} consumer workers across {} stages; the maximum \
+                 is {MAX_GRAPH_WORKERS}. Each worker allocates a task and a broker long-poll before \
+                 the graph starts, so an unbounded value can exhaust a replica. Lower \
+                 `nodes[].concurrency` or `GATE_STAGE_CONCURRENCY`, or split the topology into \
+                 separate graphs.",
+                plan.stages.len()
+            ),
+        ));
+    }
 }
 
 fn naming(doc: &GraphDoc, out: &mut Vec<Problem>) {
@@ -336,13 +435,27 @@ fn budgets(doc: &GraphDoc, plan: &Plan, out: &mut Vec<Problem>) {
             ));
             continue;
         }
-        if np.unscoped().next().is_none() {
+        if np.node_wide().next().is_none() {
             out.push(p(
                 "node-unscoped-budget",
                 format!(
-                    "node `{name}` has only per-key budgets. It needs at least one budget on the \
-                     node itself: it is what the ETA measures a rate against and what the breaker \
-                     spends when a vendor says 429."
+                    "node `{name}` has no unconditional budget on the node itself. It needs at \
+                     least one budget without scopeBy or whenOp: every item must meet that \
+                     counter, so the ETA has a node-wide rate and the breaker can stop every \
+                     operation when a vendor says 429."
+                ),
+            ));
+        }
+        let breaker_keys: HashSet<&str> = np.unscoped().map(|b| b.key.as_str()).collect();
+        if breaker_keys.len() > MAX_BREAKER_COUNTERS {
+            out.push(p(
+                "breaker-width",
+                format!(
+                    "node `{name}` compiles to {} distinct node-wide counters. A breaker must \
+                     spend them and write its audit record atomically, but the broker accepts at \
+                     most 256 operations in one call. Keep at most {MAX_BREAKER_COUNTERS} \
+                     distinct unscoped counters; budgets with the same sharedKey count once.",
+                    breaker_keys.len()
                 ),
             ));
         }
@@ -419,7 +532,8 @@ fn budgets(doc: &GraphDoc, plan: &Plan, out: &mut Vec<Problem>) {
                         "scope-path",
                         format!(
                             "budget `{}` of node `{name}`: scopeBy `{path}` is not a payload path. \
-                             Write it as `payload.field` or `payload.a.b`.",
+                             Write it as `payload.field` or `payload.a.b`; `payload._gate` is \
+                             reserved for Gate's routing stamp.",
                             cb.id
                         ),
                     ));
@@ -503,7 +617,8 @@ fn cost_rules(name: &str, cost: &Cost, out: &mut Vec<Problem>) {
                     "cost-path",
                     format!(
                         "node `{name}`: cost.path `{}` is not a payload path. Write it as \
-                         `payload.field` or `payload.a.b`.",
+                         `payload.field` or `payload.a.b`; `payload._gate` is reserved for Gate's \
+                         routing stamp.",
                         c.path
                     ),
                 ));
@@ -613,39 +728,95 @@ fn shares(doc: &GraphDoc, plan: &Plan, out: &mut Vec<Problem>) {
     }
 }
 
-fn ownership(doc: &GraphDoc, facts: &ExternalFacts, out: &mut Vec<Problem>) {
-    // Two nodes in ONE document naming one ingress queue, and the same question
-    // asked of the fleet. Both are refusals: two consumers of one queue in
-    // different groups each get every message, which doubles what leaves.
+fn ownership(plan: &Plan, facts: &ExternalFacts, out: &mut Vec<Problem>) {
+    // One logical node per source queue, including Gate-owned interior queues.
+    // Looking only at `node.ingress` misses a named ingress that aliases an
+    // interior queue: two consumers then read the same physical stream under
+    // different groups even though the document appears to name two queues.
     let mut mine: HashMap<&str, &str> = HashMap::new();
-    for (name, node) in &doc.nodes {
-        let Some(q) = node
-            .ingress
-            .as_ref()
-            .filter(|i| i.is_enabled())
-            .and_then(|i| i.declared_queue())
-        else {
-            continue;
-        };
-        if let Some(other) = mine.insert(q, name.as_str()) {
+    let mut reported: HashSet<&str> = HashSet::new();
+    for stage in &plan.stages {
+        let q = stage.source.as_str();
+        let name = stage.node.as_str();
+        if let Some(other) = mine.insert(q, name) {
+            if other == name || !reported.insert(q) {
+                continue;
+            }
             out.push(p(
                 "ingress-owner",
                 format!(
-                    "`{q}` is the ingress of both `{other}` and `{name}` in this graph. Two \
-                     consumers of one queue in different groups each get every message, which \
-                     doubles what leaves."
+                    "`{q}` is the source of both `{other}` and `{name}` in this graph. One queue \
+                     cannot be both a declared ingress and a Gate-owned interior stream: their \
+                     consumer groups would each receive and forward the same messages."
                 ),
             ));
         }
+    }
+
+    // The same source ownership rule across replicas. The facts include every
+    // source from the local registry; the caller separately checks the durable
+    // store for declarations this replica has not reconciled yet.
+    for (q, name) in &mine {
         if let Some((_, g, n)) = facts.ingress_owners.iter().find(|(oq, _, _)| oq == q) {
             out.push(p(
                 "ingress-owner",
                 format!(
-                    "`{q}` is already the ingress of node `{n}` in graph `{g}`. Two consumers of \
-                     one queue in different groups each get every message, which doubles what \
-                     leaves."
+                    "`{q}` is already the source of node `{n}` in graph `{g}`. Node `{name}` \
+                     would consume the same physical stream under a different group, so both \
+                     graphs would forward every message."
                 ),
             ));
+        }
+    }
+
+    // A terminal destination that is also one of this graph's sources is a
+    // physical cycle even when the node DAG is acyclic. The simplest case is a
+    // one-node target whose ingress and egress names are equal: each admitted
+    // message is atomically pushed back into the queue it was just acked from
+    // and circulates for ever, paying the budget on every turn.
+    // Reachability, not membership. A queue that is both an egress and a source
+    // is only a cycle if work put there can come BACK to it: `in -> mid -> out`
+    // spread over two paths makes `mid` a terminal destination of one and the
+    // source of the other, and that is a chain, not a loop. Walk the queue graph
+    // forward from each terminal destination and look for the queue itself.
+    let mut forward: HashMap<&str, Vec<&str>> = HashMap::new();
+    for stage in &plan.stages {
+        forward
+            .entry(stage.source.as_str())
+            .or_default()
+            .extend(stage.destinations.iter().map(|d| d.queue.as_str()));
+    }
+    let returns_to = |start: &str| -> bool {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut queue: VecDeque<&str> = forward.get(start).into_iter().flatten().copied().collect();
+        while let Some(next) = queue.pop_front() {
+            if next == start {
+                return true;
+            }
+            if !seen.insert(next) {
+                continue;
+            }
+            queue.extend(forward.get(next).into_iter().flatten().copied());
+        }
+        false
+    };
+    let mut feedback: HashSet<&str> = HashSet::new();
+    for stage in &plan.stages {
+        for destination in &stage.destinations {
+            if destination.terminal
+                && returns_to(destination.queue.as_str())
+                && feedback.insert(destination.queue.as_str())
+            {
+                out.push(p(
+                    "queue-cycle",
+                    format!(
+                        "`{}` is both an egress and a source in this graph. An admitted message \
+                         would be pushed back into a queue this graph consumes and circulate for \
+                         ever, paying its budgets on every turn. Use a distinct egress queue.",
+                        destination.queue
+                    ),
+                ));
+            }
         }
     }
 }
@@ -673,8 +844,12 @@ pub fn warnings_with(doc: &GraphDoc, facts: &ExternalFacts) -> Vec<Problem> {
             // RATE than declared**, never a looser one, which is the safe way to
             // be wrong — but neither is what the caller wrote down, so both are
             // said out loud.
-            let enforced_ms = cb.window_sub_seconds * 1000 * cb.sub_windows as i64;
-            if enforced_ms != b.time_ms {
+            // A valid declaration may use the whole i64 range for `timeMs`.
+            // Rounding each sub-window up can make the reconstructed duration
+            // slightly larger than i64::MAX, so compare in i128 instead of
+            // panicking while preparing a warning after the graph is live.
+            let enforced_ms = (cb.window_sub_seconds as i128) * 1000 * (cb.sub_windows as i128);
+            if enforced_ms != b.time_ms as i128 {
                 out.push(p(
                     "window-sub-second",
                     format!(

@@ -38,19 +38,28 @@ const graph = ref(null)
 const error = ref('')
 /* `?path=` selects one path, which is what a `/lanes/:lane` link becomes. */
 const selected = ref(String(route.query.path ?? ''))
+watch(
+  () => route.query.path,
+  (path) => { selected.value = String(path ?? '') },
+)
 
 async function load() {
+  const app = application.value
+  const name = props.name
   try {
-    graph.value = await api.get(graphApi(application.value, props.name))
+    const next = await api.get(graphApi(app, name))
+    if (app !== application.value || name !== props.name) return
+    graph.value = next
     error.value = ''
   } catch (e) {
+    if (app !== application.value || name !== props.name) return
     error.value = e.message
   }
 }
-usePoll(load)
+const refresh = usePoll(load)
 watch(() => [props.app, props.name], () => {
   graph.value = null
-  load()
+  refresh()
 })
 
 const nodes = computed(() => graph.value?.nodes ?? [])
@@ -131,7 +140,7 @@ function nodeState(n) {
   if (!graph.value?.running) return 'down'
   if (n.breaker) return 'breached'
   if ((n.budgets ?? []).some((b) => b.confidence === 'assumed')) return 'blind'
-  if (counters(n.node).deferred > 0) return 'pacing'
+  if ((n.waiting_for_budget ?? 0) > 0) return 'pacing'
   return 'flowing'
 }
 
@@ -140,7 +149,7 @@ const state = computed(() => {
   if (nodes.value.some((n) => n.breaker)) return 'breached'
   if (nodes.value.some((n) => (n.budgets ?? []).some((b) => b.confidence === 'assumed')))
     return 'blind'
-  return totals.value.deferred > 0 ? 'pacing' : 'flowing'
+  return nodes.value.some((n) => (n.waiting_for_budget ?? 0) > 0) ? 'pacing' : 'flowing'
 })
 
 const CONFIDENCE_NOTE = {
@@ -266,6 +275,8 @@ async function remove() {
                         running: graph.running,
                         paths: n.paths ?? [],
                         budgets: n.budgets ?? [],
+                        waiting_for_budget: n.waiting_for_budget,
+                        waiting_for_workers: n.waiting_for_workers,
                       }))"
                       :edges="edges" />
       </section>

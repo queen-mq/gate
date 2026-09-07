@@ -64,7 +64,7 @@ async fn answer(
         ));
     }
     let path = pick(rt, node, &q)?;
-    match crate::eta::view(st, rt, node, &path).await {
+    match crate::eta::view(st, rt, node, &path).await? {
         Some(v) => ok(v),
         None => Err(Fail(
             StatusCode::NOT_FOUND,

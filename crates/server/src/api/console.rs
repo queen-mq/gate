@@ -13,10 +13,29 @@ use std::collections::{BTreeSet, HashMap};
 
 use axum::extract::Path as AxPath;
 use axum::extract::{Query, State};
+use axum::http::StatusCode;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::api::{ok, ApiResult, Shared};
+use crate::api::{ok, ApiResult, Fail, Shared};
+
+/// Console reads are interactive views, not an unbounded export surface.
+/// Keeping the bounds here also makes every `usize -> i64/u32` conversion
+/// below safe on both 32- and 64-bit builds.
+const MAX_HISTORY_MINUTES: usize = 24 * 60;
+const MAX_TRACE_ROWS: usize = crate::obs::TRACE_RING;
+const MAX_BREACH_ROWS: usize = 500;
+
+fn bounded(value: Option<usize>, default: usize, max: usize) -> usize {
+    value.unwrap_or(default).clamp(1, max)
+}
+
+fn history_failure(error: String) -> Fail {
+    Fail(
+        StatusCode::BAD_GATEWAY,
+        format!("could not read history: {error}"),
+    )
+}
 
 // ------------------------------------------------------------------ overview
 
@@ -50,6 +69,24 @@ pub async fn overview(State(app): State<Shared>) -> ApiResult {
         }
     }
 
+    // Every other field in this document comes from the registry and the
+    // broker, not from Postgres. Failing the whole response on the history read
+    // would take `queen.reachable` down with it — the one field that says
+    // whether the LIMITER is healthy, hidden at exactly the moment an operator
+    // is working out what broke. So the rate reports itself as unknown and
+    // names its own failure, and the rest of the overview still answers.
+    let (admitted_per_sec, history_error) = if counters_on {
+        match rate_of(&app, now).await {
+            Ok(rate) => (rate, Value::Null),
+            Err(Fail(_, message)) => {
+                tracing::warn!(error = %message, "overview: the admission rate is unreadable");
+                (Value::Null, Value::String(message))
+            }
+        }
+    } else {
+        (Value::Null, Value::Null)
+    };
+
     ok(json!({
         "queen": {
             "reachable": health.reachable,
@@ -63,7 +100,10 @@ pub async fn overview(State(app): State<Shared>) -> ApiResult {
         // Null, not a lifetime average. A running counter divided by an uptime
         // the caller does not know is a number that is wrong in a way nobody can
         // see.
-        "admitted_per_sec": if counters_on { rate_of(&app, now).await } else { Value::Null },
+        "admitted_per_sec": admitted_per_sec,
+        // Present only when the rate above is null BECAUSE the read failed, so
+        // a console can tell that apart from roll-ups being switched off.
+        "history_error": history_error,
         "budgets_assumed": assumed,
         "budgets_stale": stale,
     }))
@@ -85,9 +125,9 @@ fn is_stale(as_of: Option<&str>, now_ms: i64) -> bool {
     }
 }
 
-async fn rate_of(app: &Shared, now: i64) -> Value {
+async fn rate_of(app: &Shared, now: i64) -> Result<Value, Fail> {
     let Some(h) = app.history.as_ref() else {
-        return Value::Null;
+        return Ok(Value::Null);
     };
     let mut total = 0.0f64;
     for g in app.registry.all() {
@@ -99,10 +139,11 @@ async fn rate_of(app: &Shared, now: i64) -> Value {
                     &s.stage.path,
                     now,
                 )
-                .await;
+                .await
+                .map_err(history_failure)?;
         }
     }
-    json!(total)
+    Ok(json!(total))
 }
 
 // -------------------------------------------------------------------- lists
@@ -139,18 +180,26 @@ pub async fn list_targets(State(app): State<Shared>) -> ApiResult {
     let now = crate::now_ms();
     let mut out = Vec::new();
 
-    for g in app.registry.all() {
-        // The backlog of everything that has not been admitted yet: every
-        // ingress queue this graph reads, under the group that reads it.
+    let graphs = app.registry.all();
+    // This is the one route that samples, so it is the one place that knows
+    // which graphs still exist.
+    app.backlogs
+        .retain(&graphs.iter().map(|g| g.key()).collect());
+
+    for g in graphs {
+        // The backlog of everything that has not been admitted yet: every stage
+        // source this graph reads, under the group that reads it. Interior
+        // stages matter too — a downstream budget can be the binding one.
         let mut backlog = 0u64;
-        for s in g.stages.iter().filter(|s| s.stage.first_hop) {
+        for s in &g.stages {
             backlog += app
                 .depths
                 .pending_of_group(&app.queen, &s.stage.source, &s.stage.group)
-                .await
+                .await?
                 .values()
                 .sum::<u64>();
         }
+        let saturating = app.backlogs.sample(&g.key(), backlog);
 
         let (mut adm, mut den) = (0u64, 0u64);
         for s in &g.stages {
@@ -169,7 +218,7 @@ pub async fn list_targets(State(app): State<Shared>) -> ApiResult {
         let mut worst = (String::new(), 0.0f64, 0i64, 0i64, false, 0i64);
         for np in g.plan.nodes.values() {
             let keys: Vec<String> = np.unscoped().map(|b| b.key.clone()).collect();
-            let states = app.budgets.read(&keys).await.unwrap_or_default();
+            let states = app.budgets.read(&keys).await?;
             for b in np.unscoped() {
                 let ceiling = b.max_for(np.widest_share());
                 if ceiling <= 0 {
@@ -228,7 +277,15 @@ pub async fn list_targets(State(app): State<Shared>) -> ApiResult {
             "worst_assumed": worst.4,
             "admitted": adm,
             "denied": den,
-            "state": if den > 0 { "pacing" } else { "flowing" },
+            "state": if !g.is_running() {
+                "down"
+            } else if saturating {
+                "saturating"
+            } else if backlog > 0 {
+                "pacing"
+            } else {
+                "flowing"
+            },
             "backlog": backlog,
             "at": now,
         }));
@@ -248,7 +305,7 @@ pub async fn list_graphs(State(st): State<Shared>) -> ApiResult {
                 waiting += st
                     .depths
                     .pending_of_group(&st.queen, &s.stage.source, &s.stage.group)
-                    .await
+                    .await?
                     .values()
                     .sum::<u64>();
                 admitted += s
@@ -310,20 +367,20 @@ pub struct FlowQuery {
 /// much did we send" but "how close are we to being refused".
 pub async fn flow(State(app): State<Shared>, Query(q): Query<FlowQuery>) -> ApiResult {
     let now = crate::now_ms();
-    let minutes = q.minutes.unwrap_or(120).clamp(1, 1440) as i64;
+    let minutes = bounded(q.minutes, 120, MAX_HISTORY_MINUTES) as i64;
 
     let Some(h) = app.history.as_ref() else {
         return ok(json!({ "minutes": [], "applications": [], "durable": false }));
     };
 
-    // The ceiling per node, from the DECLARATION rather than from the data: it
-    // is what the counter enforces, and a node that admitted nothing this minute
-    // still has one.
+    // The node-wide ceiling from the DECLARATION rather than from the data. A
+    // `whenOp` counter covers only an unknown subset of these admissions, so it
+    // cannot be the denominator for the whole node.
     let mut ceiling: HashMap<(String, String), f64> = HashMap::new();
     for g in app.registry.all() {
         for (name, np) in &g.plan.nodes {
             let per_min = np
-                .unscoped()
+                .node_wide_rates()
                 .map(|b| b.count_sub as f64 * 60.0 / b.window_sub_seconds.max(1) as f64)
                 .fold(f64::INFINITY, f64::min);
             if per_min.is_finite() && per_min > 0.0 {
@@ -342,20 +399,23 @@ pub async fn flow(State(app): State<Shared>, Query(q): Query<FlowQuery>) -> ApiR
         utilisation: f64,
         target: String,
         admitted: i64,
+        cost: f64,
         ceiling: f64,
         total: i64,
     }
     let mut cells: HashMap<(String, i64), Cell> = HashMap::new();
     let mut minute_set: BTreeSet<i64> = BTreeSet::new();
 
-    for (application, target, minute, admitted) in h.flow(minutes, now).await {
+    let history = h.flow(minutes, now).await.map_err(history_failure)?;
+    for (application, target, minute, admitted, cost) in history {
         minute_set.insert(minute);
         let cap = ceiling.get(&(application.clone(), target.clone())).copied();
-        let u = cap.map_or(0.0, |c| admitted as f64 / c);
+        let u = cap.map_or(0.0, |c| cost / c);
         let e = cells.entry((application.clone(), minute)).or_insert(Cell {
             utilisation: 0.0,
             target: target.clone(),
             admitted: 0,
+            cost: 0.0,
             ceiling: cap.unwrap_or(0.0),
             total: 0,
         });
@@ -364,6 +424,7 @@ pub async fn flow(State(app): State<Shared>, Query(q): Query<FlowQuery>) -> ApiR
             e.utilisation = u;
             e.target = target;
             e.admitted = admitted;
+            e.cost = cost;
             e.ceiling = cap.unwrap_or(0.0);
         }
     }
@@ -378,12 +439,14 @@ pub async fn flow(State(app): State<Shared>, Query(q): Query<FlowQuery>) -> ApiR
                 .map(|t| match cells.get(&(a.clone(), *t)) {
                     Some(c) => json!({
                         "t": t, "utilisation": c.utilisation, "target": c.target,
-                        "admitted": c.admitted, "ceiling": c.ceiling, "total_admitted": c.total,
+                        "admitted": c.admitted, "cost": c.cost,
+                        "ceiling": c.ceiling, "total_admitted": c.total,
                     }),
                     // A minute an application did not appear in is a minute it
                     // admitted nothing, which is a real zero and not a gap.
                     None => {
-                        json!({ "t": t, "utilisation": 0.0, "admitted": 0, "total_admitted": 0 })
+                        json!({ "t": t, "utilisation": 0.0, "admitted": 0,
+                                "cost": 0.0, "total_admitted": 0 })
                     }
                 })
                 .collect();
@@ -423,9 +486,11 @@ pub async fn rollups(State(app): State<Shared>, Query(q): Query<RollupQuery>) ->
             q.target.clone(),
         ),
     };
-    ok(json!(
-        h.rollups(&a, &t, q.minutes.unwrap_or(120) as i64).await
-    ))
+    let minutes = bounded(q.minutes, 120, MAX_HISTORY_MINUTES) as i64;
+    ok(json!(h
+        .rollups(&a, &t, minutes)
+        .await
+        .map_err(history_failure)?))
 }
 
 #[derive(Deserialize)]
@@ -443,7 +508,7 @@ pub struct TraceQuery {
 /// inherit and no `cost_actual` to compare — see the design's §16.5. What is
 /// kept is the interesting event: the denial.
 pub async fn traces(State(app): State<Shared>, Query(q): Query<TraceQuery>) -> ApiResult {
-    let limit = q.limit.unwrap_or(100);
+    let limit = bounded(q.limit, 100, MAX_TRACE_ROWS);
     let mut out: Vec<Value> = app
         .traces
         .recent(q.outcome.as_deref(), limit)
@@ -454,7 +519,8 @@ pub async fn traces(State(app): State<Shared>, Query(q): Query<TraceQuery>) -> A
         if let Some(h) = app.history.as_ref() {
             out.extend(
                 h.traces(q.outcome.as_deref(), (limit - out.len()) as i64)
-                    .await,
+                    .await
+                    .map_err(history_failure)?,
             );
         }
     }
@@ -472,9 +538,8 @@ pub struct LimitQuery {
 /// sees. These are the `brk:` records, which every replica writes and every
 /// replica can read.
 pub async fn recent_breaches(State(app): State<Shared>, Query(q): Query<LimitQuery>) -> ApiResult {
-    ok(json!(
-        crate::breaker::recent(&app.budgets, q.limit.unwrap_or(10) as u32).await
-    ))
+    let limit = bounded(q.limit, 10, MAX_BREACH_ROWS) as u32;
+    ok(json!(crate::breaker::recent(&app.budgets, limit).await?))
 }
 
 /// One row per `(application, sharedKey)`, read live.
@@ -506,8 +571,7 @@ pub async fn shared_budgets(State(app): State<Shared>) -> ApiResult {
         let state = app
             .budgets
             .read(std::slice::from_ref(&first.key))
-            .await
-            .unwrap_or_default()
+            .await?
             .into_iter()
             .next();
         let conflicts: Vec<Value> = members
@@ -572,7 +636,7 @@ pub async fn app_metrics(
                 let budget_pending: u64 = app
                     .depths
                     .pending_of_group(&app.queen, &s.stage.source, &s.stage.group)
-                    .await
+                    .await?
                     .values()
                     .sum();
                 waiting_budget += budget_pending;
@@ -585,7 +649,8 @@ pub async fn app_metrics(
                             &s.stage.path,
                             now,
                         )
-                        .await,
+                        .await
+                        .map_err(history_failure)?,
                     ),
                     // Null, not a lifetime average — the same fix as
                     // `/api/overview`, so the two fields of this name finally
@@ -610,15 +675,15 @@ pub async fn app_metrics(
                     Some(gr) => app
                         .depths
                         .pending_of_group(&app.queen, q, gr)
-                        .await
+                        .await?
                         .values()
                         .sum(),
-                    None => app.depths.pending(&app.queen, q).await.values().sum(),
+                    None => app.depths.pending(&app.queen, q).await?.values().sum(),
                 };
             }
 
             let keys: Vec<String> = np.unscoped().map(|b| b.key.clone()).collect();
-            let states = app.budgets.read(&keys).await.unwrap_or_default();
+            let states = app.budgets.read(&keys).await?;
             let binding = np
                 .unscoped()
                 .map(|b| {
@@ -635,7 +700,7 @@ pub async fn app_metrics(
                     _ => Some(x),
                 });
 
-            let breaker = crate::breaker::held(&app.budgets, np).await;
+            let breaker = crate::breaker::held(&app.budgets, np).await?;
             let state = if breaker.is_some() {
                 "breached"
             } else if waiting_budget > 0 {
@@ -709,4 +774,34 @@ pub async fn me(
         "role": if crate::auth::is_admin(&s.email) { "admin" } else { "viewer" },
         "expires_at": s.exp,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::StatusCode;
+
+    use super::{bounded, history_failure, MAX_BREACH_ROWS, MAX_HISTORY_MINUTES, MAX_TRACE_ROWS};
+
+    #[test]
+    fn console_query_sizes_are_never_zero_or_unrepresentably_large() {
+        assert_eq!(bounded(None, 120, MAX_HISTORY_MINUTES), 120);
+        assert_eq!(bounded(Some(0), 120, MAX_HISTORY_MINUTES), 1);
+        assert_eq!(
+            bounded(Some(usize::MAX), 120, MAX_HISTORY_MINUTES),
+            MAX_HISTORY_MINUTES
+        );
+        assert_eq!(bounded(Some(usize::MAX), 100, MAX_TRACE_ROWS), 500);
+        assert_eq!(bounded(Some(usize::MAX), 10, MAX_BREACH_ROWS), 500);
+    }
+
+    #[test]
+    fn a_history_failure_is_not_reported_as_an_empty_success() {
+        let failure = history_failure("connection refused".into());
+
+        assert_eq!(failure.0, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            failure.1,
+            "could not read history: connection refused".to_string()
+        );
+    }
 }
