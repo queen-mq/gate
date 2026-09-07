@@ -188,7 +188,7 @@ pub async fn list_targets(State(app): State<Shared>) -> ApiResult {
         let mut worst = (String::new(), 0.0f64, 0i64, 0i64, false, 0i64);
         for np in g.plan.nodes.values() {
             let keys: Vec<String> = np.unscoped().map(|b| b.key.clone()).collect();
-            let states = app.budgets.read(&keys).await.unwrap_or_default();
+            let states = app.budgets.read(&keys).await?;
             for b in np.unscoped() {
                 let ceiling = b.max_for(np.widest_share());
                 if ceiling <= 0 {
@@ -499,7 +499,7 @@ pub struct LimitQuery {
 /// replica can read.
 pub async fn recent_breaches(State(app): State<Shared>, Query(q): Query<LimitQuery>) -> ApiResult {
     let limit = bounded(q.limit, 10, MAX_BREACH_ROWS) as u32;
-    ok(json!(crate::breaker::recent(&app.budgets, limit).await))
+    ok(json!(crate::breaker::recent(&app.budgets, limit).await?))
 }
 
 /// One row per `(application, sharedKey)`, read live.
@@ -531,8 +531,7 @@ pub async fn shared_budgets(State(app): State<Shared>) -> ApiResult {
         let state = app
             .budgets
             .read(std::slice::from_ref(&first.key))
-            .await
-            .unwrap_or_default()
+            .await?
             .into_iter()
             .next();
         let conflicts: Vec<Value> = members
@@ -643,7 +642,7 @@ pub async fn app_metrics(
             }
 
             let keys: Vec<String> = np.unscoped().map(|b| b.key.clone()).collect();
-            let states = app.budgets.read(&keys).await.unwrap_or_default();
+            let states = app.budgets.read(&keys).await?;
             let binding = np
                 .unscoped()
                 .map(|b| {
@@ -660,7 +659,7 @@ pub async fn app_metrics(
                     _ => Some(x),
                 });
 
-            let breaker = crate::breaker::held(&app.budgets, np).await;
+            let breaker = crate::breaker::held(&app.budgets, np).await?;
             let state = if breaker.is_some() {
                 "breached"
             } else if waiting_budget > 0 {
