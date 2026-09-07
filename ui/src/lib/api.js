@@ -5,8 +5,10 @@ import { ref, computed } from 'vue'
   - 'unknown'  boot, /api/me in flight
   - 'ready'    a session (or admin token / open mode) answers for us
   - 'login'    the API said 401 — show the login screen
+  - 'error'    /api/me failed for another reason — show the failure and retry
 */
 export const authState = ref('unknown')
+export const authError = ref('')
 export const me = ref(null) // { actor, email, role }
 
 /*
@@ -75,9 +77,17 @@ export const api = {
 export async function fetchMe() {
   try {
     me.value = await request('/api/me')
+    authError.value = ''
     authState.value = 'ready'
-  } catch {
-    if (authState.value !== 'login') authState.value = 'login'
+  } catch (e) {
+    // `request` alone moves to login, and only for an actual 401. A network
+    // failure or a 5xx is not evidence that the operator is signed out.
+    if (authState.value === 'login') {
+      authError.value = ''
+      return
+    }
+    authError.value = e?.message || 'Could not reach the console API'
+    authState.value = 'error'
   }
 }
 
