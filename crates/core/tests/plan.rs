@@ -489,6 +489,37 @@ fn a_scoped_budget_keys_on_the_value() {
     assert_eq!(b.key_for(None), "b:channel:airbnb:photos:per-listing");
 }
 
+#[test]
+fn a_scope_is_required_only_when_its_budget_applies() {
+    let p = compile(&airbnb());
+    let budgets = &p.node("photos").unwrap().budgets;
+
+    assert_eq!(
+        gate_core::missing_scope(
+            budgets,
+            &serde_json::json!({ "op": "photo.delete", "rooms": 1 })
+        ),
+        Some(("per-listing", "payload.listingId"))
+    );
+    assert_eq!(
+        gate_core::missing_scope(
+            budgets,
+            &serde_json::json!({ "op": "photo.upload", "rooms": 1 })
+        ),
+        None,
+        "a non-matching whenOp must not require this budget's scope"
+    );
+    assert_eq!(
+        gate_core::missing_scope(
+            budgets,
+            &serde_json::json!({
+                "op": "photo.delete", "rooms": 1, "listingId": "l-42"
+            })
+        ),
+        None
+    );
+}
+
 // ---------------------------------------------------------------------- cost
 
 #[test]
