@@ -40,17 +40,22 @@ const error = ref('')
 const selected = ref(String(route.query.path ?? ''))
 
 async function load() {
+  const app = application.value
+  const name = props.name
   try {
-    graph.value = await api.get(graphApi(application.value, props.name))
+    const next = await api.get(graphApi(app, name))
+    if (app !== application.value || name !== props.name) return
+    graph.value = next
     error.value = ''
   } catch (e) {
+    if (app !== application.value || name !== props.name) return
     error.value = e.message
   }
 }
-usePoll(load)
+const refresh = usePoll(load)
 watch(() => [props.app, props.name], () => {
   graph.value = null
-  load()
+  refresh()
 })
 
 const nodes = computed(() => graph.value?.nodes ?? [])
