@@ -521,7 +521,6 @@ mod tests {
         assert_eq!(data, json!({"_gate": {"path": "main"}}));
     }
 
-
     fn budget(id: &str) -> gate_core::CompiledBudget {
         gate_core::CompiledBudget {
             id: id.into(),

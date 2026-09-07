@@ -551,6 +551,7 @@ fn a_scope_is_required_only_when_its_budget_applies() {
     );
 }
 
+#[test]
 fn budget_key_components_cannot_smuggle_separators() {
     let mut doc = airbnb();
     doc.nodes.get_mut("photos").unwrap().budgets[1].id = Some("per:listing%v2".into());
