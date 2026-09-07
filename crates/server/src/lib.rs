@@ -112,6 +112,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         queen,
         registry: Default::default(),
         depths: Arc::new(depth::Depths::default()),
+        backlogs: Default::default(),
         traces: Arc::new(obs::Traces::default()),
         history: history.clone(),
         queen_url: queen_url.clone(),
