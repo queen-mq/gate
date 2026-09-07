@@ -443,7 +443,7 @@ queen.queue(stage.source)
      //                     .subscription_from(runtime_start - INTERIOR_SEED_SKEW)
      .batch(stage.batch)                         // default 200
      .partitions(1)                              // ONE source partition per claim — §6.4
-     .concurrency(stage.concurrency)             // default = max(4, source partitions)
+     .concurrency(stage.concurrency)             // default derived from node-wide rate
      .auto_ack(false)                            // the relay settles inside its own txn
      .lease_seconds(30)                          // a WORK lease, not a pacing quantum
      .renew_lease(Duration::from_secs(10))
@@ -1028,10 +1028,10 @@ Two broker calls:
 
 ```
 depth  = GET /api/v1/resources/queues/{node.source_queue}/depth?group={stage.group}
-state  = kv.batch([ getMany(NS, node.unscoped_budget_keys) ])
+state  = kv.batch([ getMany(NS, node.node_wide_budget_keys) ])
 ```
 
-Then, per budget `b`:
+Then, per unconditional, unscoped budget `b`:
 
 ```
 cap_p     = round(count_sub(b) * share(path))
@@ -1049,6 +1049,12 @@ else:
 etaSeconds = max over b of seconds_b               // the slowest budget binds
 boundBy    = the b that produced it
 ```
+
+`whenOp` budgets are deliberately excluded from this queue-level bound. Depth
+does not say which operations are waiting, so charging every queued item to a
+selective counter would produce a late, false answer for non-matching work. The
+ETA keeps the unconditional lower bound and names the unresolved selectors in
+`assumes`.
 
 `cap_p <= 0` (a share that rounds a path out of existence — refused at declare time, but a
 stored document from an older build can still carry it) answers `null`, never infinity.
@@ -1638,7 +1644,7 @@ worth keeping.
 | knob | default | why |
 |---|---|---|
 | `GATE_STAGE_BATCH` | 200 | the per-claim batch when a node declares none |
-| `GATE_STAGE_CONCURRENCY` | `max(4, partitions)` | worker count per stage |
+| `GATE_STAGE_CONCURRENCY` | unset (derive from the node-wide rate) | fleet-wide worker-count override |
 | `GATE_LEASE_SECONDS` | 30 | the work lease |
 | `GATE_POLL_TIMEOUT_SECONDS` | 30 | the parked long-poll window |
 | `GATE_PARK_THRESHOLD_MS` | 1500 | park-vs-release (§6.5) |
@@ -1707,7 +1713,8 @@ for a system whose largest declared budget is 400 items a second.
 workers = clamp(ceil(cap_rate_per_sec / GATE_LANE_CAPACITY), 1, partitions)
 ```
 
-from the stage's tightest unscoped budget with its `share` applied. For the three graphs we
+from the stage's tightest unconditional, unscoped budget with its `share` applied. A `whenOp`
+budget limits only the selected traffic and cannot size the whole node. For the three graphs we
 run — sixteen stages, caps between 1.7 and 400 items a second — that is **one worker per
 stage**: sixteen parked polls per replica, about 1,900 pops an hour, against v1's ~275,000.
 `airbnb` is six of those sixteen, `vrbo` six and `google` four — a stage being one node on one
