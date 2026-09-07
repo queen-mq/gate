@@ -730,10 +730,14 @@ fn a_stored_document_is_refused_only_for_a_rule_it_cannot_be_served_under() {
         "graph-name",
         "node-name",
         "path-name",
+        // Not a naming or emptiness rule: a plan over the worker cap would
+        // exhaust the replica before it served anything, which is not a graph
+        // kept running and takes every other graph on the replica down too.
+        "graph-workers",
     ] {
         assert!(
             gate_core::refuses_stored_document(fatal),
-            "`{fatal}` leaves no plan to run and must still refuse"
+            "`{fatal}` leaves no plan that can run and must still refuse"
         );
     }
     for kept in [
@@ -743,7 +747,6 @@ fn a_stored_document_is_refused_only_for_a_rule_it_cannot_be_served_under() {
         "shares",
         "ingress-owner",
         "counters-window",
-        "graph-workers",
         "breaker-width",
         "queue-cycle",
         "a-rule-that-does-not-exist-yet",

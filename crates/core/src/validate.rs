@@ -114,13 +114,22 @@ fn p(rule: &'static str, detail: String) -> Problem {
 /// rule was added to stop the NEXT declare, not to stop this one.
 ///
 /// So a rule stops a stored document only when the plan cannot be built or
-/// addressed at all: no nodes, no paths, or a name that cannot become a queue
-/// name and a kv key. Everything else is logged and kept running, and the next
-/// caller declare still has to fix it.
+/// addressed at all — no nodes, no paths, or a name that cannot become a queue
+/// name and a kv key — or when starting it would exhaust the replica before it
+/// served anything (`graph-workers`): a WARN written while the process runs out
+/// of task slots is not a graph kept running, and it takes every other graph on
+/// the replica down with it. Everything else is logged and kept running, and
+/// the next caller declare still has to fix it.
 pub fn refuses_stored_document(rule: &str) -> bool {
     matches!(
         rule,
-        "nodes" | "paths" | "application" | "graph-name" | "node-name" | "path-name"
+        "nodes"
+            | "paths"
+            | "application"
+            | "graph-name"
+            | "node-name"
+            | "path-name"
+            | "graph-workers"
     )
 }
 
