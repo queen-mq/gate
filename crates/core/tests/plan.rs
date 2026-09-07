@@ -236,6 +236,37 @@ fn a_convergence_derives_even_without_a_fanout() {
     );
 }
 
+/// Ownership on a shared interior queue is encoded in `_gate.path`. The
+/// immediate writers must therefore know that an unstampable payload cannot be
+/// forwarded there; unrelated fan-out branches and linear hops do not inherit
+/// that restriction.
+#[test]
+fn only_destinations_with_multiple_readers_require_a_path_stamp() {
+    let p = compile(&airbnb());
+    let photos = p.stage("photos", "photos").unwrap();
+    let ip = photos.destinations.iter().find(|d| d.node == "ip").unwrap();
+    let audit = photos
+        .destinations
+        .iter()
+        .find(|d| d.node == "audit")
+        .unwrap();
+    assert!(ip.requires_stamp, "three path groups read ip.in");
+    assert!(!audit.requires_stamp, "only one path group reads audit.in");
+
+    let chain: gate_core::GraphDoc = serde_json::from_str(
+        r#"{"application":"a","graph":"g","version":1,
+            "nodes":{"one":{"ingress":true,"budgets":[{"id":"b","count":100,"timeMs":1000}]},
+                     "two":{"budgets":[{"id":"b","count":100,"timeMs":1000}],"egress":"a.g.out"}},
+            "paths":[{"name":"main","nodes":["one","two"]}]}"#,
+    )
+    .unwrap();
+    let chain = compile(&chain);
+    assert!(
+        !chain.stage("main", "one").unwrap().destinations[0].requires_stamp,
+        "one reader needs no ownership stamp"
+    );
+}
+
 // ---------------------------------------------------------------- ceilings
 
 /// Priority is a per-path `max` on ONE counter. The top half of `ip` is an
