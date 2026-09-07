@@ -212,9 +212,13 @@ pub fn spawn_counters(app: api::Shared) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut last: HashMap<String, (u64, u64, u64)> = HashMap::new();
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(
+                gate_core::COUNTERS_WINDOW_SECONDS.into(),
+            ))
+            .await;
             let now = now_ms();
-            let minute = now / 60_000 * 60_000;
+            let window_ms = i64::from(gate_core::COUNTERS_WINDOW_SECONDS) * 1_000;
+            let minute = now / window_ms * window_ms;
 
             if let Some(h) = app.history.as_ref() {
                 for g in app.registry.all() {

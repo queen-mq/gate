@@ -36,7 +36,7 @@ mod common;
 
 use common::{airbnb, rules};
 use gate_core::doc::{Egress, Ingress, PathElem};
-use gate_core::{validate, warnings, GraphDoc};
+use gate_core::{validate, warnings, Counters, GraphDoc};
 
 /// The single most valuable test in the file: the flagship fixture must validate
 /// clean, in the new vocabulary. If it cannot, the schema is wrong.
@@ -80,6 +80,17 @@ fn broken(f: impl FnOnce(&mut GraphDoc)) -> Vec<&'static str> {
     let mut doc = airbnb();
     f(&mut doc);
     rules(&validate(&doc))
+}
+
+#[test]
+fn counters_only_accept_the_window_the_runtime_emits() {
+    assert!(
+        broken(|d| d.counters = Some(Counters { window_seconds: 30 })).contains(&"counters-window")
+    );
+    assert!(
+        !broken(|d| d.counters = Some(Counters { window_seconds: 60 }))
+            .contains(&"counters-window")
+    );
 }
 
 // -------------------------------------------------------------------- naming
