@@ -123,7 +123,7 @@ pub async fn view(
     let waiting_for_budget: u64 = app
         .depths
         .pending_of_group(&app.queen, &stage.source, &stage.group)
-        .await
+        .await?
         .values()
         .sum();
 
@@ -137,7 +137,7 @@ pub async fn view(
                 worker_group_known = true;
                 app.depths
                     .pending_of_group(&app.queen, q, g)
-                    .await
+                    .await?
                     .values()
                     .sum()
             }
@@ -145,7 +145,7 @@ pub async fn view(
             // it is at or above the group being asked about: it can only make
             // the answer later, never earlier, which is the safe direction for a
             // bound.
-            None => app.depths.pending(&app.queen, q).await.values().sum(),
+            None => app.depths.pending(&app.queen, q).await?.values().sum(),
         };
     }
 

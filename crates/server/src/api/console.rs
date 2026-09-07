@@ -165,7 +165,7 @@ pub async fn list_targets(State(app): State<Shared>) -> ApiResult {
             backlog += app
                 .depths
                 .pending_of_group(&app.queen, &s.stage.source, &s.stage.group)
-                .await
+                .await?
                 .values()
                 .sum::<u64>();
         }
@@ -275,7 +275,7 @@ pub async fn list_graphs(State(st): State<Shared>) -> ApiResult {
                 waiting += st
                     .depths
                     .pending_of_group(&st.queen, &s.stage.source, &s.stage.group)
-                    .await
+                    .await?
                     .values()
                     .sum::<u64>();
                 admitted += s
@@ -596,7 +596,7 @@ pub async fn app_metrics(
                 let budget_pending: u64 = app
                     .depths
                     .pending_of_group(&app.queen, &s.stage.source, &s.stage.group)
-                    .await
+                    .await?
                     .values()
                     .sum();
                 waiting_budget += budget_pending;
@@ -634,10 +634,10 @@ pub async fn app_metrics(
                     Some(gr) => app
                         .depths
                         .pending_of_group(&app.queen, q, gr)
-                        .await
+                        .await?
                         .values()
                         .sum(),
-                    None => app.depths.pending(&app.queen, q).await.values().sum(),
+                    None => app.depths.pending(&app.queen, q).await?.values().sum(),
                 };
             }
 
