@@ -128,12 +128,21 @@ impl History {
     /// Add one minute's increments. Two replicas writing the same minute is the
     /// normal case, not a race: they saw different halves of the traffic, and
     /// the row is the sum.
-    pub async fn add(&self, app: &str, target: &str, minute: i64, lanes: &HashMap<String, Bucket>) {
-        let Ok(client) = self.pool.get().await else {
-            return;
+    pub async fn add(
+        &self,
+        app: &str,
+        target: &str,
+        minute: i64,
+        lanes: &HashMap<String, Bucket>,
+    ) -> bool {
+        let Ok(mut client) = self.pool.get().await else {
+            return false;
+        };
+        let Ok(tx) = client.transaction().await else {
+            return false;
         };
         for (lane, b) in lanes {
-            let _ = client
+            if tx
                 .execute(
                     "INSERT INTO gate.rollups
                        (application, target, lane, minute, admitted, denied, calls, throttled, cost_est, cost_actual)
@@ -152,8 +161,13 @@ impl History {
                         &b.cost_estimated, &b.cost_actual,
                     ],
                 )
-                .await;
+                .await
+                .is_err()
+            {
+                return false;
+            }
         }
+        tx.commit().await.is_ok()
     }
 
     pub async fn rollups(&self, app: &str, target: &str, minutes: i64) -> Vec<Value> {
@@ -319,15 +333,18 @@ impl History {
             .collect()
     }
 
-    pub async fn add_traces(&self, rows: &[crate::obs::Trace]) {
+    pub async fn add_traces(&self, rows: &[crate::obs::Trace]) -> bool {
         if rows.is_empty() {
-            return;
+            return true;
         }
-        let Ok(client) = self.pool.get().await else {
-            return;
+        let Ok(mut client) = self.pool.get().await else {
+            return false;
+        };
+        let Ok(tx) = client.transaction().await else {
+            return false;
         };
         for t in rows {
-            let _ = client
+            if tx
                 .execute(
                     "INSERT INTO gate.traces (at, application, target, lane, op, outcome, budget_id, calls)
                      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
@@ -336,8 +353,13 @@ impl History {
                         &t.path, &t.op, &t.outcome, &t.budget_id, &0i64,
                     ],
                 )
-                .await;
+                .await
+                .is_err()
+            {
+                return false;
+            }
         }
+        tx.commit().await.is_ok()
     }
 
     pub async fn traces(&self, outcome: Option<&str>, limit: i64) -> Vec<Value> {
