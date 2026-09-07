@@ -399,6 +399,7 @@ pub async fn flow(State(app): State<Shared>, Query(q): Query<FlowQuery>) -> ApiR
         utilisation: f64,
         target: String,
         admitted: i64,
+        cost: f64,
         ceiling: f64,
         total: i64,
     }
@@ -406,14 +407,15 @@ pub async fn flow(State(app): State<Shared>, Query(q): Query<FlowQuery>) -> ApiR
     let mut minute_set: BTreeSet<i64> = BTreeSet::new();
 
     let history = h.flow(minutes, now).await.map_err(history_failure)?;
-    for (application, target, minute, admitted) in history {
+    for (application, target, minute, admitted, cost) in history {
         minute_set.insert(minute);
         let cap = ceiling.get(&(application.clone(), target.clone())).copied();
-        let u = cap.map_or(0.0, |c| admitted as f64 / c);
+        let u = cap.map_or(0.0, |c| cost / c);
         let e = cells.entry((application.clone(), minute)).or_insert(Cell {
             utilisation: 0.0,
             target: target.clone(),
             admitted: 0,
+            cost: 0.0,
             ceiling: cap.unwrap_or(0.0),
             total: 0,
         });
@@ -422,6 +424,7 @@ pub async fn flow(State(app): State<Shared>, Query(q): Query<FlowQuery>) -> ApiR
             e.utilisation = u;
             e.target = target;
             e.admitted = admitted;
+            e.cost = cost;
             e.ceiling = cap.unwrap_or(0.0);
         }
     }
@@ -436,12 +439,14 @@ pub async fn flow(State(app): State<Shared>, Query(q): Query<FlowQuery>) -> ApiR
                 .map(|t| match cells.get(&(a.clone(), *t)) {
                     Some(c) => json!({
                         "t": t, "utilisation": c.utilisation, "target": c.target,
-                        "admitted": c.admitted, "ceiling": c.ceiling, "total_admitted": c.total,
+                        "admitted": c.admitted, "cost": c.cost,
+                        "ceiling": c.ceiling, "total_admitted": c.total,
                     }),
                     // A minute an application did not appear in is a minute it
                     // admitted nothing, which is a real zero and not a gap.
                     None => {
-                        json!({ "t": t, "utilisation": 0.0, "admitted": 0, "total_admitted": 0 })
+                        json!({ "t": t, "utilisation": 0.0, "admitted": 0,
+                                "cost": 0.0, "total_admitted": 0 })
                     }
                 })
                 .collect();

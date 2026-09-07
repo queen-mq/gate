@@ -326,7 +326,8 @@ impl History {
     // counter now, so N ceilings cannot oversubscribe it, and the whole argument
     // evaporates with the feature.
 
-    /// Admissions per minute for every target, over the last `minutes`.
+    /// Admissions and admitted cost per minute for every target, over the last
+    /// `minutes`.
     ///
     /// One query for the whole deployment rather than one per target: the
     /// dashboard draws every application at once, and N round trips to draw one
@@ -335,7 +336,7 @@ impl History {
         &self,
         minutes: i64,
         now_ms: i64,
-    ) -> Result<Vec<(String, String, i64, i64)>, String> {
+    ) -> Result<Vec<(String, String, i64, i64, f64)>, String> {
         let client = self
             .pool
             .get()
@@ -344,7 +345,9 @@ impl History {
         let since = now_ms / 60_000 * 60_000 - minutes * 60_000;
         let rows = client
             .query(
-                "SELECT application, target, minute, COALESCE(SUM(admitted), 0)::BIGINT
+                "SELECT application, target, minute,
+                        COALESCE(SUM(admitted), 0)::BIGINT,
+                        COALESCE(NULLIF(SUM(cost_est), 0), SUM(admitted)::DOUBLE PRECISION, 0)
                  FROM gate.rollups WHERE minute >= $1
                  GROUP BY application, target, minute
                  ORDER BY minute",
@@ -362,6 +365,8 @@ impl History {
                 r.try_get::<_, i64>(2)
                     .map_err(|e| format!("history flow row: {e}"))?,
                 r.try_get::<_, i64>(3)
+                    .map_err(|e| format!("history flow row: {e}"))?,
+                r.try_get::<_, f64>(4)
                     .map_err(|e| format!("history flow row: {e}"))?,
             ));
         }
