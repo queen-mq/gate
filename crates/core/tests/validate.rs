@@ -206,6 +206,14 @@ fn the_window_floor_is_a_hundred_milliseconds() {
 }
 
 #[test]
+fn warning_about_an_extreme_window_does_not_overflow() {
+    let mut doc = airbnb();
+    doc.nodes.get_mut("audit").unwrap().budgets[0].time_ms = i64::MAX;
+    let got = rules(&warnings(&doc));
+    assert!(got.contains(&"window-sub-second"), "{got:?}");
+}
+
+#[test]
 fn one_id_declared_twice_would_spend_one_counter() {
     let got = broken(|d| {
         let n = d.nodes.get_mut("photos").unwrap();

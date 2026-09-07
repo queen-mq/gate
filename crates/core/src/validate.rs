@@ -673,8 +673,12 @@ pub fn warnings_with(doc: &GraphDoc, facts: &ExternalFacts) -> Vec<Problem> {
             // RATE than declared**, never a looser one, which is the safe way to
             // be wrong — but neither is what the caller wrote down, so both are
             // said out loud.
-            let enforced_ms = cb.window_sub_seconds * 1000 * cb.sub_windows as i64;
-            if enforced_ms != b.time_ms {
+            // A valid declaration may use the whole i64 range for `timeMs`.
+            // Rounding each sub-window up can make the reconstructed duration
+            // slightly larger than i64::MAX, so compare in i128 instead of
+            // panicking while preparing a warning after the graph is live.
+            let enforced_ms = (cb.window_sub_seconds as i128) * 1000 * (cb.sub_windows as i128);
+            if enforced_ms != b.time_ms as i128 {
                 out.push(p(
                     "window-sub-second",
                     format!(
