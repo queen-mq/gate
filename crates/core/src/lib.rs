@@ -35,5 +35,5 @@ pub use plan::{
 };
 pub use validate::{
     needs_version_bump, refuses_stored_document, validate, validate_with, warnings, warnings_with,
-    ExternalFacts, Problem, QueueFacts,
+    ExternalFacts, Problem, QueueFacts, MAX_BREAKER_COUNTERS,
 };
