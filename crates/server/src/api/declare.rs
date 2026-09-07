@@ -378,7 +378,7 @@ pub async fn view(st: &Shared, rt: &Arc<GraphRuntime>) -> queen_mq::Result<Value
             waiting_for_budget += st
                 .depths
                 .pending_of_group(&st.queen, &s.stage.source, &s.stage.group)
-                .await
+                .await?
                 .values()
                 .sum::<u64>();
         }
@@ -387,13 +387,13 @@ pub async fn view(st: &Shared, rt: &Arc<GraphRuntime>) -> queen_mq::Result<Value
             (Some(queue), Some(group)) => st
                 .depths
                 .pending_of_group(&st.queen, queue, group)
-                .await
+                .await?
                 .values()
                 .sum::<u64>(),
             (Some(queue), None) => st
                 .depths
                 .pending(&st.queen, queue)
-                .await
+                .await?
                 .values()
                 .sum::<u64>(),
             (None, _) => 0,
