@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use axum::extract::{Query, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use jsonwebtoken::{
     decode, decode_header, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation,
@@ -39,6 +39,8 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 /// The signed `state` only has to survive one round trip through Google.
 const STATE_TTL_S: i64 = 300;
 pub const COOKIE: &str = "gate_session";
+const OAUTH_STATE_COOKIE: &str = "gate_oauth_state";
+const OAUTH_CALLBACK_PATH: &str = "/api/auth/google/callback";
 
 #[derive(Clone)]
 pub struct AuthConfig {
@@ -372,12 +374,24 @@ pub async fn login(
         // returned token is checked and this is not.
         urlencode(auth.cfg.allowed_domains.first().map(String::as_str).unwrap_or("")),
     );
-    Redirect::to(&url).into_response()
+    let secure = auth.cfg.public_url.starts_with("https://");
+    let mut response = Redirect::to(&url).into_response();
+    let cookie = oauth_state_cookie(&state, STATE_TTL_S, secure);
+    let Ok(cookie) = HeaderValue::from_str(&cookie) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not bind the OAuth state",
+        )
+            .into_response();
+    };
+    response.headers_mut().append(header::SET_COOKIE, cookie);
+    response
 }
 
 pub async fn callback(
     State(app): State<crate::api::Shared>,
     Query(q): Query<HashMap<String, String>>,
+    headers: HeaderMap,
 ) -> Response {
     let Some(auth) = app.auth.as_ref() else {
         return (StatusCode::NOT_FOUND, "sign-in is not configured").into_response();
@@ -385,6 +399,18 @@ pub async fn callback(
     let (Some(code), Some(state)) = (q.get("code"), q.get("state")) else {
         return (StatusCode::BAD_REQUEST, "missing code or state").into_response();
     };
+
+    // A signature proves that Gate minted the state; it does not prove that
+    // THIS browser initiated the transaction. Without this binding an attacker
+    // can complete their own Google login and make a victim visit the callback,
+    // replacing the victim's session with the attacker's identity (login CSRF).
+    if cookie_value(&headers, OAUTH_STATE_COOKIE) != Some(state.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "invalid or expired OAuth transaction",
+        )
+            .into_response();
+    }
 
     let mut v = Validation::new(Algorithm::HS256);
     v.set_required_spec_claims(&["exp"]);
@@ -474,11 +500,18 @@ pub async fn callback(
         8 * 3600,
         if secure { "; Secure" } else { "" }
     );
-    (
+    let mut response = (
         StatusCode::SEE_OTHER,
         [(header::SET_COOKIE, cookie), (header::LOCATION, next)],
     )
-        .into_response()
+        .into_response();
+    // One transaction, one use. Matching the original Path is required for the
+    // browser to remove the cookie rather than leaving a replayable binding
+    // behind for the rest of its five-minute lifetime.
+    if let Ok(clear) = HeaderValue::from_str(&oauth_state_cookie("", 0, secure)) {
+        response.headers_mut().append(header::SET_COOKIE, clear);
+    }
+    response
 }
 
 pub async fn logout() -> Response {
@@ -496,13 +529,24 @@ pub async fn logout() -> Response {
 }
 
 pub fn session_of(headers: &axum::http::HeaderMap, auth: &Auth) -> Option<Session> {
-    let raw = headers.get(header::COOKIE)?.to_str().ok()?;
-    let token = raw
-        .split(';')
-        .filter_map(|c| c.trim().split_once('='))
-        .find(|(k, _)| *k == COOKIE)
-        .map(|(_, v)| v)?;
+    let token = cookie_value(headers, COOKIE)?;
     auth.verify_session(token)
+}
+
+fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    let raw = headers.get(header::COOKIE)?.to_str().ok()?;
+    raw.split(';')
+        .filter_map(|c| c.trim().split_once('='))
+        .find(|(k, _)| *k == name)
+        .map(|(_, v)| v)
+}
+
+fn oauth_state_cookie(value: &str, max_age: i64, secure: bool) -> String {
+    format!(
+        "{OAUTH_STATE_COOKIE}={value}; Path={OAUTH_CALLBACK_PATH}; HttpOnly; SameSite=Lax; \
+         Max-Age={max_age}{}",
+        if secure { "; Secure" } else { "" }
+    )
 }
 
 /// A signed-in identity conjured without Google, for running the console on a
@@ -631,7 +675,9 @@ fn urlencode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::safe_next;
+    use axum::http::{header, HeaderMap, HeaderValue};
+
+    use super::{cookie_value, oauth_state_cookie, safe_next, OAUTH_STATE_COOKIE};
 
     #[test]
     fn oauth_next_accepts_only_local_absolute_paths() {
@@ -649,5 +695,38 @@ mod tests {
             assert_eq!(safe_next(Some(path)), "/", "accepted {path:?}");
         }
         assert_eq!(safe_next(None), "/");
+    }
+
+    #[test]
+    fn oauth_state_is_bound_to_the_browser_that_started_it() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(cookie_value(&headers, OAUTH_STATE_COOKIE), None);
+
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("other=x; gate_oauth_state=signed-state"),
+        );
+        assert_eq!(
+            cookie_value(&headers, OAUTH_STATE_COOKIE),
+            Some("signed-state")
+        );
+        assert_ne!(
+            cookie_value(&headers, OAUTH_STATE_COOKIE),
+            Some("attacker-state")
+        );
+    }
+
+    #[test]
+    fn oauth_state_cookie_is_short_lived_scoped_and_secure_in_production() {
+        let cookie = oauth_state_cookie("signed-state", 300, true);
+        assert!(cookie.starts_with("gate_oauth_state=signed-state;"));
+        assert!(cookie.contains("Path=/api/auth/google/callback"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Lax"));
+        assert!(cookie.contains("Max-Age=300"));
+        assert!(cookie.ends_with("; Secure"));
+
+        let cleared = oauth_state_cookie("", 0, true);
+        assert!(cleared.contains("Max-Age=0"));
     }
 }
