@@ -93,6 +93,7 @@ mod tests {
 
     #[tokio::test]
     async fn favicon_is_embedded_and_revalidated() {
+        let expected = Assets::get("assets/gate-favicon.ico").expect("favicon must be embedded");
         let response = favicon(HeaderMap::new()).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[header::CACHE_CONTROL], "no-cache");
@@ -101,9 +102,10 @@ mod tests {
             .unwrap()
             .starts_with("image/"));
         let etag = response.headers()[header::ETAG].clone();
-        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+        let bytes = axum::body::to_bytes(response.into_body(), expected.data.len())
             .await
             .unwrap();
+        assert_eq!(bytes.as_ref(), expected.data.as_ref());
         assert_eq!(&bytes[..4], &[0, 0, 1, 0], "must serve an ICO, not the SPA");
 
         let mut headers = HeaderMap::new();
