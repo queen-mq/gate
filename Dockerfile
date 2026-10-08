@@ -20,6 +20,10 @@ RUN npm run build
 # ------------------------------------------------------------------ the gate
 FROM rust:1-bookworm AS server-builder
 
+# Multi-platform builds run Cargo concurrently. Keep each architecture's
+# registry extraction and compiled artefacts in separate, locked caches.
+ARG TARGETARCH
+
 WORKDIR /usr/build
 
 # Manifests first, then `cargo fetch`, so a source-only change re-uses the
@@ -40,7 +44,8 @@ RUN mkdir -p crates/core/src crates/server/src crates/e2e/src crates/bench/src \
     && echo "fn main() {}" > crates/server/src/main.rs \
     && echo "fn main() {}" > crates/e2e/src/main.rs \
     && echo "fn main() {}" > crates/bench/src/main.rs
-RUN --mount=type=cache,target=/usr/local/cargo/registry cargo fetch --locked
+RUN --mount=type=cache,id=gate-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry,sharing=locked \
+    cargo fetch --locked
 
 COPY crates ./crates
 
@@ -50,8 +55,8 @@ COPY crates ./crates
 # instead of silently serving the previous one.
 COPY --from=ui-builder /app/ui/dist ./ui/dist
 
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/build/target \
+RUN --mount=type=cache,id=gate-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=gate-cargo-target-${TARGETARCH},target=/usr/build/target,sharing=locked \
     cargo build --release --bin gate-server && cp target/release/gate-server /gate-server
 
 # ---------------------------------------------------------------- the runtime
