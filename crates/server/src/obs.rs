@@ -84,6 +84,23 @@ pub struct StageCounters {
 }
 
 impl StageCounters {
+    /// Record admitted cost without wrapping or losing concurrent updates.
+    pub fn add_cost(&self, cost: u64) {
+        // A CAS loop keeps this compatible with the workspace's Rust 1.88 MSRV.
+        let mut current = self.cost.load(Ordering::Relaxed);
+        loop {
+            match self.cost.compare_exchange_weak(
+                current,
+                current.saturating_add(cost),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(value) => current = value,
+            }
+        }
+    }
+
     pub fn view(&self) -> Value {
         let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
         let forwarded = g(&self.forwarded);
@@ -274,6 +291,37 @@ impl Traces {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admitted_cost_saturates_instead_of_wrapping() {
+        let counters = StageCounters::default();
+        counters.add_cost(0);
+        assert_eq!(counters.view()["costAdmitted"], 0);
+        counters.add_cost(u64::MAX - 1);
+        counters.add_cost(2);
+        assert_eq!(counters.view()["costAdmitted"], u64::MAX);
+        counters.add_cost(1);
+        assert_eq!(counters.view()["costAdmitted"], u64::MAX);
+    }
+
+    #[test]
+    fn concurrent_admissions_preserve_every_cost_update() {
+        let counters = StageCounters::default();
+        let start = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for cost in 1..=8 {
+                let counters = &counters;
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    for _ in 0..1_000 {
+                        counters.add_cost(cost);
+                    }
+                });
+            }
+        });
+        assert_eq!(counters.view()["costAdmitted"], 36_000);
+    }
 
     fn trace(at: i64) -> Trace {
         Trace {

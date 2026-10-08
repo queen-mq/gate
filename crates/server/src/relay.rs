@@ -1163,13 +1163,7 @@ async fn stage_and_commit(
             st.counters.admitted.fetch_add(forwarded, Ordering::Relaxed);
             st.counters.foreign.fetch_add(foreign, Ordering::Relaxed);
             st.counters.commits.fetch_add(1, Ordering::Relaxed);
-            let delta = cost.max(0) as u64;
-            let _ = st
-                .counters
-                .cost
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                    Some(value.saturating_add(delta))
-                });
+            st.counters.add_cost(cost.max(0) as u64);
             // The cursor moved, so whatever was being counted at the old head is
             // over. The head comparison in `note_failed_settle` would notice on
             // its own; this keeps the count honest without waiting for a second
@@ -1254,12 +1248,7 @@ async fn settle_head(ctx: &Ctx, m: &Message, kind: &Kind) -> bool {
             // admission and not the cost measures a node as idler than it is.
             // Utilisation is read from this number.
             let cost = cost_of(&st.node.cost, &m.data).unwrap_or(1).max(0) as u64;
-            let _ = st
-                .counters
-                .cost
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                    Some(value.saturating_add(cost))
-                });
+            st.counters.add_cost(cost);
             true
         }
         // Already downstream: settle it and move on. It does NOT count as
