@@ -3,6 +3,7 @@ import { createRouter, createWebHashHistory } from 'vue-router'
 import App from './App.vue'
 import { api, DEFAULT_APP } from './lib/api.js'
 import './style.css'
+import './components/dashboard/dashboard.css'
 
 /*
   A graph's identity is the pair `(application, name)`: two teams may both own

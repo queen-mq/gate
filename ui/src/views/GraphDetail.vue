@@ -17,7 +17,7 @@
 import { ref, computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import PageHeader from '../components/PageHeader.vue'
-import GraphDiagram from '../components/GraphDiagram.vue'
+import SpatialGraph from '../components/dashboard/SpatialGraph.vue'
 import CeilingBar from '../components/CeilingBar.vue'
 import StatusDot from '../components/StatusDot.vue'
 import Metric from '../components/Metric.vue'
@@ -65,36 +65,6 @@ watch(() => [props.app, props.name], () => {
 const nodes = computed(() => graph.value?.nodes ?? [])
 const stages = computed(() => graph.value?.stages ?? [])
 const paths = computed(() => graph.value?.paths ?? [])
-
-/* The edges every path implies, for the diagram. The document says paths; the
-   picture wants pairs, and deriving them here keeps the server's topology route
-   free of a second shape that has to agree with this one. */
-const edges = computed(() => {
-  const out = []
-  const seen = new Set()
-  for (const p of paths.value) {
-    const hops = p.hops ?? []
-    for (let i = 0; i + 1 < hops.length; i++) {
-      for (const from of split(hops[i])) {
-        for (const to of split(hops[i + 1])) {
-          const k = `${from}->${to}`
-          if (!seen.has(k)) {
-            seen.add(k)
-            out.push({ from, to, priority: p.priority ?? 0 })
-          }
-        }
-      }
-    }
-  }
-  return out
-})
-
-/* A hop is either a node name or `[a, b]` — a fan-out. */
-function split(hop) {
-  const s = String(hop ?? '')
-  if (!s.startsWith('[')) return [s]
-  return s.slice(1, -1).split(',').map((x) => x.trim()).filter(Boolean)
-}
 
 function stagesOf(node) {
   return stages.value.filter((s) => s.node === node)
@@ -267,19 +237,9 @@ async function remove() {
         </div>
       </section>
 
-      <section class="mt-8 rounded-lg border border-line bg-surface p-5">
-        <GraphDiagram :nodes="nodes.map((n) => ({
-                        name: n.node,
-                        entry: !!n.ingressQueue,
-                        consume: !!n.egressQueue,
-                        running: graph.running,
-                        paths: n.paths ?? [],
-                        budgets: n.budgets ?? [],
-                        waiting_for_budget: n.waiting_for_budget,
-                        waiting_for_workers: n.waiting_for_workers,
-                      }))"
-                      :edges="edges" />
-      </section>
+      <div class="mt-7">
+        <SpatialGraph :graph="graph" :highlighted-path="selected" />
+      </div>
 
       <!-- ----------------------------------------------------- paths -->
       <section class="mt-10">

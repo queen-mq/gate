@@ -15,10 +15,10 @@
 */
 import { computed } from 'vue'
 import GateBrand from '../components/GateBrand.vue'
-import Icon from '../components/Icon.vue'
+import ThemeSelector from '../components/ThemeSelector.vue'
 
-defineProps({ dark: Boolean })
-const emit = defineEmits(['toggle-theme'])
+defineProps({ theme: { type: String, default: 'system' } })
+const emit = defineEmits(['update:theme'])
 
 const loginUrl = computed(() => {
   const here = window.location.hash?.slice(1) || '/'
@@ -31,11 +31,7 @@ const loginUrl = computed(() => {
 
 <template>
   <div class="min-h-screen grid place-items-center px-6 py-16 relative">
-    <button type="button" class="icon-button absolute right-5 top-4"
-            :aria-label="dark ? 'Switch to light theme' : 'Switch to dark theme'"
-            :title="dark ? 'Switch to light theme' : 'Switch to dark theme'" @click="emit('toggle-theme')">
-      <Icon :name="dark ? 'sun' : 'moon'" :size="16" />
-    </button>
+    <ThemeSelector class="absolute right-5 top-4" :model-value="theme" @update:model-value="emit('update:theme', $event)" />
     <div class="w-full max-w-[380px] text-center">
       <GateBrand variant="full" class="mx-auto mb-8" />
       <div class="card px-6 py-7 sm:px-8">

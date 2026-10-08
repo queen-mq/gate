@@ -62,6 +62,7 @@ const durable = computed(() => data.value?.durable !== false)
    one chart has outgrown a chart, and the honest fix is a filter rather than a
    seventh hue nobody can tell from the second. */
 const colour = (i) => `var(--series-${(i % 6) + 1})`
+const pattern = (i) => [undefined, '7 3', '2 3', '9 3 2 3', '4 3', '12 4'][i % 6]
 
 const W = 760
 const H = 220
@@ -111,7 +112,17 @@ const xLabels = computed(() => {
    The legend shows the same fields either way, so the eye does not have to
    re-learn the row when the pointer lands. */
 const hover = ref(null)
-const at = computed(() => (hover.value ?? minutes.value.length - 1))
+const at = computed(() => Math.max(0, Math.min(hover.value ?? minutes.value.length - 1, minutes.value.length - 1)))
+
+function onKey(event) {
+  if (!minutes.value.length) return
+  if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+    event.preventDefault()
+    hover.value = Math.max(0, Math.min(minutes.value.length - 1,
+      at.value + (event.key === 'ArrowLeft' ? -1 : 1)))
+  }
+  if (event.key === 'Escape') hover.value = null
+}
 
 function onMove(ev) {
   const n = minutes.value.length
@@ -140,7 +151,7 @@ function toneOf(u) {
 </script>
 
 <template>
-  <section v-if="error || data !== null" class="mb-8">
+  <section class="mb-8">
     <div class="flex items-baseline justify-between mb-3 gap-4 flex-wrap">
       <div>
         <h2 class="section-title mb-0">Flow against the limit</h2>
@@ -165,10 +176,16 @@ function toneOf(u) {
 
     <div v-else-if="data === undefined" class="card px-6 py-10"><div class="skeleton h-32 w-full" /></div>
 
+    <div v-else-if="data === null" class="card px-6 py-12 text-center">
+      <p class="text-[14px] text-fg-2">Capacity history will appear here.</p>
+      <p class="text-[12px] text-fg-3 mt-2">No samples were returned for this range. Graph counters must be enabled to record history.</p>
+    </div>
+
     <div v-else class="card px-4 py-5 sm:px-6">
       <svg
         :viewBox="`0 0 ${W} ${H}`" class="w-full h-auto" role="img"
-        aria-label="Utilisation of every application over time"
+        aria-label="Utilisation of every application over time. Use arrow keys to inspect a minute."
+        tabindex="0" @keydown="onKey" @blur="hover = null"
         @mousemove="onMove" @mouseleave="hover = null"
       >
         <!-- The cap solid, 85% dashed: the two thresholds every gauge in this
@@ -189,6 +206,7 @@ function toneOf(u) {
         <path
           v-for="(s, i) in series" :key="s.application"
           :d="path(s)" fill="none" :stroke="colour(i)"
+          :stroke-dasharray="pattern(i)"
           stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"
         />
 

@@ -4,13 +4,15 @@ import { useRoute } from 'vue-router'
 import Icon from './components/Icon.vue'
 import GateBrand from './components/GateBrand.vue'
 import SignIn from './views/SignIn.vue'
+import ThemeSelector from './components/ThemeSelector.vue'
+import { useTheme } from './lib/theme.js'
 import { api, authState, authError, me, fetchMe, isAdmin, READ_ONLY_NOTE } from './lib/api.js'
 import { usePoll } from './lib/poll.js'
 
 const route = useRoute()
 const overview = ref(null)
 const overviewError = ref(false)
-const dark = ref(document.documentElement.classList.contains('dark'))
+const { theme } = useTheme()
 const mobileNav = ref(false)
 const drawerQuery = window.matchMedia('(max-width: 1023px)')
 const mobileViewport = ref(drawerQuery.matches)
@@ -48,12 +50,6 @@ const groups = [
     ],
   },
 ]
-
-function toggleTheme() {
-  dark.value = !dark.value
-  document.documentElement.classList.toggle('dark', dark.value)
-  try { localStorage.setItem('gate-theme', dark.value ? 'dark' : 'light') } catch {}
-}
 
 function toggleRail() {
   rail.value = !rail.value
@@ -170,7 +166,7 @@ const warnings = computed(() => {
     <span class="text-xs text-fg-3">Loading console…</span>
   </div>
 
-  <SignIn v-else-if="authState === 'login'" :dark="dark" @toggle-theme="toggleTheme" />
+  <SignIn v-else-if="authState === 'login'" :theme="theme" @update:theme="theme = $event" />
 
   <div v-else-if="authState === 'error'" class="min-h-screen grid place-items-center px-6">
     <div class="card w-full max-w-[440px] px-7 py-8 text-center">
@@ -275,11 +271,7 @@ const warnings = computed(() => {
             <span class="status-glyph" :class="brokerState === 'connected' ? 'good' : brokerState === 'down' ? 'bad' : 'muted'" />
             <span class="sr-only sm:not-sr-only" :class="brokerState === 'down' ? 'text-bad' : ''">{{ brokerLabel }}</span>
           </span>
-          <button type="button" class="icon-button"
-                  :aria-label="dark ? 'Switch to light theme' : 'Switch to dark theme'"
-                  :title="dark ? 'Switch to light theme' : 'Switch to dark theme'" @click="toggleTheme">
-            <Icon :name="dark ? 'sun' : 'moon'" :size="16" />
-          </button>
+          <ThemeSelector v-model="theme" />
         </div>
       </header>
 
