@@ -48,6 +48,8 @@
   --color-bg: var(--bg);
   --color-surface: var(--surface);
   --color-surface-2: var(--surface-2);
+  --color-rail: var(--rail);
+  --color-selected: var(--selected);
   --color-fg: var(--text);
   --color-fg-2: var(--text-2);
   --color-fg-3: var(--text-3);
@@ -86,74 +88,74 @@
   }
 }
 
-/* ---------------------------------------------------------------- tokens
-   A strictly neutral scale (the queenmq.com / Vercel school): gray carries the
-   structure, hue appears only where it means state. Light and dark are one
-   class on <html>; nothing below this block knows which mode it is in.
-
-   The one hard rule: a token used as an AREA fill must be far enough from the
-   surface behind it. Pill-lightness tints (96%+) vanish as fills in light mode.
-   -dim tokens here are ~92% / ~25%. */
+/* Queen's dashboard palette: warm paper / warm black, flat surfaces, neutral
+   healthy states, amber attention and coral failures. Gate keeps its existing
+   token names so every gauge and diagram follows the same state language. */
 @layer base {
   :root {
-    --bg: oklch(98.6% 0 0);
-    --surface: oklch(100% 0 0);
-    --surface-2: oklch(96.8% 0 0);
-    --text: oklch(17% 0 0);
-    --text-2: oklch(48% 0 0);
-    --text-3: oklch(65% 0 0);
-    --border: oklch(92.5% 0 0);
-    --border-2: oklch(85% 0 0);
+    --rail: #e8e5e0;
+    --bg: #f2f0ec;
+    --surface: #f9f7f4;
+    --surface-2: #ebe7e1;
+    --input: #f1eee9;
+    --selected: #e2ded7;
+    --text: #1f1d1a;
+    --text-2: #4f4b45;
+    --text-3: #6c675f;
+    --border: #e0dcd6;
+    --border-2: #cfc9c1;
 
-    --link: oklch(50% 0.17 255);
-    --good: oklch(50% 0.13 152);
-    --good-dim: oklch(92.5% 0.05 152);
-    --warn: oklch(53% 0.12 70);
-    --warn-dim: oklch(93% 0.06 80);
-    --bad: oklch(51% 0.19 26);
-    --bad-dim: oklch(93.5% 0.045 26);
+    --link: #4f4b45;
+    --good: #6c675f;
+    --good-dim: #eeebe6;
+    --warn: #9a5b07;
+    --warn-dim: #f0e6d6;
+    --bad: #c6452e;
+    --bad-dim: #f3e4dc;
 
-    /* Categorical, for one line per application. Deliberately none of the
-       semantic hues: green, amber and red mean healthy, elevated and breached
-       everywhere else in this console, and a chart that spends them as identity
-       would have an application looking fine because of who it is. Read by name
-       from FlowChart.vue, so these stay plain variables and out of the theme. */
-    --series-1: oklch(50% 0.17 255);
-    --series-2: oklch(50% 0.16 300);
-    --series-3: oklch(48% 0.13 195);
-    --series-4: oklch(52% 0.16 330);
-    --series-5: oklch(46% 0.12 225);
-    --series-6: oklch(54% 0.14 275);
+    /* Application identity uses Queen's categorical chart palette, separate
+       from amber / coral state marks and the yellow in the brand asset. */
+    --series-1: #44689e;
+    --series-2: #6f4fa0;
+    --series-3: #2c7a6a;
+    --series-4: #9a4d73;
+    --series-5: #5b7a26;
+    --series-6: #557888;
 
-    --shadow-card: 0 1px 2px rgb(0 0 0 / 0.04);
+    --scrim: rgb(40 36 32 / 0.25);
+    color-scheme: light;
   }
 
   .dark {
-    --bg: oklch(9% 0 0);
-    --surface: oklch(12.3% 0 0);
-    --surface-2: oklch(16% 0 0);
-    --text: oklch(96% 0 0);
-    --text-2: oklch(63% 0 0);
-    --text-3: oklch(45% 0 0);
-    --border: oklch(20.5% 0 0);
-    --border-2: oklch(28.5% 0 0);
+    --rail: #000000;
+    --bg: #0b0a0a;
+    --surface: #111010;
+    --surface-2: #1c1b19;
+    --input: #171615;
+    --selected: #242220;
+    --text: #eeebe6;
+    --text-2: #aaa59e;
+    --text-3: #8f8a83;
+    --border: #1f1d1b;
+    --border-2: #34312e;
 
-    --link: oklch(72% 0.13 255);
-    --good: oklch(76% 0.15 152);
-    --good-dim: oklch(24% 0.055 152);
-    --warn: oklch(80% 0.13 80);
-    --warn-dim: oklch(25% 0.055 80);
-    --bad: oklch(70% 0.17 25);
-    --bad-dim: oklch(24.5% 0.06 25);
+    --link: #aaa59e;
+    --good: #8f8a83;
+    --good-dim: #1b1917;
+    --warn: #e8a849;
+    --warn-dim: #2a2116;
+    --bad: #f07a5f;
+    --bad-dim: #2c1c17;
 
-    --series-1: oklch(74% 0.14 255);
-    --series-2: oklch(74% 0.14 300);
-    --series-3: oklch(76% 0.12 195);
-    --series-4: oklch(75% 0.14 330);
-    --series-5: oklch(70% 0.11 225);
-    --series-6: oklch(78% 0.12 275);
+    --series-1: #7f9fd0;
+    --series-2: #b092d0;
+    --series-3: #6fb3a3;
+    --series-4: #d08fae;
+    --series-5: #a3b56f;
+    --series-6: #85a8b8;
 
-    --shadow-card: none;
+    --scrim: rgb(7 6 6 / 0.62);
+    color-scheme: dark;
   }
 
   html {
@@ -164,8 +166,10 @@
 
   body {
     @apply bg-bg text-fg font-sans;
-    font-size: 14px;
+    font-size: 13px;
     line-height: 1.55;
+    letter-spacing: -0.005em;
+    font-feature-settings: 'cv11', 'ss01', 'ss03', 'cv02';
   }
 
   /* v3 preflight gave these a pointer and v4 leaves them at the browser
@@ -175,7 +179,7 @@
     cursor: pointer;
   }
 
-  ::selection { background: var(--warn-dim); }
+  ::selection { background: var(--selected); }
 
   :focus-visible {
     outline: 2px solid var(--link);
@@ -191,16 +195,16 @@
 
 @layer components {
   .card {
-    @apply bg-surface border border-line rounded-xl;
-    box-shadow: var(--shadow-card);
+    @apply bg-surface border border-line rounded-lg;
   }
 
-  /* Buttons: monochrome primary (Vercel school), hairline secondary. */
+  /* Queen's control sizes and quiet monochrome primary. */
   .btn {
-    @apply inline-flex items-center justify-center gap-2 h-[34px] px-3.5 rounded-lg
-           border border-line-2 bg-surface text-fg text-[13px] font-medium select-none
+    @apply inline-flex items-center justify-center gap-1.5 h-[32px] px-3 rounded-md
+           border border-line-2 text-fg text-[12px] font-medium select-none
            transition-colors duration-100 hover:bg-surface-2
-           active:scale-[0.985] disabled:opacity-40 disabled:pointer-events-none;
+           disabled:opacity-40 disabled:pointer-events-none;
+    background: color-mix(in srgb, var(--text) 3%, transparent);
   }
   .btn-primary {
     @apply bg-fg text-bg border-transparent hover:bg-fg hover:opacity-88;
@@ -211,9 +215,10 @@
   .btn-sm { @apply h-[28px] px-2.5 text-xs rounded-md; }
 
   .input {
-    @apply w-full h-[36px] px-3 rounded-lg border border-line-2 bg-surface text-fg
-           text-[13.5px] placeholder:text-fg-3 transition-shadow
+    @apply w-full h-[32px] px-2.5 rounded-md border border-line-2 text-fg
+           text-[12.5px] placeholder:text-fg-3 transition-colors
            focus:outline-hidden focus:border-fg-3;
+    background: var(--input);
   }
   select.input {
     @apply pr-8 appearance-none bg-no-repeat;
@@ -244,5 +249,106 @@
     @apply rounded-sm animate-shimmer;
     background: linear-gradient(90deg, var(--surface-2) 25%, var(--border) 37%, var(--surface-2) 63%);
     background-size: 400% 100%;
+  }
+
+  .gate-brand { display: inline-flex; flex: none; }
+  .gate-brand img { display: block; width: 100%; height: auto; }
+  .gate-brand-compact { width: 112px; }
+  .gate-brand-full { width: 240px; }
+  .gate-brand-symbol { width: 36px; }
+  .gate-brand .gate-brand-dark { display: none; }
+  .dark .gate-brand .gate-brand-light { display: none; }
+  .dark .gate-brand .gate-brand-dark { display: block; }
+
+  .console-shell { --sidebar-width: 224px; }
+  .gate-sidebar {
+    position: fixed; inset: 0 auto 0 0; z-index: 40;
+    display: flex; flex-direction: column;
+    width: 224px; background: var(--rail); border-right: 1px solid var(--border);
+    transform: translateX(-100%);
+    transition: transform 0.18s var(--ease-spring), width 0.18s var(--ease-spring);
+  }
+  .gate-sidebar.is-open { transform: translateX(0); }
+  .sidebar-brand {
+    display: flex; align-items: center; justify-content: space-between;
+    height: 52px; padding: 0 14px; flex: none;
+  }
+  .sidebar-nav { flex: 1; overflow-y: auto; padding: 16px 8px; }
+  .nav-group + .nav-group { margin-top: 22px; }
+  .nav-label {
+    padding: 0 8px 6px; font-size: 11px; font-weight: 600; color: var(--text-2);
+  }
+  .nav-link {
+    display: flex; align-items: center; gap: 10px; height: 32px;
+    padding: 0 8px; margin-bottom: 2px; border-radius: 6px;
+    color: var(--text-2); font-size: 13px; white-space: nowrap;
+    transition: color 0.12s, background 0.12s;
+  }
+  .nav-link > svg { color: var(--text-3); }
+  .nav-link:hover { background: var(--surface); color: var(--text); }
+  .nav-link.is-active { background: var(--selected); color: var(--text); font-weight: 500; }
+  .nav-link:hover > svg, .nav-link.is-active > svg { color: var(--text); }
+  .sidebar-foot { flex: none; margin: 0 16px; padding: 14px 0 16px; border-top: 1px solid var(--border); }
+  .sidebar-rail-foot { display: none; }
+  .console-topbar {
+    height: 52px; position: sticky; top: 0; z-index: 20;
+    display: flex; align-items: center; gap: 12px; padding: 0 20px;
+    background: var(--bg); border-bottom: 1px solid var(--border);
+  }
+  .icon-button {
+    display: inline-grid; place-items: center; flex: none;
+    width: 30px; height: 30px; border-radius: 6px; color: var(--text-3);
+    transition: color 0.12s, background 0.12s;
+  }
+  .icon-button:hover { color: var(--text); background: var(--surface-2); }
+  .console-main { min-width: 0; padding: 24px 20px 40px; }
+  .console-content { width: 100%; max-width: 1240px; margin: 0 auto; }
+  .nav-scrim { position: fixed; inset: 0; z-index: 30; background: var(--scrim); }
+  .summary-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+  .metric-tile { padding: 16px 18px; }
+  .segmented-control {
+    display: inline-flex; align-items: center; gap: 2px; padding: 3px;
+    border: 1px solid var(--border); border-radius: 6px;
+  }
+  .status-glyph { display: inline-block; width: 7px; height: 7px; flex: none; border-radius: 50%; }
+  .status-glyph.good { background: var(--good); }
+  .status-glyph.warn { background: var(--warn); border-radius: 1px; transform: rotate(45deg); }
+  .status-glyph.bad { background: var(--bad); border-radius: 1px; }
+  .status-glyph.muted { border: 1px solid var(--text-3); }
+
+  @media (min-width: 640px) {
+    .summary-metrics { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  }
+  @media (min-width: 1024px) {
+    .console-shell.is-rail { --sidebar-width: 56px; }
+    .gate-sidebar { width: var(--sidebar-width); transform: none; }
+    .console-page { margin-left: var(--sidebar-width); transition: margin-left 0.18s var(--ease-spring); }
+    .console-main { padding: 28px 32px 48px; }
+    .console-topbar { padding: 0 24px; }
+    .gate-sidebar.is-rail .sidebar-brand { padding: 0; justify-content: center; }
+    .gate-sidebar.is-rail .brand-wordmark,
+    .gate-sidebar:not(.is-rail) .brand-symbol { display: none; }
+    .gate-sidebar.is-rail .nav-link { justify-content: center; padding: 0; }
+    .gate-sidebar.is-rail .nav-name,
+    .gate-sidebar.is-rail .nav-label,
+    .gate-sidebar.is-rail .sidebar-foot { display: none; }
+    .gate-sidebar.is-rail .sidebar-rail-foot {
+      display: flex; flex-direction: column; align-items: center; gap: 6px;
+      margin: 0 8px; padding: 12px 0; border-top: 1px solid var(--border);
+    }
+    .gate-sidebar.is-rail .nav-group + .nav-group::before {
+      content: ''; display: block; margin: 0 8px 14px; border-top: 1px solid var(--border);
+    }
+    .nav-scrim { display: none; }
+  }
+  @media (max-width: 1023px) {
+    .brand-symbol { display: none; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
   }
 }

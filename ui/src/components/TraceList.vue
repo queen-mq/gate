@@ -32,7 +32,7 @@ const traceBudget = (t) => t.budget_id ?? t.budgetId
 <template>
   <ul class="divide-y divide-line">
     <li v-for="(t, i) in traces" :key="i"
-        class="flex items-center gap-3 px-5 h-[46px] text-[13px]">
+        class="flex flex-wrap lg:flex-nowrap items-center gap-x-3 gap-y-2 px-4 sm:px-5 py-3 lg:py-0 lg:h-[46px] text-[13px]">
       <span class="font-mono text-[11.5px] text-fg-3 tabular-nums w-[64px] shrink-0"
             :title="clock(t.at)">{{ ago(t.at) }}</span>
 
@@ -53,7 +53,7 @@ const traceBudget = (t) => t.budget_id ?? t.budgetId
       <span class="font-mono text-[11.5px] text-fg-3 shrink-0 w-[70px] truncate">{{ t.path ?? t.lane }}</span>
       <span class="font-mono text-[12px] text-fg-2 shrink-0 max-w-[160px] truncate">{{ t.op }}</span>
 
-      <span class="truncate flex-1" :class="tone(t)">
+      <span class="truncate flex-1 basis-full lg:basis-auto" :class="tone(t)">
         {{ t.reason || WORD[t.outcome] || t.outcome }}
         <span v-if="traceBudget(t)" class="font-mono text-fg-3">· {{ traceBudget(t) }}</span>
       </span>
@@ -63,7 +63,7 @@ const traceBudget = (t) => t.budget_id ?? t.budgetId
       <span v-if="t.cap_was_assumed" class="chip text-warn shrink-0">assumed cap</span>
 
       <span v-if="t.utilisation !== undefined"
-            class="font-mono text-[11.5px] tabular-nums w-[46px] text-right shrink-0"
+            class="font-mono text-[11.5px] tabular-nums w-[46px] text-right shrink-0 ml-auto lg:ml-0"
             :class="t.utilisation > 1 ? 'text-bad' : t.utilisation >= 0.85 ? 'text-warn' : 'text-fg-3'">
         {{ pct(t.utilisation) }}
       </span>

@@ -10,6 +10,7 @@
 */
 import { ref, computed } from 'vue'
 import Metric from '../components/Metric.vue'
+import PageHeader from '../components/PageHeader.vue'
 import FlowChart from '../components/FlowChart.vue'
 import StatusDot from '../components/StatusDot.vue'
 import BudgetBar from '../components/BudgetBar.vue'
@@ -112,12 +113,14 @@ const status = computed(() => {
 
 <template>
   <div>
-    <header class="mb-8 flex items-center">
-      <h1 class="text-[28px] font-semibold tracking-[-0.02em] leading-tight">Overview</h1>
-      <span class="ml-auto flex items-center gap-2 text-[11.5px] text-fg-3">
-        <span class="w-[7px] h-[7px] rounded-full bg-good animate-pulse2" /> live
-      </span>
-    </header>
+    <PageHeader title="Overview" sub="Your traffic, its ceilings, and what needs your attention.">
+      <template #actions>
+        <span class="flex items-center gap-2 text-[11px] text-fg-3" role="status">
+          <span class="status-glyph" :class="error ? 'bad' : overview ? 'good' : 'muted'" />
+          {{ error ? 'Refresh failed' : overview ? 'Live · every 4s' : 'Connecting…' }}
+        </span>
+      </template>
+    </PageHeader>
 
     <div v-if="error" class="card border-transparent bg-bad-dim px-5 py-4 text-[13.5px] text-bad">
       {{ error }}
@@ -127,19 +130,25 @@ const status = computed(() => {
 
     <template v-else>
       <!-- ------------------------------------------------ status hero -->
-      <section class="card px-6 py-6 md:px-7 flex flex-col md:flex-row md:items-center gap-6">
-        <div class="flex-1 min-w-0">
-          <StatusDot :state="status.state" size="lg" :label="status.title" avatar>
-            <p class="text-[13px] text-fg-2 mt-2 ml-[22.5px] max-w-[52ch] leading-relaxed">{{ status.sub }}</p>
-          </StatusDot>
-        </div>
+      <section class="mb-5 pb-5 border-b border-line">
+        <StatusDot :state="status.state" size="lg" :label="status.title">
+          <p class="text-[12.5px] text-fg-3 mt-1.5 ml-[17px] max-w-[86ch] leading-relaxed">{{ status.sub }}</p>
+        </StatusDot>
+      </section>
         <!-- Admitted and denied stand side by side, in the same weight and the
              same colour, because they are two halves of one measurement: the
              denials are the work the ceiling held back, not the work we lost. -->
-        <div class="grid grid-cols-2 sm:grid-cols-4 gap-7 md:gap-9 md:pl-8 md:border-l border-line shrink-0">
+      <section class="summary-metrics" aria-label="Traffic summary">
+        <div class="card metric-tile">
           <Metric label="Targets" :value="num(targets.length)" />
+        </div>
+        <div class="card metric-tile">
           <Metric label="Paths" :value="num(paths)" />
+        </div>
+        <div class="card metric-tile">
           <Metric label="Admitted" :value="rate(overview.admitted_per_sec)" unit="/s" />
+        </div>
+        <div class="card metric-tile">
           <Metric label="Denied" :value="num(overview.denied_total)" />
         </div>
       </section>
@@ -148,12 +157,12 @@ const status = computed(() => {
       <!-- Below the hero and above the exceptions: the hero says what is true
            right now, this says how we got here, and what needs attention is
            what to do about it. -->
-      <div class="mt-10">
+      <div class="mt-7">
         <FlowChart />
       </div>
 
       <!-- ------------------------------------------- needs attention -->
-      <section v-if="attention.length" class="mt-10">
+      <section v-if="attention.length" class="mt-7">
         <h2 class="section-title">Needs attention
           <span class="section-count">{{ attention.length }}</span>
         </h2>
@@ -164,7 +173,7 @@ const status = computed(() => {
             class="flex items-center gap-4 px-5 py-4 hover:bg-surface-2 transition-colors group"
           >
             <div class="min-w-0 flex-1">
-              <div class="flex items-center gap-2.5">
+              <div class="flex items-center gap-2.5 flex-wrap">
                 <span class="font-medium text-[14px]">{{ t.name }}</span>
                 <StatusDot :state="isThrottled(t) ? 'breached' : (t.assumed_budgets ? 'blind' : t.state)" />
               </div>
@@ -182,7 +191,7 @@ const status = computed(() => {
       </section>
 
       <!-- ------------------------------------------------- breaches -->
-      <section class="mt-10">
+      <section class="mt-7">
         <h2 class="section-title">Recent backoffs
           <span class="section-count">the only proof our numbers are wrong</span>
         </h2>

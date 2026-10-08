@@ -5,12 +5,16 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="color-scheme" content="light dark">
   <title>Gate</title>
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23888' stroke-width='2' stroke-linecap='round'><path d='M4 4v16'/><path d='M20 4v16'/><path d='M9 12h6'/><path d='M12 9v6'/></svg>">
+  <link rel="icon" type="image/x-icon" href="/src/assets/brand/gate-favicon.ico">
+  <link rel="icon" type="image/svg+xml" href="/src/assets/brand/gate-favicon.svg">
+  <link rel="icon" type="image/png" sizes="32x32" href="/src/assets/brand/gate-favicon-32.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="/src/assets/brand/gate-favicon-180.png">
   <script>
     // Applied before first paint so a reload never flashes the wrong theme.
     (function () {
-      var t = localStorage.getItem('gate-theme')
-      var dark = t ? t === 'dark' : window.matchMedia('(prefers-color-scheme: dark)').matches
+      var t
+      try { t = localStorage.getItem('gate-theme') } catch (_) {}
+      var dark = t ? t === 'dark' : true
       document.documentElement.classList.toggle('dark', dark)
     })()
   </script>

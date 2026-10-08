@@ -236,9 +236,9 @@ async function remove() {
       <p v-if="!isAdmin" class="-mt-4 mb-6 text-[12px] text-fg-3">{{ READ_ONLY_NOTE }}</p>
 
       <!-- --------------------------------------------------- headline -->
-      <section class="card px-6 py-6 flex flex-col md:flex-row md:items-center gap-6">
-        <div class="flex-1 min-w-0">
-          <StatusDot :state="state" size="lg" avatar>
+      <section class="card px-5 py-5">
+        <div class="min-w-0 pb-4 mb-4 border-b border-line">
+          <StatusDot :state="state" size="lg">
             <p v-if="nodes.some((n) => n.breaker)"
                class="text-[13px] text-fg-2 mt-2 ml-[22.5px] max-w-[52ch] leading-relaxed">
               A breaker is holding a node: its window has been spent on purpose, so every path
@@ -258,7 +258,7 @@ async function remove() {
              transaction whoever holds it, so items-per-transaction is the
              multiplier on everything the workers do in parallel. It sat near 1
              in v1; here it should sit near the batch. -->
-        <div class="grid grid-cols-2 sm:grid-cols-4 gap-7 md:gap-9 md:pl-8 md:border-l border-line shrink-0">
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-5">
           <Metric label="Admitted" :value="num(totals.admitted)" />
           <Metric label="Deferred" :value="num(totals.deferred)" />
           <Metric label="Relayed" :value="num(totals.forwarded)" />
@@ -267,7 +267,7 @@ async function remove() {
         </div>
       </section>
 
-      <section class="mt-8 rounded-xl border border-line bg-surface p-5">
+      <section class="mt-8 rounded-lg border border-line bg-surface p-5">
         <GraphDiagram :nodes="nodes.map((n) => ({
                         name: n.node,
                         entry: !!n.ingressQueue,
@@ -380,7 +380,8 @@ async function remove() {
           </div>
 
           <!-- -------------------------------------------- stages -->
-          <table class="w-full mt-5 text-[12.5px]">
+          <div class="overflow-x-auto mt-5">
+          <table class="w-full min-w-[840px] text-[12px]">
             <thead>
               <tr class="text-left text-[11px] text-fg-3">
                 <th class="font-normal pb-1.5">path</th>
@@ -436,6 +437,7 @@ async function remove() {
               </tr>
             </tbody>
           </table>
+          </div>
           <p v-if="stagesOf(n.node).some((s) => s.lastRefusal)"
              class="mt-2 text-[12px] text-fg-2">
             <template v-for="s in stagesOf(n.node)" :key="s.path">

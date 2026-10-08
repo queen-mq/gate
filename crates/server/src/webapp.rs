@@ -21,11 +21,15 @@ pub fn router() -> Router<crate::api::Shared> {
     Router::new()
         .route("/", get(index))
         .route("/assets/*path", get(asset))
-        .route("/favicon.ico", get(|| async { StatusCode::NO_CONTENT }))
+        .route("/favicon.ico", get(favicon))
 }
 
 async fn index(headers: HeaderMap) -> Response {
     serve("index.html", &headers)
+}
+
+async fn favicon(headers: HeaderMap) -> Response {
+    serve("assets/gate-favicon.ico", &headers)
 }
 
 async fn asset(Path(path): Path<String>, headers: HeaderMap) -> Response {
@@ -81,4 +85,29 @@ fn serve(path: &str, req: &HeaderMap) -> Response {
 /// signature.
 fn hex16(hash: &[u8; 32]) -> String {
     hash[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn favicon_is_embedded_and_revalidated() {
+        let response = favicon(HeaderMap::new()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-cache");
+        assert!(response.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("image/"));
+        let etag = response.headers()[header::ETAG].clone();
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..4], &[0, 0, 1, 0], "must serve an ICO, not the SPA");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_NONE_MATCH, etag);
+        assert_eq!(favicon(headers).await.status(), StatusCode::NOT_MODIFIED);
+    }
 }

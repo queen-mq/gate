@@ -1,6 +1,9 @@
 <div align="center">
 
-<img src="assets/logo.svg" alt="" width="76" height="76">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="ui/src/assets/brand/gate-simbolo-bianco.svg">
+  <img src="assets/logo.svg" alt="Gate" width="76" height="76">
+</picture>
 
 # Gate
 

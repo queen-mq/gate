@@ -3,7 +3,7 @@
   <title id="title">Gate symbol</title>
   <desc id="description">Open gate with a yellow message petal; transparent vector symbol.</desc>
   <g id="gate-symbol">
-    <g id="gate-posts" fill="#000000">
+    <g id="gate-posts" fill="#F9F7F4">
       <path id="entry-post" d="M30 28 C34.4183 28 38 31.5817 38 36 V124 C38 128.4183 34.4183 132 30 132 C25.5817 132 22 128.4183 22 124 V36 C22 31.5817 25.5817 28 30 28 Z" />
       <path id="exit-upper" d="M116 28 C120.4183 28 124 31.5817 124 36 V48 C124 52.4183 120.4183 56 116 56 C111.5817 56 108 52.4183 108 48 V36 C108 31.5817 111.5817 28 116 28 Z" />
       <path id="exit-lower" d="M116 104 C120.4183 104 124 107.5817 124 112 V124 C124 128.4183 120.4183 132 116 132 C111.5817 132 108 128.4183 108 124 V112 C108 107.5817 111.5817 104 116 104 Z" />

@@ -148,11 +148,12 @@ function toneOf(u) {
           Each application against its own ceiling — its busiest target, minute by minute.
         </p>
       </div>
-      <div class="flex items-center gap-1">
+      <div class="segmented-control" role="group" aria-label="Time range">
         <button
           v-for="r in RANGES" :key="r.key"
           class="px-2.5 py-1 rounded-md text-[12px] transition-colors"
-          :class="r.key === range.key ? 'bg-surface-2 text-fg' : 'text-fg-3 hover:text-fg-2'"
+          :class="r.key === range.key ? 'bg-selected text-fg' : 'text-fg-3 hover:text-fg-2'"
+          :aria-pressed="r.key === range.key"
           @click="range = r"
         >{{ r.key }}</button>
       </div>
