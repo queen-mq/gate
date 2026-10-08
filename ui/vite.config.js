@@ -11,6 +11,9 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     emptyOutDir: true,
+    // Brand assets need stable /assets URLs, including the touch icon and ICO
+    // served by the embedded console; avoid inlining small icons as data URLs.
+    assetsInlineLimit: 0,
     // One CSS file, and one JS chunk per lazily-routed view — rollup numbers
     // them off the same name. Fixed names rather than hashed ones: the assets
     // are embedded in the binary and revalidated with `no-cache`, so a hash

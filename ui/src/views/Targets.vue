@@ -92,7 +92,7 @@ const groups = computed(() => {
         <div class="relative">
           <Icon name="search" :size="14"
                 class="absolute left-3 top-1/2 -translate-y-1/2 text-fg-3 pointer-events-none" />
-          <input v-model="q" class="input w-[200px] pl-9" placeholder="Filter targets" />
+          <input v-model="q" class="input w-[200px] pl-9" placeholder="Filter targets" aria-label="Filter targets" />
         </div>
         <RouterLink v-if="isAdmin" to="/graphs/new" class="btn btn-primary">
           <Icon name="plus" :size="14" /> New graph
@@ -142,7 +142,7 @@ const groups = computed(() => {
             class="flex items-center gap-5 px-5 py-4 hover:bg-surface-2 transition-colors group"
           >
             <div class="min-w-0 flex-[2]">
-              <div class="flex items-center gap-2.5">
+              <div class="flex items-center gap-2.5 flex-wrap">
                 <span class="font-medium text-[14px]">{{ t.name }}</span>
                 <span class="chip">v{{ t.version }}</span>
                 <StatusDot :state="t.assumed_budgets ? 'blind' : t.state" />

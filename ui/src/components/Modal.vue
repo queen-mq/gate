@@ -32,7 +32,7 @@ onUnmounted(() => document.removeEventListener('keydown', onKey))
     <form
       ref="panel"
       class="w-full max-w-[460px] max-h-[88vh] overflow-y-auto bg-surface border border-line
-             rounded-2xl shadow-2xl animate-in"
+             rounded-lg shadow-2xl animate-in"
       @submit.prevent="emit('submit')"
     >
       <header class="flex items-start justify-between px-6 pt-5 pb-0">

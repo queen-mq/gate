@@ -1,34 +1,49 @@
 <script setup>
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, onUnmounted, computed, watch, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import Icon from './components/Icon.vue'
+import GateBrand from './components/GateBrand.vue'
 import SignIn from './views/SignIn.vue'
 import { api, authState, authError, me, fetchMe, isAdmin, READ_ONLY_NOTE } from './lib/api.js'
 import { usePoll } from './lib/poll.js'
 
 const route = useRoute()
 const overview = ref(null)
+const overviewError = ref(false)
 const dark = ref(document.documentElement.classList.contains('dark'))
 const mobileNav = ref(false)
+const drawerQuery = window.matchMedia('(max-width: 1023px)')
+const mobileViewport = ref(drawerQuery.matches)
+const rail = ref(false)
+try { rail.value = localStorage.getItem('gate-sidebar-rail') === 'true' } catch {}
 const signingOut = ref(false)
 const signOutError = ref('')
 
 /*
-  Navigation grouped by intent: "Monitor" is what an operator opens when a
-  portal starts refusing. The primary object is the GRAPH — one document, its
+  Navigation grouped like Queen's console. The primary object is the GRAPH — one document, its
   nodes, its budgets and the paths that cross them. "Targets" is the same list
   in the older vocabulary, because a target is a one-node graph and a link in a
   runbook does not stop existing when a model changes.
 */
 const groups = [
   {
-    label: 'Monitor',
+    label: null,
     items: [
       { to: '/', label: 'Overview', icon: 'gauge', key: 'overview' },
+    ],
+  },
+  {
+    label: 'Routing',
+    items: [
       { to: '/targets', label: 'Targets', icon: 'target', key: 'targets' },
       { to: '/graphs', label: 'Graphs', icon: 'graph', key: 'graphs' },
 
       { to: '/budgets', label: 'Shared budgets', icon: 'budget', key: 'budgets' },
+    ],
+  },
+  {
+    label: 'Observability',
+    items: [
       { to: '/traces', label: 'Traces', icon: 'trace', key: 'traces' },
     ],
   },
@@ -37,8 +52,37 @@ const groups = [
 function toggleTheme() {
   dark.value = !dark.value
   document.documentElement.classList.toggle('dark', dark.value)
-  localStorage.setItem('gate-theme', dark.value ? 'dark' : 'light')
+  try { localStorage.setItem('gate-theme', dark.value ? 'dark' : 'light') } catch {}
 }
+
+function toggleRail() {
+  rail.value = !rail.value
+  try { localStorage.setItem('gate-sidebar-rail', String(rail.value)) } catch {}
+}
+
+function onKey(e) {
+  if (e.key === 'Escape' && mobileNav.value) {
+    mobileNav.value = false
+  }
+}
+function onViewportChange(e) {
+  mobileViewport.value = e.matches
+  mobileNav.value = false
+}
+watch(() => route.fullPath, () => { mobileNav.value = false })
+watch(mobileNav, async (open) => {
+  document.body.style.overflow = open ? 'hidden' : ''
+  await nextTick()
+  if (open && mobileNav.value) document.querySelector('#gate-navigation button')?.focus()
+  else if (!open) document.querySelector('[aria-controls="gate-navigation"]')?.focus()
+})
+watch(authState, (state) => {
+  if (state !== 'ready') {
+    mobileNav.value = false
+    overview.value = null
+    overviewError.value = false
+  }
+})
 
 async function signOut() {
   if (signingOut.value) return
@@ -51,7 +95,10 @@ async function signOut() {
     // A 401 already switches the shell to SignIn. Other failures leave the
     // current session intact and should be visible rather than becoming an
     // unhandled event promise in the console.
-    if (authState.value !== 'login') signOutError.value = e.message
+    if (authState.value !== 'login') {
+      signOutError.value = e.message
+      if (rail.value) toggleRail()
+    }
   } finally {
     signingOut.value = false
   }
@@ -61,8 +108,10 @@ async function load() {
   if (authState.value !== 'ready') return
   try {
     overview.value = await api.get('/api/overview')
+    overviewError.value = false
   } catch {
     overview.value = null
+    overviewError.value = true
   }
 }
 
@@ -74,12 +123,29 @@ async function retryAuth() {
 
 const refresh = usePoll(load, 15000)
 onMounted(async () => {
+  document.addEventListener('keydown', onKey)
+  drawerQuery.addEventListener('change', onViewportChange)
   await fetchMe()
   refresh()
 })
+onUnmounted(() => {
+  document.removeEventListener('keydown', onKey)
+  drawerQuery.removeEventListener('change', onViewportChange)
+  document.body.style.overflow = ''
+})
 
-const brokerOk = computed(() => overview.value?.queen?.reachable === true)
 const activeNav = computed(() => route.meta?.nav)
+const currentPage = computed(() => groups.flatMap((g) => g.items).find((i) => i.key === activeNav.value)?.label || 'Console')
+const brokerState = computed(() => {
+  if (!overview.value) return overviewError.value ? 'unknown' : 'checking'
+  return overview.value.queen?.reachable === true ? 'connected' : 'down'
+})
+const brokerLabel = computed(() => ({
+  checking: 'Checking broker',
+  unknown: 'Broker status unknown',
+  connected: `Queen ${overview.value?.queen?.version ?? ''}`.trim(),
+  down: 'Broker unreachable',
+}[brokerState.value]))
 
 /*
   The sidebar carries the two warnings an operator must never have to go
@@ -99,138 +165,126 @@ const warnings = computed(() => {
 </script>
 
 <template>
-  <div v-if="authState === 'unknown'" class="min-h-screen grid place-items-center">
-    <div class="skeleton h-5 w-40" />
+  <div v-if="authState === 'unknown'" class="min-h-screen flex flex-col items-center justify-center gap-5" role="status">
+    <GateBrand variant="symbol" />
+    <span class="text-xs text-fg-3">Loading console…</span>
   </div>
 
-  <!-- Signed out: the sign-in page INSTEAD of the shell, not inside it. A
-       sidebar whose every page answers "sign in required" is a dashboard that
-       looks broken rather than closed. -->
-  <SignIn v-else-if="authState === 'login'" />
+  <SignIn v-else-if="authState === 'login'" :dark="dark" @toggle-theme="toggleTheme" />
 
   <div v-else-if="authState === 'error'" class="min-h-screen grid place-items-center px-6">
     <div class="card w-full max-w-[440px] px-7 py-8 text-center">
-      <span class="w-10 h-10 rounded-xl bg-bad-dim text-bad grid place-items-center mx-auto">
-        <Icon name="alert" :size="19" />
-      </span>
-      <h1 class="text-[20px] font-semibold tracking-[-0.02em] mt-5">Console unavailable</h1>
-      <p class="text-[13.5px] text-fg-2 mt-2 leading-relaxed">
+      <GateBrand variant="symbol" class="mx-auto mb-6" />
+      <h1 class="text-[20px] font-semibold tracking-tight">Console unavailable</h1>
+      <p class="text-[13px] text-fg-2 mt-2 leading-relaxed">
         Gate could not establish whether this session is signed in.
       </p>
-      <p class="mt-4 px-3 py-2.5 rounded-lg bg-bad-dim text-[12.5px] text-bad break-words">
+      <p class="mt-4 px-3 py-2.5 rounded-md bg-bad-dim text-[12px] text-bad break-words" role="alert">
         {{ authError }}
       </p>
-      <button type="button" class="btn btn-primary mt-6 mx-auto" @click="retryAuth">
-        Try again
-      </button>
+      <button type="button" class="btn btn-primary mt-6 mx-auto" @click="retryAuth">Try again</button>
     </div>
   </div>
 
-  <div v-else class="min-h-screen">
-    <!-- ------------------------------------------------------- sidebar -->
-    <aside
-      class="fixed inset-y-0 left-0 z-40 w-[248px] bg-bg border-r border-line
-             flex flex-col transition-transform duration-200 ease-spring lg:translate-x-0"
-      :class="mobileNav ? 'translate-x-0 bg-surface shadow-2xl' : '-translate-x-full'"
-    >
-      <div class="h-[60px] px-5 flex items-center shrink-0">
-        <RouterLink to="/" class="flex items-center gap-2.5" @click="mobileNav = false">
-          <span class="w-[22px] h-[22px] rounded-md bg-fg text-bg grid place-items-center
-                       shrink-0" aria-hidden="true">
-            <!-- Two posts and a bar: a gate, which is what the thing does —
-                 it does not slow traffic down, it decides what goes through. -->
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                 stroke-width="2.4" stroke-linecap="round">
-              <path d="M5 4v16" /><path d="M19 4v16" /><path d="M9.5 12h5" />
-            </svg>
-          </span>
-          <span class="font-semibold tracking-tight text-[14.5px]">Gate</span>
+  <div v-else class="console-shell min-h-screen" :class="{ 'is-rail': rail }">
+    <aside id="gate-navigation" class="gate-sidebar" :class="{ 'is-open': mobileNav, 'is-rail': rail }"
+           :inert="mobileViewport && !mobileNav">
+      <div class="sidebar-brand">
+        <RouterLink to="/" aria-label="Gate overview" @click="mobileNav = false">
+          <GateBrand class="brand-wordmark" />
+          <GateBrand variant="symbol" class="brand-symbol" />
         </RouterLink>
+        <button type="button" class="icon-button lg:hidden" aria-label="Close navigation" @click="mobileNav = false">
+          <Icon name="x" :size="16" />
+        </button>
       </div>
 
-      <nav class="flex-1 px-3 pt-2 pb-4 overflow-y-auto">
-        <div v-for="g in groups" :key="g.label" class="mb-6">
-          <div class="px-2.5 mb-1.5 text-[10.5px] font-semibold uppercase tracking-[0.08em] text-fg-3">
-            {{ g.label }}
-          </div>
-          <RouterLink
-            v-for="item in g.items" :key="item.key" :to="item.to"
-            class="flex items-center gap-2.5 h-[34px] px-2.5 rounded-lg text-[13.5px]
-                   transition-colors duration-100 mb-px"
-            :class="activeNav === item.key
-              ? 'bg-surface-2 text-fg font-medium'
-              : 'text-fg-2 hover:text-fg hover:bg-surface-2'"
-            @click="mobileNav = false"
-          >
-            <Icon :name="item.icon" :size="15.5"
-                  :class="activeNav === item.key ? 'text-fg' : 'text-fg-3'" />
-            {{ item.label }}
+      <nav class="sidebar-nav" aria-label="Main navigation">
+        <div v-for="(g, index) in groups" :key="index" class="nav-group">
+          <div v-if="g.label" class="nav-label">{{ g.label }}</div>
+          <RouterLink v-for="item in g.items" :key="item.key" :to="item.to"
+                      class="nav-link" :class="{ 'is-active': activeNav === item.key }"
+                      :aria-current="activeNav === item.key ? 'page' : undefined"
+                      :aria-label="item.label" :title="rail ? item.label : undefined"
+                      @click="mobileNav = false">
+            <Icon :name="item.icon" :size="16" />
+            <span class="nav-name">{{ item.label }}</span>
           </RouterLink>
         </div>
       </nav>
 
-      <div class="px-5 py-4 border-t border-line space-y-3 shrink-0">
-        <p v-for="w in warnings" :key="w"
-           class="flex gap-1.5 text-[11px] leading-snug text-warn">
-          <Icon name="alert" :size="12" class="mt-px shrink-0" />{{ w }}
-        </p>
+      <div class="sidebar-rail-foot">
+        <RouterLink v-if="warnings.length" to="/" class="icon-button text-warn"
+                    :title="warnings.join(' ')" :aria-label="warnings.join(' ')">
+          <Icon name="alert" :size="16" />
+        </RouterLink>
+        <span v-if="me" class="icon-button text-[11px] font-medium" role="img"
+              :title="`${me.role || 'unknown role'} · ${me.email || me.actor}`"
+              :aria-label="`${me.role || 'unknown role'} · ${me.email || me.actor}`">
+          {{ isAdmin ? 'A' : 'R' }}
+        </span>
+        <button v-if="me?.actor === 'google'" type="button" class="icon-button"
+                :disabled="signingOut" title="Sign out" aria-label="Sign out" @click="signOut">
+          <Icon name="logout" :size="16" />
+        </button>
+      </div>
 
-        <!-- Who is signed in, what they may do, and the way out. The role is
-             not decoration: it decides whether every editor in this console is
-             enabled, so it belongs where the identity is and not buried on the
-             page that refuses to save. -->
+      <div class="sidebar-foot space-y-3">
+        <p v-for="w in warnings" :key="w" class="flex gap-2 text-[11px] leading-relaxed text-warn">
+          <Icon name="alert" :size="12" class="mt-0.5 shrink-0" />{{ w }}
+        </p>
         <div v-if="me" class="space-y-2">
-          <div class="flex items-center gap-2.5 min-w-0">
-            <span class="w-[26px] h-[26px] rounded-full bg-surface-2 border border-line grid
-                         place-items-center text-[11px] font-semibold uppercase shrink-0">
-              {{ (me.email || me.actor || '?')[0] }}
-            </span>
-            <span class="min-w-0 flex-1 leading-tight">
-              <span class="block text-[12px] font-medium truncate" :title="me.email || me.actor">
-                {{ me.email || me.actor }}
-              </span>
-              <span class="block text-[11px] text-fg-3 truncate">{{ me.role || 'unknown role' }}</span>
-            </span>
+          <div class="flex items-center justify-between gap-2 text-[11px]">
+            <span class="text-fg-2 capitalize">{{ me.role || 'unknown role' }}</span>
             <button v-if="me.actor === 'google'" type="button" :disabled="signingOut"
-                    class="w-7 h-7 grid place-items-center rounded-md text-fg-3 hover:text-fg
-                           hover:bg-surface-2 transition-colors disabled:opacity-50"
-                    title="Sign out" @click="signOut">
-              <Icon name="x" :size="13" />
-            </button>
+                    class="text-fg-3 hover:text-fg transition-colors disabled:opacity-50"
+                    @click="signOut">{{ signingOut ? 'Signing out…' : 'Sign out' }}</button>
           </div>
-          <p v-if="signOutError" class="text-[11px] leading-snug text-bad">
+          <p class="text-[12px] text-fg-3 truncate" :title="me.email || me.actor">{{ me.email || me.actor }}</p>
+          <p v-if="signOutError" class="text-[11px] leading-snug text-bad" role="alert">
             Could not sign out: {{ signOutError }}
           </p>
-          <p v-if="!isAdmin" class="text-[11px] leading-snug text-fg-3">{{ READ_ONLY_NOTE }}</p>
-        </div>
-
-        <div class="flex items-center justify-between">
-          <span class="flex items-center gap-1.5 font-mono text-[11px] text-fg-3"
-                :title="overview?.queen?.url">
-            <span class="w-[6px] h-[6px] rounded-full" :class="brokerOk ? 'bg-good' : 'bg-bad'" />
-            {{ brokerOk ? `Queen ${overview?.queen?.version ?? ''}` : 'broker unreachable' }}
-          </span>
-          <button class="w-7 h-7 grid place-items-center rounded-md text-fg-3
-                         hover:text-fg hover:bg-surface-2 transition-colors"
-                  :title="dark ? 'Switch to light' : 'Switch to dark'" @click="toggleTheme">
-            <Icon :name="dark ? 'sun' : 'moon'" :size="14" />
-          </button>
+          <p v-if="!isAdmin" class="text-[11px] leading-relaxed text-fg-3">{{ READ_ONLY_NOTE }}</p>
         </div>
       </div>
     </aside>
 
-    <div v-if="mobileNav" class="fixed inset-0 z-30 bg-black/40 lg:hidden" @click="mobileNav = false" />
+    <div v-if="mobileNav" class="nav-scrim lg:hidden" aria-hidden="true" @click="mobileNav = false" />
 
-    <!-- --------------------------------------------------------- page -->
-    <div class="lg:pl-[248px]">
-      <header class="lg:hidden h-[52px] px-4 flex items-center gap-3 border-b border-line bg-bg
-                     sticky top-0 z-20">
-        <button class="btn btn-sm" @click="mobileNav = true">Menu</button>
-        <span class="font-semibold tracking-tight text-[14px]">Gate</span>
+    <div class="console-page" :inert="mobileNav">
+      <header class="console-topbar">
+        <button type="button" class="icon-button lg:hidden" aria-label="Open navigation"
+                aria-controls="gate-navigation" :aria-expanded="mobileNav" @click="mobileNav = !mobileNav">
+          <Icon name="menu" :size="17" />
+        </button>
+        <GateBrand variant="symbol" class="lg:hidden w-6" />
+        <button type="button" class="icon-button hidden lg:inline-grid"
+                :aria-label="rail ? 'Expand sidebar' : 'Collapse sidebar'"
+                :title="rail ? 'Expand sidebar' : 'Collapse sidebar'" :aria-expanded="!rail"
+                aria-controls="gate-navigation" @click="toggleRail">
+          <Icon name="sidebar" :size="17" />
+        </button>
+        <div class="flex items-center gap-2 text-[12px] min-w-0">
+          <span class="text-fg-3 hidden sm:inline">Console</span>
+          <Icon name="chevron" :size="10" class="text-fg-3 hidden sm:block" />
+          <span class="text-fg-2 truncate">{{ currentPage }}</span>
+        </div>
+        <div class="ml-auto flex items-center gap-4">
+          <span class="flex items-center gap-2 text-[11px] text-fg-3" :title="overview?.queen?.url"
+                role="status">
+            <span class="status-glyph" :class="brokerState === 'connected' ? 'good' : brokerState === 'down' ? 'bad' : 'muted'" />
+            <span class="sr-only sm:not-sr-only" :class="brokerState === 'down' ? 'text-bad' : ''">{{ brokerLabel }}</span>
+          </span>
+          <button type="button" class="icon-button"
+                  :aria-label="dark ? 'Switch to light theme' : 'Switch to dark theme'"
+                  :title="dark ? 'Switch to light theme' : 'Switch to dark theme'" @click="toggleTheme">
+            <Icon :name="dark ? 'sun' : 'moon'" :size="16" />
+          </button>
+        </div>
       </header>
 
-      <main class="px-6 lg:px-12 py-10">
-        <div class="max-w-[1120px] mx-auto">
+      <main class="console-main">
+        <div class="console-content">
           <RouterView v-slot="{ Component }">
             <component :is="Component" class="animate-in" />
           </RouterView>

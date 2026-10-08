@@ -2,6 +2,9 @@
 // Inline stroke icons: the console ships inside a binary, so every glyph is a
 // kilobyte an operator carries forever, and the set needed here is small.
 const paths = {
+  menu: ['M4 6h16', 'M4 12h16', 'M4 18h16'],
+  sidebar: ['M3 4h18v16H3z', 'M9 4v16'],
+  logout: ['M9 4H4v16h5', 'M12 12h9', 'M17 8l4 4-4 4'],
   gauge: ['M12 13l4-4', 'M20.2 15a8.5 8.5 0 1 0-16.4 0'],
   target: ['M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z', 'M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8z', 'M12 11.5v1'],
   budget: ['M4 19V5', 'M4 15h4V9h4V5h4v14', 'M20 19H4'],

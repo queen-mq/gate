@@ -199,11 +199,12 @@ const tone = computed(() => (peak.value > 1 ? 'text-bad' : peak.value >= 0.85 ? 
         ]"
       >
         <template #actions>
-          <div class="flex items-center gap-1">
+          <div class="segmented-control" role="group" aria-label="Time range">
             <button
               v-for="r in RANGES" :key="r.key"
               class="h-[28px] px-2.5 rounded-md text-[12px] transition-colors"
-              :class="range.key === r.key ? 'bg-fg text-bg font-medium' : 'text-fg-2 hover:bg-surface-2'"
+              :class="range.key === r.key ? 'bg-selected text-fg font-medium' : 'text-fg-2 hover:bg-surface-2'"
+              :aria-pressed="range.key === r.key"
               @click="range = r"
             >{{ r.label }}</button>
           </div>

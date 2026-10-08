@@ -80,7 +80,7 @@ const note = computed(() => OUTCOMES.find((o) => o.key === outcome.value)?.note 
       sub="Refusals, as they were taken. Admissions are counted and never traced — they are 99% of the volume and almost none of the interest, and the hot path writes one KV batch and one transaction and nothing else."
     >
       <template #actions>
-        <select v-model="target" class="input w-[180px]">
+        <select v-model="target" class="input w-[180px]" aria-label="Filter traces by target">
           <option value="">Every target</option>
           <option
             v-for="t in targets" :key="`${t.application}/${t.name}`"
@@ -94,7 +94,8 @@ const note = computed(() => OUTCOMES.find((o) => o.key === outcome.value)?.note 
       <button
         v-for="o in OUTCOMES" :key="o.key"
         class="h-[28px] px-2.5 rounded-md text-[12px] transition-colors"
-        :class="outcome === o.key ? 'bg-fg text-bg font-medium' : 'text-fg-2 hover:bg-surface-2'"
+        :class="outcome === o.key ? 'bg-selected text-fg font-medium' : 'text-fg-2 hover:bg-surface-2'"
+        :aria-pressed="outcome === o.key"
         @click="outcome = o.key"
       >{{ o.label }}</button>
       <span class="ml-auto text-[11.5px] text-fg-3">{{ note }}</span>

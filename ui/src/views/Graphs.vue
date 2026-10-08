@@ -82,7 +82,7 @@ const rows = computed(() =>
     <p v-if="error" class="mb-4 text-[13px] text-bad">{{ error }}</p>
 
     <div v-if="rows.length === 0 && graphs !== null"
-         class="rounded-xl border border-line bg-surface p-8 text-center">
+         class="rounded-lg border border-line bg-surface p-8 text-center">
       <p class="text-[13.5px] text-fg-2">No graph is declared.</p>
       <p class="text-[12.5px] text-fg-3 mt-1.5">
         A graph is declared whole, by its owner:
@@ -91,7 +91,7 @@ const rows = computed(() =>
     </div>
 
     <div v-for="g in rows" :key="`${g.application}/${g.name}`"
-         class="mb-3 rounded-xl border border-line bg-surface overflow-hidden">
+         class="mb-3 rounded-lg border border-line bg-surface overflow-hidden">
       <RouterLink :to="graphPath(g)" class="block p-5 hover:bg-surface-2 transition-colors">
         <div class="flex items-baseline gap-3 flex-wrap">
           <span class="font-mono text-[15px] text-fg">{{ g.name }}</span>
