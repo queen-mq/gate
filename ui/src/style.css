@@ -88,11 +88,11 @@
   }
 }
 
-/* Queen's dashboard palette: warm paper / warm black, flat surfaces, neutral
-   healthy states, amber attention and coral failures. Gate keeps its existing
-   token names so every gauge and diagram follows the same state language. */
+/* Gate's logo provides the palette: sunflower yellow, warm white and black.
+   Green/coral are reserved for operational status, not decorative surfaces. */
 @layer base {
   :root {
+    --brand: #FCC620;
     --rail: #e8e5e0;
     --bg: #f2f0ec;
     --surface: #f9f7f4;
@@ -106,53 +106,52 @@
     --border-2: #cfc9c1;
 
     --link: #4f4b45;
-    --good: #6c675f;
-    --good-dim: #eeebe6;
+    --good: #426b4e;
+    --good-dim: #e8eee7;
     --warn: #9a5b07;
     --warn-dim: #f0e6d6;
     --bad: #c6452e;
     --bad-dim: #f3e4dc;
 
-    /* Application identity uses Queen's categorical chart palette, separate
-       from amber / coral state marks and the yellow in the brand asset. */
-    --series-1: #44689e;
-    --series-2: #6f4fa0;
-    --series-3: #2c7a6a;
-    --series-4: #9a4d73;
-    --series-5: #5b7a26;
-    --series-6: #557888;
+    /* Brand-aligned chart colours are paired with line patterns for identity. */
+    --series-1: #846100;
+    --series-2: #24211c;
+    --series-3: #777065;
+    --series-4: #a67c23;
+    --series-5: #5f5b53;
+    --series-6: #968469;
 
     --scrim: rgb(40 36 32 / 0.25);
     color-scheme: light;
   }
 
   .dark {
-    --rail: #000000;
-    --bg: #0b0a0a;
-    --surface: #111010;
-    --surface-2: #1c1b19;
-    --input: #171615;
-    --selected: #242220;
-    --text: #eeebe6;
-    --text-2: #aaa59e;
-    --text-3: #8f8a83;
-    --border: #1f1d1b;
-    --border-2: #34312e;
+    --rail: #0d0c0b;
+    --bg: #11100e;
+    --surface: #191815;
+    --surface-2: #25231e;
+    --input: #1d1b17;
+    --selected: #353020;
+    --text: #f9f7f4;
+    --text-2: #bcb6ab;
+    --text-3: #969084;
+    --border: #302d27;
+    --border-2: #474238;
 
-    --link: #aaa59e;
-    --good: #8f8a83;
-    --good-dim: #1b1917;
+    --link: #fcc620;
+    --good: #95cfaf;
+    --good-dim: #1b2a1e;
     --warn: #e8a849;
     --warn-dim: #2a2116;
     --bad: #f07a5f;
     --bad-dim: #2c1c17;
 
-    --series-1: #7f9fd0;
-    --series-2: #b092d0;
-    --series-3: #6fb3a3;
-    --series-4: #d08fae;
-    --series-5: #a3b56f;
-    --series-6: #85a8b8;
+    --series-1: #fcc620;
+    --series-2: #f9f7f4;
+    --series-3: #b7afa2;
+    --series-4: #d8b45b;
+    --series-5: #918d84;
+    --series-6: #d3c9b6;
 
     --scrim: rgb(7 6 6 / 0.62);
     color-scheme: dark;
@@ -271,27 +270,28 @@
   .gate-sidebar.is-open { transform: translateX(0); }
   .sidebar-brand {
     display: flex; align-items: center; justify-content: space-between;
-    height: 52px; padding: 0 14px; flex: none;
+    height: 76px; padding: 0 22px; flex: none;
   }
   .sidebar-nav { flex: 1; overflow-y: auto; padding: 16px 8px; }
   .nav-group + .nav-group { margin-top: 22px; }
   .nav-label {
-    padding: 0 8px 6px; font-size: 11px; font-weight: 600; color: var(--text-2);
+    padding: 0 12px 9px; font-size: 9px; font-weight: 500; color: var(--text-3);
+    text-transform: uppercase; letter-spacing: 1.4px;
   }
   .nav-link {
-    display: flex; align-items: center; gap: 10px; height: 32px;
-    padding: 0 8px; margin-bottom: 2px; border-radius: 6px;
-    color: var(--text-2); font-size: 13px; white-space: nowrap;
+    display: flex; align-items: center; gap: 10px; height: 39px;
+    padding: 0 12px; margin-bottom: 5px; border-radius: 6px;
+    color: var(--text-2); font-size: 12px; white-space: nowrap;
     transition: color 0.12s, background 0.12s;
   }
   .nav-link > svg { color: var(--text-3); }
   .nav-link:hover { background: var(--surface); color: var(--text); }
-  .nav-link.is-active { background: var(--selected); color: var(--text); font-weight: 500; }
+  .nav-link.is-active { background: var(--selected); color: var(--spatial-accent, var(--text)); font-weight: 500; }
   .nav-link:hover > svg, .nav-link.is-active > svg { color: var(--text); }
   .sidebar-foot { flex: none; margin: 0 16px; padding: 14px 0 16px; border-top: 1px solid var(--border); }
   .sidebar-rail-foot { display: none; }
   .console-topbar {
-    height: 52px; position: sticky; top: 0; z-index: 20;
+    height: 60px; position: sticky; top: 0; z-index: 20;
     display: flex; align-items: center; gap: 12px; padding: 0 20px;
     background: var(--bg); border-bottom: 1px solid var(--border);
   }
@@ -302,7 +302,7 @@
   }
   .icon-button:hover { color: var(--text); background: var(--surface-2); }
   .console-main { min-width: 0; padding: 24px 20px 40px; }
-  .console-content { width: 100%; max-width: 1240px; margin: 0 auto; }
+  .console-content { width: 100%; max-width: 1500px; margin: 0 auto; }
   .nav-scrim { position: fixed; inset: 0; z-index: 30; background: var(--scrim); }
   .summary-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
   .metric-tile { padding: 16px 18px; }

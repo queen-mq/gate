@@ -11,17 +11,17 @@ defineProps({
 })
 
 const marks = {
-  compact: { light: compactLight, dark: compactDark },
-  full: { light: fullLight, dark: fullDark },
-  symbol: { light: symbolLight, dark: symbolDark },
+  compact: { light: compactLight, dark: compactDark, width: 538, height: 268 },
+  full: { light: fullLight, dark: fullDark, width: 1515, height: 775 },
+  symbol: { light: symbolLight, dark: symbolDark, width: 160, height: 160 },
 }
 </script>
 
 <template>
   <span class="gate-brand" :class="`gate-brand-${variant}`">
     <img class="gate-brand-light" :src="marks[variant].light" alt="Gate"
-         :width="variant === 'symbol' ? 160 : 740" :height="variant === 'symbol' ? 160 : 280" />
+         :width="marks[variant].width" :height="marks[variant].height" />
     <img class="gate-brand-dark" :src="marks[variant].dark" alt="Gate"
-         :width="variant === 'symbol' ? 160 : 740" :height="variant === 'symbol' ? 160 : 280" />
+         :width="marks[variant].width" :height="marks[variant].height" />
   </span>
 </template>
