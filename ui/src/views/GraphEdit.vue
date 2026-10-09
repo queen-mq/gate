@@ -5,6 +5,7 @@ import { useRoute, useRouter } from 'vue-router'
 import PageHeader from '../components/PageHeader.vue'
 import Icon from '../components/Icon.vue'
 import { cloneGraph } from '../lib/target-setup.js'
+import { readAiDraft, completeAiDraft, openAiAgent } from '../lib/ai-session.js'
 import GraphForm from '../components/editor/GraphForm.vue'
 import { api, isAdmin, READ_ONLY_NOTE, graphApi, graphPath, DEFAULT_APP } from '../lib/api.js'
 import { ensureNewGraph, formIssue, newTarget, trafficMode, validateDocument } from '../lib/graph-editor.js'
@@ -47,7 +48,15 @@ async function loadDocument() {
   mode.value = 'form'
 
   if (!name && !route.query.clone) {
-    text.value = JSON.stringify(newTarget(app), null, 2)
+    const draft = route.query.aiDraft ? readAiDraft(String(route.query.aiDraft)) : newTarget(app)
+    if (!draft) {
+      text.value = ''
+      loadFailed.value = true
+      error.value = 'This AI draft is no longer available. Return to the AI agent to prepare a new one.'
+    } else {
+      text.value = JSON.stringify(draft, null, 2)
+      if (formIssue(draft)) mode.value = 'json'
+    }
     loading.value = false
     return
   }
@@ -80,7 +89,7 @@ async function loadDocument() {
 // `onMounted` alone leaves the previous graph in the editor when navigating
 // between two URLs backed by the same route record. Watching the identity also
 // covers `/graphs/new` if RouterView elects to reuse the component instance.
-watch(() => [props.app, props.name, route.query.configureLimits, route.query.clone, route.query.app], loadDocument, { immediate: true })
+watch(() => [props.app, props.name, route.query.configureLimits, route.query.clone, route.query.app, route.query.aiDraft], loadDocument, { immediate: true })
 
 const parsed = computed(() => {
   try {
@@ -126,6 +135,7 @@ async function save() {
     migration.value = res?.migration ?? []
     // Keep caveats and migration notes visible before opening the saved graph.
     declared.value = true
+    if (route.query.aiDraft) completeAiDraft(String(route.query.aiDraft), parsed.value.value)
     if (!migration.value.length && !warnings.value.length) {
       router.push({ path: graphPath(app, name), query: editing.value ? {} : { setup: '1' } })
     }
@@ -140,6 +150,7 @@ async function save() {
 
 <template>
   <div>
+    <p v-if="route.query.aiDraft" class="editor-note mb-5">AI-generated draft. Review the queues, assumptions and limits before creating this graph. <button class="underline" @click="openAiAgent()">Return to conversation</button></p>
     <p v-if="route.query.clone" class="editor-note mb-5">Cloning {{ route.query.clone }}. Choose a new name and outgoing queues. Incoming queues will be created for the clone. Shared budget keys are preserved: review them if the clone should have a separate allowance.</p>
     <PageHeader
       :title="editing ? name : 'New graph'"

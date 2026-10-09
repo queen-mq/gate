@@ -813,6 +813,8 @@ mod tests {
 
         assert!(!requires_admin(&Method::POST, LOGOUT_PATH));
         assert!(requires_admin(&Method::POST, "/v1/apps/a/graphs/g"));
+        assert!(requires_admin(&Method::POST, "/api/ai/chat"));
+        assert!(!session_exempt("/api/ai/chat"));
         assert!(!requires_admin(&Method::GET, "/api/graphs"));
     }
 

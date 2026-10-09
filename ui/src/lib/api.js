@@ -22,7 +22,7 @@ export const me = ref(null) // { actor, email, role }
 export const isAdmin = computed(() => me.value?.role === 'admin')
 export const READ_ONLY_NOTE = 'read-only: your account is not in GATE_ADMIN_EMAILS'
 
-async function request(path, { method = 'GET', body } = {}) {
+async function request(path, { method = 'GET', body, signal } = {}) {
   const headers = {}
   if (body !== undefined) headers['content-type'] = 'application/json'
   /* No `Authorization` header. The console used to send a bearer token out of
@@ -35,6 +35,7 @@ async function request(path, { method = 'GET', body } = {}) {
     headers,
     body: body !== undefined ? JSON.stringify(body) : undefined,
     credentials: 'same-origin',
+    signal,
   })
 
   if (res.status === 401) {
@@ -68,7 +69,7 @@ async function request(path, { method = 'GET', body } = {}) {
 
 export const api = {
   get: (p) => request(p),
-  post: (p, body) => request(p, { method: 'POST', body }),
+  post: (p, body, options = {}) => request(p, { ...options, method: 'POST', body }),
   put: (p, body) => request(p, { method: 'PUT', body }),
   patch: (p, body) => request(p, { method: 'PATCH', body }),
   del: (p) => request(p, { method: 'DELETE' }),

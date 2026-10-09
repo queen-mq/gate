@@ -299,6 +299,68 @@ Apache-2.0. See [LICENSE.md](LICENSE.md).
 
 ### Target setup and operations
 
+**AI configuration agent.** Open **AI agent** in the top navbar or **Create with AI**
+on the target list. The chat opens in a side panel over the current page, and
+closing it preserves the conversation and draft while you navigate the console.
+Select an application and describe a new target's queues,
+limits or Watch period. The agent asks for missing details, shows assumptions,
+and validates generated drafts using Gate's compiler and validation rules. It
+can repair a rejected draft once. Choose **Review in editor** to inspect the form
+or JSON, then explicitly create the graph. The agent cannot change running
+graphs or provision queues. Queue ownership and availability are checked again
+when the graph is saved.
+
+Select the provider and model in the server environment:
+
+| `GATE_AI_PROVIDER` | Default `GATE_AI_MODEL` | API key variables, in precedence order |
+| --- | --- | --- |
+| `openai` (default) | `gpt-5.6-luna` | `GATE_OPENAI_API_KEY`, `OPENAI_API_KEY` |
+| `gemini` | `gemini-3.8-flash` | `GATE_GEMINI_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY` |
+
+For Gemini 3.8 Flash, set `GATE_AI_PROVIDER=gemini` and
+`GATE_AI_MODEL=gemini-3.8-flash`; for 3.6 Flash, set
+`GATE_AI_MODEL=gemini-3.6-flash`. Supply the key through an ignored local
+environment file or a deployment secret. Gate reads process environment
+variables and does not load `.env` automatically. Never put a key in a `VITE_`
+variable or commit it. Restart Gate after changes. Without a key for the selected
+provider, the chat shows setup guidance and the wizard remains available.
+The first nonempty key for that provider wins; there is no automatic switch to
+another provider. Invalid provider names fail startup.
+
+OpenAI uses the [Responses API with structured outputs](https://developers.openai.com/api/docs/guides/structured-outputs?api-mode=responses);
+Gemini uses native [generateContent with structured outputs](https://ai.google.dev/gemini-api/docs/generate-content/structured-output).
+`GATE_AI_MODEL` can select a model supporting the chosen API and JSON schema
+output. Model selection is server-side; the browser never supplies a model or key.
+
+Both providers can draft multi-node graphs with several paths, combined time
+windows, scoped and operation-specific limits, shared budgets and payload-based
+costs. Fan-out is available when explicitly requested and duplicates messages;
+multiple paths are not operation filters. Drafts are bounded to 20 nodes and 20
+paths. Gate validates structure and budget arithmetic, not whether a quota is
+correct for your provider: review assumptions and routing before creation.
+
+The shared prompt drafts complete simple requests directly and asks at most two
+focused questions at a time for missing requirements. Complex requests distinguish
+traffic routes, cost units, per-account/operation limits, common downstream gates,
+burst behavior and capacity priorities. Refinements preserve the rest of the draft;
+validation repair must ask before changing a business requirement. Four worked
+examples cover a simple target, combined limits, an Airbnb-like topology and Watch.
+Their quotas are fictional, not vendor defaults. Tests compile those exact examples
+and check their effective budgets and routing; they do not evaluate live model quality.
+
+The public chat endpoint requires an administrator, like other console writes.
+The internal listener keeps its existing cluster-only trust boundary. Only the
+conversation, selected application, Watch availability and current draft are
+sent only to the selected provider; Gate does not fetch queue payloads or other
+graph configurations for the agent. OpenAI requests use `store: false`; Gemini
+uses individual `generateContent` calls without creating a server conversation.
+Conversations and review drafts stay
+in browser memory and clear on refresh or sign-out. Each request is limited to
+21 alternating messages, 64 KB of conversation text, two provider calls and
+150 seconds; each replica allows two concurrent requests. Provider errors are
+redacted. `GET /api/ai/status` reports availability; `POST /api/ai/chat` returns
+a validated draft or a clarification without saving it.
+
 The new-target wizard offers **global**, **per account**, **per operation** and
 **shared budget** templates. Amounts are editable examples marked `assumed`;
 verify the actual quota before enforcing them. Scoped and operation templates

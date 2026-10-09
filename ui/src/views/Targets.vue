@@ -17,6 +17,7 @@ import BudgetBar from '../components/BudgetBar.vue'
 import Icon from '../components/Icon.vue'
 import { api, num, pct, isAdmin, graphPath, DEFAULT_APP, READ_ONLY_NOTE } from '../lib/api.js'
 import { usePoll } from '../lib/poll.js'
+import { openAiAgent } from '../lib/ai-session.js'
 
 const targets = ref(null)
 const apps = ref([])
@@ -97,6 +98,7 @@ const groups = computed(() => {
         <RouterLink v-if="isAdmin" :to="{ path: '/targets/new', query: app ? { app } : {} }" class="btn btn-primary">
           <Icon name="plus" :size="14" /> New target
         </RouterLink>
+        <button v-if="isAdmin" class="btn" @click="openAiAgent(app)"><Icon name="sparkles" :size="14" /> Create with AI</button>
       </template>
     </PageHeader>
 
