@@ -38,6 +38,7 @@ use crate::obs::Traces;
 use crate::registry::Registry;
 
 pub struct App {
+    pub ai: Option<Arc<crate::ai::Agent>>,
     pub observations: parking_lot::Mutex<Vec<Arc<crate::observation::Observation>>>,
     pub conditions: parking_lot::Mutex<std::collections::HashMap<String, i64>>,
     pub auth: Option<Arc<crate::auth::Auth>>,
@@ -74,6 +75,7 @@ impl App {
     /// listeners.
     pub fn new(queen: Queen, queen_url: String) -> Self {
         Self {
+            ai: None,
             observations: Default::default(),
             conditions: Default::default(),
             auth: None,
@@ -287,6 +289,11 @@ fn routes() -> Router<Shared> {
         .route("/api/breaches/recent", get(console::recent_breaches))
         .route("/api/traces", get(console::traces))
         .route("/api/me", get(console::me))
+        .route("/api/ai/status", get(crate::ai::status))
+        .route(
+            "/api/ai/chat",
+            post(crate::ai::chat).layer(DefaultBodyLimit::max(128 * 1024)),
+        )
         .route(
             "/health",
             get(|| async { Json(json!({"status":"healthy"})) }),

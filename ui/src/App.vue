@@ -5,9 +5,11 @@ import Icon from './components/Icon.vue'
 import GateBrand from './components/GateBrand.vue'
 import SignIn from './views/SignIn.vue'
 import ThemeSelector from './components/ThemeSelector.vue'
+import AiAgentChat from './components/AiAgentChat.vue'
 import { useTheme } from './lib/theme.js'
 import { api, authState, authError, me, fetchMe, isAdmin, READ_ONLY_NOTE } from './lib/api.js'
 import { usePoll } from './lib/poll.js'
+import { aiPanel, openAiAgent, closeAiAgent, resetAiSession } from './lib/ai-session.js'
 
 const route = useRoute()
 const overview = ref(null)
@@ -39,7 +41,6 @@ const groups = [
     items: [
       { to: '/targets', label: 'Targets', icon: 'target', key: 'targets' },
       { to: '/graphs', label: 'Graphs', icon: 'graph', key: 'graphs' },
-
       { to: '/budgets', label: 'Shared budgets', icon: 'budget', key: 'budgets' },
     ],
   },
@@ -66,14 +67,18 @@ function onViewportChange(e) {
   mobileNav.value = false
 }
 watch(() => route.fullPath, () => { mobileNav.value = false })
+watch([mobileNav, () => aiPanel.open], ([navOpen, chatOpen]) => {
+  document.body.style.overflow = navOpen || chatOpen ? 'hidden' : ''
+})
 watch(mobileNav, async (open) => {
-  document.body.style.overflow = open ? 'hidden' : ''
   await nextTick()
   if (open && mobileNav.value) document.querySelector('#gate-navigation button')?.focus()
   else if (!open) document.querySelector('[aria-controls="gate-navigation"]')?.focus()
 })
 watch(authState, (state) => {
   if (state !== 'ready') {
+    closeAiAgent()
+    resetAiSession()
     mobileNav.value = false
     overview.value = null
     overviewError.value = false
@@ -265,12 +270,17 @@ const warnings = computed(() => {
           <Icon name="chevron" :size="10" class="text-fg-3 hidden sm:block" />
           <span class="text-fg-2 truncate">{{ currentPage }}</span>
         </div>
-        <div class="ml-auto flex items-center gap-4">
+        <div class="ml-auto flex items-center gap-2 sm:gap-4">
           <span class="flex items-center gap-2 text-[11px] text-fg-3" :title="overview?.queen?.url"
                 role="status">
             <span class="status-glyph" :class="brokerState === 'connected' ? 'good' : brokerState === 'down' ? 'bad' : 'muted'" />
             <span class="sr-only sm:not-sr-only" :class="brokerState === 'down' ? 'text-bad' : ''">{{ brokerLabel }}</span>
           </span>
+          <button type="button" class="btn ai-nav-trigger" aria-label="AI agent"
+                  aria-haspopup="dialog" aria-controls="gate-ai-chat" :aria-expanded="aiPanel.open"
+                  @click="openAiAgent(route.params.app || route.query.app)">
+            <Icon name="sparkles" :size="15" /><span class="hidden sm:inline">AI agent</span>
+          </button>
           <ThemeSelector v-model="theme" />
         </div>
       </header>
@@ -283,5 +293,6 @@ const warnings = computed(() => {
         </div>
       </main>
     </div>
+    <AiAgentChat />
   </div>
 </template>

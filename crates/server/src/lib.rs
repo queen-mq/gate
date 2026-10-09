@@ -18,6 +18,7 @@
 //! plane — declarations, validation, the console, sign-in, the document store —
 //! is unchanged in shape.
 
+pub mod ai;
 pub mod api;
 pub mod auth;
 pub mod breaker;
@@ -110,6 +111,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let queen = Queen::connect(Config::new(&queen_url))?;
 
     let app = Arc::new(api::App {
+        ai: Some(ai::Agent::from_env()?),
         observations: Default::default(),
         conditions: Default::default(),
         auth,

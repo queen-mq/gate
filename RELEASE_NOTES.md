@@ -2,11 +2,25 @@
 
 ## Unreleased
 
-Gate adds guided target setup and traffic insights to help configure rules,
-observe demand before choosing limits, and investigate delivery delays.
+Gate adds an OpenAI/Gemini configuration assistant, guided target setup and traffic
+insights to help configure rules, observe demand before choosing limits, and
+investigate delivery delays.
 
 ### Console and target setup
 
+- **AI configuration agent.** Open the chat from the navbar without leaving the
+  current page. Closing the panel preserves your conversation and draft.
+  Describe a new target in a conversation with
+  OpenAI or Gemini, clarify missing requirements, and refine a draft with visible
+  assumptions. Gate validates proposed configurations and offers one repair
+  attempt. Review the result in the existing form or JSON editor before saving;
+  the agent cannot change running configurations.
+- **Adaptive configuration prompt.** Complete simple requests produce a minimal
+  draft; complex topologies receive focused questions about queues, scopes, cost
+  units, shared limits, smoothing and priorities. Four validated examples include
+  an Airbnb-like flow with three inputs, shared IP ceilings and an audit copy.
+  Example quotas are fictional. Refinements preserve existing choices, and repairs
+  must ask before changing requirements to satisfy validation.
 - **Guided rule editor.** Switch between a form and JSON while keeping the same
   draft. Configure queues, budgets, costs and paths with field validation.
 - **New target wizard.** Create a target through identity, queue configuration,
@@ -47,6 +61,14 @@ observe demand before choosing limits, and investigate delivery delays.
 
 ### Upgrade notes
 
+- Select `GATE_AI_PROVIDER=openai` (default) or `gemini`. OpenAI uses
+  `GATE_OPENAI_API_KEY` or `OPENAI_API_KEY`; Gemini uses `GATE_GEMINI_API_KEY`,
+  `GEMINI_API_KEY` or `GOOGLE_API_KEY`. `GATE_AI_MODEL` defaults to `gpt-5.6-luna`
+  for OpenAI and `gemini-3.8-flash` for Gemini; `gemini-3.6-flash` is also
+  selectable. Without the selected provider's key, the UI shows setup guidance.
+  Public chat access is restricted to administrators. Both adapters have bounded
+  retries, redact provider errors and validate drafts before review. OpenAI uses
+  Responses with `store: false`; Gemini uses native `generateContent` requests.
 - Gate-owned ingress and interior queues now enable 30-day retention for messages
   already passed by every consumer group. Pending work has no age limit. The
   policy is applied during graph provisioning and restoration; application-owned
@@ -75,9 +97,19 @@ observe demand before choosing limits, and investigate delivery delays.
 - 274 Rust tests passed, including 60 integration tests against Queen.
 - An additional Queen integration test verifies the 30-day retention settings on
   creation and redeclaration, and preserves application-owned queue configuration.
-- 21 UI tests passed, along with frontend and backend builds and Clippy checks.
+- The AI addition passes 98 server library tests, including 15 AI tests with
+  mock OpenAI and Gemini servers covering provider selection, credentials,
+  conversation mapping, validation, repair, error handling and write isolation.
+  Both adapters preserve complex graphs with multiple paths, fan-out, shared
+  budgets, operation-scoped limits and payload-based costs.
+  The prompt's four reference documents also pass Gate validation, with checks on
+  effective windows, weighted units, capacity shares and routing. These checks
+  validate examples and adapters, not a live model's interpretation of requirements.
+- 24 UI tests passed, along with frontend and backend builds and Clippy checks.
 - Browser checks covered creation from a template, cloning, integration examples,
   simulation, diagnosis links, history charts and the mobile layout.
+- AI browser checks use simulated provider responses; a live provider request
+  requires a configured server API key.
 
 See the [README](README.md#target-setup-and-operations) for setup instructions and
 the read-only diagnostics, timeline and simulation endpoints.
