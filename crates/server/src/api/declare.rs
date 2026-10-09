@@ -514,6 +514,7 @@ pub async fn view(st: &Shared, rt: &Arc<GraphRuntime>) -> queen_mq::Result<Value
         "persisted": rt.persisted.load(std::sync::atomic::Ordering::Relaxed),
         "namespace": rt.plan.namespace,
         "counters": rt.plan.counters_window_seconds,
+        "watch": rt.doc.watch,
         "nodes": nodes,
         "stages": stages,
         "paths": rt.doc.paths.iter().map(|p| json!({

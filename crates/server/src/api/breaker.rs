@@ -20,6 +20,13 @@ async fn trip(
             format!("no node `{node}` in graph `{}`", rt.key()),
         )
     })?;
+    if rt.doc.watch.is_some() {
+        return Err(Fail(
+            StatusCode::CONFLICT,
+            "This graph is in watch: backoff cannot stop traffic until limits are activated."
+                .into(),
+        ));
+    }
     let out = crate::breaker::trip(&st.budgets, &rt.doc.application, &rt.doc.graph, np, &body)
         .await
         .map_err(|e| Fail(StatusCode::BAD_GATEWAY, e.to_string()))?;

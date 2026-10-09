@@ -84,10 +84,32 @@ CREATE TABLE IF NOT EXISTS gate.traces (
 
 CREATE INDEX IF NOT EXISTS traces_by_time ON gate.traces (at DESC);
 CREATE INDEX IF NOT EXISTS traces_by_outcome ON gate.traces (outcome, at DESC);
+CREATE TABLE IF NOT EXISTS gate.watch_samples (
+    application TEXT NOT NULL, graph TEXT NOT NULL, node TEXT NOT NULL,
+    session BIGINT NOT NULL, recorder TEXT NOT NULL, second BIGINT NOT NULL,
+    items BIGINT NOT NULL, cost BIGINT NOT NULL,
+    PRIMARY KEY (recorder, second)
+);
+CREATE INDEX IF NOT EXISTS watch_samples_lookup ON gate.watch_samples (application, graph, node, session, second);
+CREATE TABLE IF NOT EXISTS gate.watch_recorders (
+    recorder TEXT PRIMARY KEY, application TEXT NOT NULL, graph TEXT NOT NULL, node TEXT NOT NULL,
+    session BIGINT NOT NULL, started BIGINT NOT NULL, through BIGINT NOT NULL, lost BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS watch_recorders_lookup ON gate.watch_recorders (application, graph, node, session);
+CREATE TABLE IF NOT EXISTS gate.snapshots (
+    application TEXT NOT NULL, graph TEXT NOT NULL, node TEXT NOT NULL,
+    minute BIGINT NOT NULL, at BIGINT NOT NULL, body JSONB NOT NULL,
+    PRIMARY KEY (application, graph, node, minute)
+);
+CREATE TABLE IF NOT EXISTS gate.config_events (
+    id BIGSERIAL PRIMARY KEY, application TEXT NOT NULL, graph TEXT NOT NULL,
+    at BIGINT NOT NULL, body JSONB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS config_events_lookup ON gate.config_events (application, graph, at);
 "#;
 
 pub struct History {
-    pool: Pool,
+    pub(crate) pool: Pool,
 }
 
 impl History {
@@ -240,6 +262,39 @@ impl History {
                 })
             })
             .collect())
+    }
+
+    /// Completed minute buckets for one node, summed across its paths.
+    /// Bounds exclude partial minutes and traffic preceding this watch session.
+    pub async fn watch_minutes(
+        &self,
+        app: &str,
+        target: &str,
+        since: i64,
+        until: i64,
+    ) -> Result<Vec<(i64, f64)>, String> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("history connection: {e}"))?;
+        let rows = client.query(
+            "SELECT COALESCE(SUM(admitted), 0)::bigint, COALESCE(SUM(cost_est), 0)::double precision
+             FROM gate.rollups WHERE application = $1 AND target = $2 AND minute >= $3 AND minute < $4
+             GROUP BY minute ORDER BY minute",
+            &[&app, &target, &since, &until],
+        ).await.map_err(|e| format!("watch history: {e}"))?;
+        rows.into_iter()
+            .map(|r| {
+                let admitted = r
+                    .try_get(0)
+                    .map_err(|e| format!("watch history row: {e}"))?;
+                let cost = r
+                    .try_get(1)
+                    .map_err(|e| format!("watch history row: {e}"))?;
+                Ok((admitted, cost))
+            })
+            .collect()
     }
 
     /// Admissions per second for one lane, from the table rather than from

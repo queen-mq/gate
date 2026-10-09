@@ -62,7 +62,7 @@ const router = createRouter({
     { path: '/', component: () => import('./views/Overview.vue'), meta: { nav: 'overview' } },
 
     { path: '/targets', component: () => import('./views/Targets.vue'), meta: { nav: 'targets' } },
-    { path: '/targets/new', redirect: '/graphs/new', meta: { nav: 'graphs' } },
+    { path: '/targets/new', component: () => import('./views/TargetNew.vue'), meta: { nav: 'targets' } },
 
     // A graph is declared whole and drawn whole.
     { path: '/graphs', component: () => import('./views/Graphs.vue'), meta: { nav: 'graphs' } },

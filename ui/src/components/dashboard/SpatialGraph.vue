@@ -53,6 +53,7 @@ let expiry
 const activity = ref([])
 const tilt = ref({ x: 0, y: 0 })
 const selected = ref('')
+defineExpose({ selectNode: (id) => { selected.value = id } })
 const model = computed(() => graphModel(props.graph))
 const layout = computed(() =>
   layoutTopology(model.value.nodes, model.value.edges),
@@ -155,9 +156,11 @@ const color = (n) =>
   `var(--${n.tone === 'bad' ? 'bad' : n.tone === 'warn' || selectedNode.value?.id === n.id ? 'spatial-accent' : 'text-2'})`
 const short = (name) => (name.length > 20 ? `${name.slice(0, 18)}…` : name)
 const reading = (value) => (value == null ? '—' : num(value))
+const watching = computed(() => !!(props.graph.watch || props.graph.spec?.watch))
 const selectedState = computed(() =>
   !props.graph.running
     ? 'down'
+    : watching.value ? 'watch'
     : selectedNode.value?.breaker
       ? 'breached'
       : selectedNode.value?.budgets?.some((b) => b.confidence === 'assumed')
@@ -364,7 +367,7 @@ function budgetLink(node, budget) {
             role="button"
             tabindex="0"
             :aria-pressed="selectedNode?.id === node.id"
-            :aria-label="`${node.name}, ${node.kind}, ${node.usage == null ? 'budget usage unavailable' : pct(node.usage)}. Inspect node.`"
+            :aria-label="`${node.name}, ${node.kind}, ${watching ? 'watching traffic' : node.usage == null ? 'budget usage unavailable' : pct(node.usage)}. Inspect node.`"
             :opacity="
               highlightedPath && !(node.paths ?? []).includes(highlightedPath)
                 ? 0.3
@@ -472,7 +475,7 @@ function budgetLink(node, budget) {
             >
               {{ node.kind }}
               <tspan v-if="node.ingressQueue && !node.output">
-                · {{ node.breaker ? 'backoff' : pct(node.usage) }}
+                · {{ watching ? 'watch' : node.breaker ? 'backoff' : pct(node.usage) }}
               </tspan>
             </text>
             <text
@@ -488,6 +491,7 @@ function budgetLink(node, budget) {
                   ? `${reading(node.waiting_for_workers)} for workers`
                   : node.breaker
                     ? 'Vendor backoff'
+                    : watching ? 'Watch traffic'
                     : node.usage == null
                       ? node.budgets.length
                         ? 'Usage unavailable'
@@ -603,6 +607,7 @@ function budgetLink(node, budget) {
         {{
           selectedNode.output
             ? 'Admitted work, ready for your consumers.'
+            : watching ? 'Traffic is observed without applying limits.'
             : selectedNode.budgets?.length
               ? 'No aggregate budget reading is available.'
               : 'No budget declared on this node.'
@@ -620,7 +625,7 @@ function budgetLink(node, budget) {
           <dd>{{ reading(selectedNode.admitted) }}</dd>
         </div>
         <div v-if="!selectedNode.output">
-          <dt>Waiting for budget</dt>
+          <dt>{{ watching ? 'Waiting to relay' : 'Waiting for budget' }}</dt>
           <dd>{{ reading(selectedNode.waiting_for_budget) }}</dd>
         </div>
         <div>

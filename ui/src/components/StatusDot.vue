@@ -12,11 +12,12 @@ const props = defineProps({
 
 const TONE = {
   flowing: 'good', pacing: 'good', admitting: 'good', ok: 'good', live: 'good',
-  parked: 'muted', idle: 'muted', draining: 'muted',
+  watch: 'muted', parked: 'muted', idle: 'muted', draining: 'muted',
   saturating: 'warn', blind: 'warn', degraded: 'warn', lagging: 'warn',
   breached: 'bad', throttled: 'bad', unreachable: 'bad', down: 'bad', blocked: 'bad',
 }
 const LABEL = {
+  watch: 'watching traffic',
   pacing: 'at cap, pacing',
   parked: 'parked until lease expiry',
   saturating: 'backlog growing',

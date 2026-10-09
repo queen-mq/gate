@@ -244,6 +244,34 @@
   }
   .section-count { @apply text-xs font-normal text-fg-3 tabular-nums; }
 
+  .editor-section { @apply p-5 sm:p-6; }
+  .editor-section-title { @apply text-[14px] font-semibold tracking-tight; }
+  .editor-toolbar { @apply flex flex-wrap items-center justify-between gap-3 mb-5; }
+  .editor-tabs { @apply inline-flex gap-1 p-1 rounded-lg border border-line bg-surface; }
+  .editor-tabs button { @apply px-4 py-1.5 rounded-md text-xs text-fg-2 disabled:opacity-40; }
+  .editor-tabs button[aria-pressed='true'] { @apply bg-selected text-fg font-semibold; }
+  .editor-budget { @apply rounded-lg border border-line bg-surface-2 p-4; }
+  .editor-details { @apply border-t border-line pt-4; }
+  .editor-details summary { @apply cursor-pointer text-xs font-medium text-fg-2; }
+  .editor-note { @apply rounded-md bg-surface-2 px-3 py-2.5 text-xs text-fg-3 leading-relaxed; }
+  .editor-note code { @apply font-mono break-all; }
+  .editor-text-button { @apply text-xs text-link underline underline-offset-4; }
+  .editor-errors { @apply rounded-lg border border-bad/25 bg-bad-dim px-5 py-4 text-[12.5px] text-bad; }
+  .editor-hop-number { @apply inline-grid place-items-center w-7 h-8 text-xs text-fg-3 shrink-0; }
+  .editor-json-preview { @apply max-h-[420px] overflow-auto rounded-lg border border-line bg-bg p-4 text-[11.5px] font-mono whitespace-pre-wrap break-all; }
+  .target-wizard { @apply max-w-[1100px] mx-auto; }
+  .wizard-steps { @apply grid grid-cols-4 gap-2 mb-6; }
+  .wizard-steps button { @apply flex flex-col sm:flex-row items-center gap-2 sm:gap-3 p-3 rounded-lg border border-line bg-surface text-fg-3 text-xs sm:text-[13px] disabled:cursor-default; }
+  .wizard-steps .current { @apply border-fg-3 text-fg bg-selected font-semibold; }
+  .wizard-step-number { @apply grid place-items-center rounded-full h-6 w-6 border border-line-2 text-[11px] shrink-0; }
+  .wizard-steps .current .wizard-step-number { @apply bg-fg text-bg border-fg; }
+  .wizard-steps .complete { @apply text-fg-2; }
+  .wizard-review { @apply grid sm:grid-cols-2 gap-4 rounded-lg bg-surface-2 p-4; }
+  .wizard-review > div { @apply min-w-0 flex flex-col gap-1; }
+  .wizard-review span { @apply text-[11px] text-fg-3; }
+  .wizard-review strong { @apply text-[12.5px] font-medium; }
+  .wizard-footer { @apply flex items-center gap-3 pt-5 mt-6 border-t border-line; }
+
   .skeleton {
     @apply rounded-sm animate-shimmer;
     background: linear-gradient(90deg, var(--surface-2) 25%, var(--border) 37%, var(--surface-2) 63%);
@@ -352,3 +380,23 @@
     }
   }
 }
+
+.template-option { padding: 16px; border: 1px solid var(--border); border-radius: 9px; text-align: left; transition: border-color .15s, background .15s; }
+.template-option strong { display: block; font-size: 13px; }
+.template-option span { display: block; font-size: 12px; color: var(--text-3); margin-top: 5px; line-height: 1.5; }
+.template-option.selected { border-color: var(--link); background: color-mix(in srgb, var(--link) 8%, transparent); }
+.diagnostic-row { padding: 13px 15px; border: 1px solid var(--border); border-left: 3px solid var(--text-3); border-radius: 7px; }
+.diagnostic-bad { border-left-color: var(--bad); }
+.diagnostic-warn { border-left-color: var(--warn); }
+.simulation-results { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.simulation-results > div { padding: 14px; border: 1px solid var(--border); border-radius: 8px; }
+.simulation-results span { display: block; color: var(--text-3); font-size: 11px; }
+.simulation-results strong { display: block; font-size: 25px; font-variant-numeric: tabular-nums; margin-top: 7px; }
+.simulation-results small { font-size: 13px; font-weight: 400; }
+.history-chart { border: 1px solid var(--border); border-radius: 9px; padding: 14px; min-width: 0; }
+.chart-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; }
+.chart-reading { min-height: 32px; }
+[id^="node-"] { scroll-margin-top: 24px; }
+@media (max-width: 640px) { .simulation-results { grid-template-columns: repeat(2, minmax(0, 1fr)); } .integration-guide summary span { display: block; margin: 5px 0 0; font-size: 12px; } }
+.history-chart { --chart-incoming: #0284c7; --chart-relayed: #059669; --chart-relay-queue: #7c3aed; --chart-worker-queue: #b7791f; --chart-age: #c2410c; }
+.dark .history-chart { --chart-incoming: #38bdf8; --chart-relayed: #34d399; --chart-relay-queue: #a78bfa; --chart-worker-queue: #fbbf24; --chart-age: #fb923c; }

@@ -29,6 +29,7 @@ use serde_json::{json, Value};
 /// batch.
 #[derive(Debug, Default)]
 pub struct StageCounters {
+    pub observation: Option<std::sync::Arc<crate::observation::Observation>>,
     pub popped: AtomicU64,
     pub admitted: AtomicU64,
     /// Batches where a refusal cut the batch short and the tail was left
@@ -84,6 +85,11 @@ pub struct StageCounters {
 }
 
 impl StageCounters {
+    pub fn observe(&self, items: u64, cost: u64) {
+        if let Some(recorder) = &self.observation {
+            recorder.record(crate::now_ms(), items, cost);
+        }
+    }
     /// Record admitted cost without wrapping or losing concurrent updates.
     pub fn add_cost(&self, cost: u64) {
         // A CAS loop keeps this compatible with the workspace's Rust 1.88 MSRV.

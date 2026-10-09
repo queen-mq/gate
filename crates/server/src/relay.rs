@@ -1164,6 +1164,7 @@ async fn stage_and_commit(
             st.counters.foreign.fetch_add(foreign, Ordering::Relaxed);
             st.counters.commits.fetch_add(1, Ordering::Relaxed);
             st.counters.add_cost(cost.max(0) as u64);
+            st.counters.observe(forwarded, cost.max(0) as u64);
             // The cursor moved, so whatever was being counted at the old head is
             // over. The head comparison in `note_failed_settle` would notice on
             // its own; this keeps the count honest without waiting for a second
@@ -1249,6 +1250,7 @@ async fn settle_head(ctx: &Ctx, m: &Message, kind: &Kind) -> bool {
             // Utilisation is read from this number.
             let cost = cost_of(&st.node.cost, &m.data).unwrap_or(1).max(0) as u64;
             st.counters.add_cost(cost);
+            st.counters.observe(1, cost);
             true
         }
         // Already downstream: settle it and move on. It does NOT count as
