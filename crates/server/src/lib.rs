@@ -26,8 +26,11 @@ pub mod depth;
 pub mod eta;
 pub mod graph;
 pub mod history;
+mod insight_history;
+pub mod insights;
 pub mod knobs;
 pub mod obs;
+pub mod observation;
 pub mod registry;
 pub mod relay;
 pub mod store;
@@ -107,6 +110,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let queen = Queen::connect(Config::new(&queen_url))?;
 
     let app = Arc::new(api::App {
+        observations: Default::default(),
+        conditions: Default::default(),
         auth,
         budgets: budget::Budgets::new(queen.clone()),
         queen,
@@ -143,6 +148,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         ),
     );
     spawn_counters(app.clone());
+    insights::spawn(app.clone());
 
     // Two listeners, the SAME router. The internal one has no authentication and
     // is reachable only from inside the cluster; the public one requires a
@@ -235,7 +241,7 @@ pub fn spawn_counters(app: api::Shared) -> tokio::task::JoinHandle<()> {
                         HashMap::new();
                     let mut checkpoints: HashMap<String, Vec<CounterCheckpoint>> = HashMap::new();
                     for s in &g.stages {
-                        let key = format!("{}/{}", g.key(), s.key());
+                        let key = format!("{}/{}/{:?}", g.key(), s.key(), s.started_at);
                         active.insert(key.clone());
                         let target = format!("{}.{}", g.doc.graph, s.stage.node);
                         let c = &s.counters;
@@ -250,9 +256,8 @@ pub fn spawn_counters(app: api::Shared) -> tokio::task::JoinHandle<()> {
                             .entry(target.clone())
                             .or_default()
                             .push((key, now3));
-                        if d == (0, 0, 0) {
-                            continue;
-                        }
+                        // Persist measured zero too: the dashboard must tell an
+                        // idle minute from a missing or failed history write.
                         per_target.entry(target).or_default().insert(
                             s.stage.path.clone(),
                             history::Bucket {

@@ -623,7 +623,11 @@ pub fn compile_with(doc: &GraphDoc, opts: &PlanOpts) -> Plan {
             name.clone(),
             NodePlan {
                 name: name.clone(),
-                budgets: compile_budgets(app, graph, name, node, opts.assumed_factor),
+                budgets: if doc.watch.is_some() {
+                    Vec::new()
+                } else {
+                    compile_budgets(app, graph, name, node, opts.assumed_factor)
+                },
                 cost: node.cost.clone(),
                 ingress_queue,
                 ingress_owned: node
@@ -636,11 +640,12 @@ pub fn compile_with(doc: &GraphDoc, opts: &PlanOpts) -> Plan {
                     .as_ref()
                     .filter(|i| i.is_enabled())
                     .is_some_and(|i| i.http()),
-                ingress_shed: node
-                    .ingress
-                    .as_ref()
-                    .filter(|i| i.is_enabled())
-                    .is_some_and(|i| i.shed()),
+                ingress_shed: doc.watch.is_none()
+                    && node
+                        .ingress
+                        .as_ref()
+                        .filter(|i| i.is_enabled())
+                        .is_some_and(|i| i.shed()),
                 interior_queue: interior_queue(app, graph, name),
                 egress_queue: node.egress.as_ref().map(|e| e.queue().to_string()),
                 egress_group: node
@@ -733,7 +738,12 @@ pub fn compile_with(doc: &GraphDoc, opts: &PlanOpts) -> Plan {
                         .and_then(|n| n.concurrency)
                         .or(opts.concurrency)
                         .unwrap_or_else(|| {
-                            fitting_workers(np, share, partitions_hint, opts.lane_capacity)
+                            if doc.watch.is_some() {
+                                // No ceiling bounds throughput in watch mode.
+                                partitions_hint.max(1)
+                            } else {
+                                fitting_workers(np, share, partitions_hint, opts.lane_capacity)
+                            }
                         })
                         .max(1),
                     destinations,
@@ -843,7 +853,11 @@ pub fn compile_with(doc: &GraphDoc, opts: &PlanOpts) -> Plan {
         nodes,
         stages,
         queues,
-        counters_window_seconds: doc.counters.as_ref().map(|c| c.window_seconds),
+        counters_window_seconds: if doc.watch.is_some() {
+            Some(crate::doc::COUNTERS_WINDOW_SECONDS)
+        } else {
+            doc.counters.as_ref().map(|c| c.window_seconds)
+        },
         max_attempts: doc.max_attempts.unwrap_or(DEFAULT_MAX_ATTEMPTS).max(1),
     }
 }

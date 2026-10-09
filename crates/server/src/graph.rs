@@ -83,10 +83,30 @@ pub async fn declare(app: &Shared, doc: GraphDoc) -> Result<Value, Refusal> {
 /// see half a configuration and reap the other half.
 pub async fn declare_locked(
     app: &Shared,
-    doc: GraphDoc,
+    mut doc: GraphDoc,
     from_caller: bool,
 ) -> Result<Value, Refusal> {
     let key = doc.key();
+    let old = app.registry.get(&doc.application, &doc.graph);
+    let predecessor = if from_caller {
+        crate::store::load_one(&app.queen, &doc.application, &doc.graph).await.map_err(|e| {
+            Refusal::Gateway(format!("`{key}` was not declared: its stored predecessor could not be read ({e}), so Gate cannot safely decide whether this change needs a version bump"))
+        })?
+    } else {
+        None
+    };
+    if from_caller && doc.watch.is_some() {
+        if app.history.is_none() {
+            return Err(Refusal::Invalid("Watch requires durable history. Configure Gate's PostgreSQL history connection before creating an observation target.".into()));
+        }
+        start_watch(
+            &mut doc,
+            predecessor
+                .as_ref()
+                .or_else(|| old.as_ref().map(|rt| &rt.doc)),
+            crate::now_ms(),
+        );
+    }
     let (plan, facts) = compile(app, &doc).await;
 
     // Validate the resolved plan, not a second compilation with library
@@ -119,7 +139,6 @@ pub async fn declare_locked(
         return Err(Refusal::Invalid(join(&fatal)));
     }
 
-    let old = app.registry.get(&doc.application, &doc.graph);
     if from_caller {
         if let Some(old) = &old {
             require_version_bump(&old.doc, &doc)?;
@@ -131,15 +150,8 @@ pub async fn declare_locked(
         // prefix scan below, so pagination cannot make an existing graph look
         // new. A failed read refuses the mutation: without the predecessor Gate
         // cannot prove that replacing it at this version is safe.
-        match crate::store::load_one(&app.queen, &doc.application, &doc.graph).await {
-            Ok(Some(stored)) => require_version_bump(&stored, &doc)?,
-            Ok(None) => {}
-            Err(e) => {
-                return Err(Refusal::Gateway(format!(
-                    "`{key}` was not declared: its stored predecessor could not be read ({e}), so \
-                     Gate cannot safely decide whether this change needs a version bump"
-                )))
-            }
+        if let Some(stored) = &predecessor {
+            require_version_bump(stored, &doc)?;
         }
         // Ask the STORE the same ownership question, because a declare lands on
         // ONE replica: a graph declared on another pod need not be in this
@@ -218,6 +230,11 @@ pub async fn declare_locked(
             let detail = match failed.restored {
                 Some(rt) => {
                     let version = rt.doc.version;
+                    app.observations.lock().extend(
+                        rt.stages
+                            .iter()
+                            .filter_map(|s| s.counters.observation.clone()),
+                    );
                     app.registry.put(rt);
                     format!(
                         "provisioning failed: {}; still serving version {version}",
@@ -239,6 +256,11 @@ pub async fn declare_locked(
             return Err(Refusal::Gateway(detail));
         }
     };
+    app.observations.lock().extend(
+        rt.stages
+            .iter()
+            .filter_map(|s| s.counters.observation.clone()),
+    );
     app.registry.put(rt.clone());
 
     if from_caller {
@@ -246,7 +268,14 @@ pub async fn declare_locked(
         // a graph that failed to provision would come back on the next boot and
         // fail again, for ever.
         match crate::store::save(&app.queen, &doc).await {
-            Ok(()) => rt.persisted.store(true, Ordering::Relaxed),
+            Ok(()) => {
+                rt.persisted.store(true, Ordering::Relaxed);
+                if let Some(history) = &app.history {
+                    if let Err(error) = history.config_event(&doc, predecessor.as_ref()).await {
+                        tracing::warn!(%error, "configuration saved, but timeline annotation could not be recorded");
+                    }
+                }
+            }
             // A declare that did not persist is not a declare that happened.
             //
             // It used to warn and answer 200. With a reconcile loop that is a
@@ -270,6 +299,22 @@ pub async fn declare_locked(
     }
 
     Ok(resolved(&rt, &gate_core::warnings_with(&doc, &facts)))
+}
+
+fn start_watch(doc: &mut GraphDoc, previous: Option<&GraphDoc>, now: i64) {
+    if let Some(watch) = &mut doc.watch {
+        // Repeated syncs and edits must not restart the observation timer.
+        // The store is authoritative when this replica has not reconciled yet.
+        watch.started_at = Some(
+            previous
+                .and_then(|d| d.watch.as_ref())
+                .and_then(|w| w.started_at)
+                .unwrap_or(now),
+        );
+        doc.counters.get_or_insert(gate_core::Counters {
+            window_seconds: gate_core::COUNTERS_WINDOW_SECONDS,
+        });
+    }
 }
 
 /// Apply a document the store already holds. No version-bump check, and no save.
@@ -323,6 +368,9 @@ fn join(problems: &[Problem]) -> String {
 
 fn require_version_bump(old: &GraphDoc, new: &GraphDoc) -> Result<(), Refusal> {
     if gate_core::needs_version_bump(old, new) && new.version <= old.version {
+        if old.watch.is_some() != new.watch.is_some() {
+            return Err(Refusal::Conflict(format!("Changing between watch and enforcement requires a version above {}. Queues and consumer groups stay the same when routing is unchanged.", old.version)));
+        }
         return Err(Refusal::Conflict(format!(
             "this change re-founds a counter or strands a queue (a new key starts at zero while \
              the old one counts down its TTL, and work already in an interior queue has no \
@@ -440,4 +488,32 @@ pub fn topology(rt: &Arc<GraphRuntime>) -> Value {
             .map(|(a, b)| json!({ "from": a, "to": b }))
             .collect::<Vec<_>>(),
     })
+}
+
+#[cfg(test)]
+mod watch_tests {
+    use super::*;
+
+    #[test]
+    fn watch_start_is_server_owned_and_repeated_declarations_keep_it() {
+        let mut doc: GraphDoc = serde_json::from_value(json!({
+            "application":"a", "graph":"g", "version":1, "nodes":{}, "paths":[],
+            "watch":{"durationSeconds":3600,"startedAt":1}
+        }))
+        .unwrap();
+        start_watch(&mut doc, None, 1000);
+        assert_eq!(doc.watch.as_ref().unwrap().started_at, Some(1000));
+        assert_eq!(doc.counters.as_ref().unwrap().window_seconds, 60);
+        let previous = doc.clone();
+        doc.watch.as_mut().unwrap().started_at = Some(999999);
+        start_watch(&mut doc, Some(&previous), 2000);
+        assert_eq!(doc.watch.as_ref().unwrap().started_at, Some(1000));
+        doc.watch.as_mut().unwrap().duration_seconds = 7200;
+        start_watch(&mut doc, Some(&previous), 3000);
+        assert_eq!(doc.watch.as_ref().unwrap().ends_at(), Some(7201000));
+        let mut enforced = previous;
+        enforced.watch = None;
+        start_watch(&mut doc, Some(&enforced), 4000);
+        assert_eq!(doc.watch.as_ref().unwrap().started_at, Some(4000));
+    }
 }

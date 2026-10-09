@@ -94,8 +94,8 @@ const groups = computed(() => {
                 class="absolute left-3 top-1/2 -translate-y-1/2 text-fg-3 pointer-events-none" />
           <input v-model="q" class="input w-[200px] pl-9" placeholder="Filter targets" aria-label="Filter targets" />
         </div>
-        <RouterLink v-if="isAdmin" to="/graphs/new" class="btn btn-primary">
-          <Icon name="plus" :size="14" /> New graph
+        <RouterLink v-if="isAdmin" :to="{ path: '/targets/new', query: app ? { app } : {} }" class="btn btn-primary">
+          <Icon name="plus" :size="14" /> New target
         </RouterLink>
       </template>
     </PageHeader>
@@ -117,8 +117,8 @@ const groups = computed(() => {
         Declare one here, or from a caller with
         <span class="kbd">PUT /v1/apps/{application}/graphs/{name}</span>.
       </p>
-      <RouterLink v-if="!q && !app && isAdmin" to="/graphs/new" class="btn btn-primary mt-5">
-        <Icon name="plus" :size="14" /> New graph
+      <RouterLink v-if="!q && !app && isAdmin" to="/targets/new" class="btn btn-primary mt-5">
+        <Icon name="plus" :size="14" /> New target
       </RouterLink>
       <p v-else-if="!q && !app" class="text-[12px] text-fg-3 mt-4">{{ READ_ONLY_NOTE }}</p>
     </div>
@@ -149,13 +149,14 @@ const groups = computed(() => {
               </div>
               <div class="text-[12.5px] text-fg-2 mt-0.5 truncate">
                 {{ (t.paths ?? t.lanes ?? []).map((l) => l.name).join(' · ') }}
-                <span class="text-fg-3">— {{ t.budgets_total }} budget{{ t.budgets_total === 1 ? '' : 's' }}</span>
+                <span v-if="t.watch" class="text-fg-3">— {{ t.at >= t.watch.startedAt + t.watch.durationSeconds * 1000 ? 'ready to configure limits' : 'observing traffic' }}</span>
+                <span v-else class="text-fg-3">— {{ t.budgets_total }} budget{{ t.budgets_total === 1 ? '' : 's' }}</span>
               </div>
             </div>
 
             <!-- The counter closest to refusing, named, because "87%" of what is
                  the question. -->
-            <div class="hidden md:block flex-1 min-w-0">
+            <div v-if="!t.watch" class="hidden md:block flex-1 min-w-0">
               <div class="flex items-baseline gap-2 mb-1.5">
                 <span class="font-mono text-[11.5px] text-fg-2 truncate">{{ t.worst_budget_id }}</span>
                 <span class="chip shrink-0 tabular-nums">{{ num(t.worst_used) }} / {{ num(t.worst_cap) }}</span>
@@ -163,7 +164,7 @@ const groups = computed(() => {
               <BudgetBar :used="t.worst_used" :cap="t.worst_cap" :assumed="t.worst_assumed" />
             </div>
 
-            <div class="w-16 text-right shrink-0 tabular-nums">
+            <div v-if="!t.watch" class="w-16 text-right shrink-0 tabular-nums">
               <div class="text-[15px] font-semibold">{{ pct(t.worst_cap ? t.worst_used / t.worst_cap : 0) }}</div>
               <div class="text-[11px] text-fg-3">of cap</div>
             </div>

@@ -452,6 +452,7 @@ pub fn from_v1_target(spec: &v1::TargetSpec) -> Result<Migrated, Refused> {
             paths,
             max_attempts: None,
             counters: None,
+            watch: None,
         },
         warnings: out,
     })
@@ -603,6 +604,7 @@ pub fn from_v1_graph(spec: &v1::GraphSpec) -> Result<Migrated, Refused> {
             paths,
             max_attempts,
             counters: None,
+            watch: None,
         },
         warnings: out,
     })

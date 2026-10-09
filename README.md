@@ -186,6 +186,27 @@ reaches it — and `GATE_PUBLIC_BIND` requires a Google session on every route. 
 the local sign-in bypass and Gate refuses to boot with it set on an `https` public URL;
 `GATE_ADMIN_EMAILS` is what makes that identity able to write rather than only read.
 
+In the console, **Targets → New target** opens a four-step wizard: application and name,
+incoming and outgoing queues, rate limits, and a review before creation. For a graph with several
+nodes, use **Graphs → New graph**. The **Edit** page offers a guided form and the JSON editor over
+the same draft; switching views keeps the limits, cost settings, shared counters and paths.
+
+Choose **Watch traffic** to observe a target before setting limits. Select an observation period
+between two minutes and 30 days. Gate still consumes the ingress and relays to the egress; your
+workers consume that outgoing queue. Watch requires PostgreSQL history, enables minute roll-ups,
+and applies no budgets or ingress load shedding. Limits retained in the document remain inactive.
+The target page shows relayed items, average cost per second and peak cost per minute for complete
+minutes within the observation period. Expiry marks it ready for review and keeps traffic in watch.
+**Configure limits** opens the form with enforcement selected; enter limits and save to activate
+them. Mode changes require a higher version, which the form sets automatically. Unchanged routes
+retain their queue names and consumer groups. Observed traffic describes demand; it does not prove
+the provider's quota or reveal bursts shorter than a minute.
+
+The JSON equivalent adds `"watch": {"durationSeconds": 86400}` to the graph. Budgets may be empty;
+the server persists `watch.startedAt` as Unix milliseconds and keeps it across declarations and
+restarts. Remove `watch`, supply valid budgets and increase `version` to enforce limits. The console
+reads its observation summary at `GET /api/apps/:app/graphs/:graph/watch`.
+
 Building from source requires Node.js 24 for the embedded console; the root `.nvmrc` selects it.
 
 ```bash
@@ -229,6 +250,14 @@ never advance its cursor again. The first declare of a graph provisions those qu
 and head are the same thing and nothing changes; a restart finds the group already there and the
 broker leaves its cursor alone.
 
+**Queue retention.** Gate-owned ingress and interior queues retain completed messages for
+30 days (`completedRetentionSeconds: 2592000`, with retention enabled). Only messages older
+than that threshold and passed by every consumer group are eligible for cleanup. Pending
+work has no age limit (`retentionSeconds: 0`, `maxWaitTimeSeconds: 0`), so waiting for a
+budget cannot expire it. Gate applies this policy when provisioning or restoring a graph.
+Application-owned ingress and egress queues retain their own configuration; configure their
+retention separately in Queen.
+
 **Replicas are safe.** Declarations live in `queen.kv` and every replica reconciles against them on
 that timer; counters are one row each, so N replicas spend one budget.
 
@@ -267,3 +296,68 @@ it server-side, and it overwrites whatever a producer wrote on the first hop.
 ## Licence
 
 Apache-2.0. See [LICENSE.md](LICENSE.md).
+
+### Target setup and operations
+
+The new-target wizard offers **global**, **per account**, **per operation** and
+**shared budget** templates. Amounts are editable examples marked `assumed`;
+verify the actual quota before enforcing them. Scoped and operation templates
+also retain a global ceiling. Shared keys join an application-wide allowance.
+
+**Clone** opens a new graph draft with the same rules and paths. It resets the
+name, version and Watch timer, gives the clone Gate-owned ingress queues and
+requires new outgoing queue names. Shared budget keys are preserved and called
+out for review. The **Integration guide** uses resolved queues and the configured
+worker group to generate JavaScript producer/consumer and optional HTTP examples.
+It opens automatically after creation and remains available on the graph page.
+
+**Why is traffic waiting?** checks broker availability, stopped relays, repeated
+cursor failures, active backoff, recent budget refusals and outgoing worker
+backlog. Each finding names the next check and links to its node. Duration means
+first observed on the responding replica, and resets after recovery or restart;
+worker backlog alone does not prove that a worker is broken.
+
+**Traffic over time** shows a selectable node over 15 minutes, 1, 6 or 24 hours:
+relayed items, incoming estimates, relay/worker backlog and oldest pending age.
+Successful configuration changes appear as timeline markers. Queue snapshots and
+annotations require the existing PostgreSQL history connection; queue sampling is
+opt-in through `counters` (enabled automatically in Watch and wizard templates).
+Incoming estimates use changes in consumer positions for a single-path ingress;
+retention or cursor changes can affect the estimate. Shared interior-queue traffic
+cannot be attributed from these positions and is shown as unknown. Broker ages
+are group-specific where available. Missing history and timestamps remain gaps.
+Snapshots and configuration annotations are retained for 31 days. An annotation
+is operational context, not a revision store or rollback mechanism.
+
+### Simulating a Watch limit
+
+**Try a limit** replays recorded traffic against one global allowance without
+changing the graph. It uses the same effective subdivision count/window as the
+limiter and reports delayed items, maximum and final backlog, and drain time if
+no further traffic arrives. The first preview supports **one full-share path,
+fixed item cost and a global counter exclusive to this node**. Scoped,
+operation-filtered, shared and multi-path policies require additional dimensions
+and are not implied by this preview.
+
+Watch records successfully relayed item counts and cost at **one-second**
+resolution, without payloads. Capture stops at the observation deadline; it does
+not activate limits. Simulations cover up to the last 24 hours of that session,
+start with an empty queue, and assume FIFO and simultaneous arrivals within each
+second. They cannot reconstruct sub-second bursts, existing input delays or
+minute-only history collected by older versions. Counts are sizing estimates,
+not provider quota recommendations.
+
+Samples flush off the relay path every ten seconds. Per-recorder replacement
+writes make retries idempotent and independent replicas add their observations.
+Buffers are bounded to an hour of distinct active seconds per stage; known gaps
+and dropped items are reported. A crash can lose the latest unflushed samples,
+and recordings only describe replicas running this build. Fine samples are
+retained for 31 days. The existing minute rollups keep their 90-day retention.
+
+Read-only endpoints, also available to console viewers:
+
+- `GET /api/apps/{app}/graphs/{graph}/diagnostics`
+- `GET /api/apps/{app}/graphs/{graph}/timeline?minutes=60`
+- `GET /api/apps/{app}/graphs/{graph}/simulate?node=limit&count=100&timeMs=1000&minutes=60`
+
+The simulation accepts optional `subWindows`; `minutes` is bounded to 1–1440.

@@ -51,7 +51,17 @@ pub async fn start(
             graph: doc.graph.clone(),
             stage: s.clone(),
             node: node.clone(),
-            counters: Default::default(),
+            counters: crate::obs::StageCounters {
+                observation: doc.watch.as_ref().map(|w| {
+                    Arc::new(crate::observation::Observation::new(
+                        &doc.application,
+                        &doc.graph,
+                        &s.node,
+                        w,
+                    ))
+                }),
+                ..Default::default()
+            },
             last_refusal: parking_lot::RwLock::new(None),
             started_at,
             wedge: parking_lot::RwLock::new(None),
@@ -107,6 +117,12 @@ async fn provision(queen: &Queen, plan: &Plan) -> Result<()> {
                 let opts = QueueOptions {
                     lease_time: Some(k.lease_seconds),
                     retry_limit: Some(k.retry_limit),
+                    // Keep pending work until it can be admitted. Only messages
+                    // older than 30 days and passed by every group can expire.
+                    retention_enabled: Some(true),
+                    retention_seconds: Some(0),
+                    completed_retention_seconds: Some(30 * 24 * 60 * 60),
+                    max_wait_time_seconds: Some(0),
                     ..Default::default()
                 };
                 queen
@@ -116,9 +132,9 @@ async fn provision(queen: &Queen, plan: &Plan) -> Result<()> {
                     .await?;
             }
             // Produced into, never configured. `QueueBuilder::create` is a
-            // `/configure` with an empty option bag, and that endpoint is a FULL
-            // replace: calling it here would silently reset an application's
-            // retention, lease, retry and dedup settings on every declare. Queen
+            // `/configure` with an empty option bag. Older brokers treat it as a
+            // full replace, resetting the application's retention, lease, retry
+            // and dedup settings; newer brokers merge omitted options. Queen
             // creates an absent queue atomically on the first push; applications
             // that need to subscribe before then own its explicit provisioning.
             QueueKind::Egress => {}
@@ -212,6 +228,11 @@ pub async fn stop(rt: &Arc<GraphRuntime>) {
     let budget = knobs().poll_timeout + std::time::Duration::from_secs(2);
     for h in handles {
         let _ = tokio::time::timeout(budget, h).await;
+    }
+    for stage in &rt.stages {
+        if let Some(recorder) = &stage.counters.observation {
+            recorder.close();
+        }
     }
 }
 

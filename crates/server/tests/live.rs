@@ -419,6 +419,7 @@ struct FaultyBroker {
     refuse: RefusalRule,
     absent: Arc<parking_lot::RwLock<Option<String>>>,
     seen: Arc<parking_lot::RwLock<Vec<String>>>,
+    configurations: Arc<parking_lot::RwLock<Vec<Value>>>,
 }
 
 impl FaultyBroker {
@@ -446,6 +447,7 @@ impl FaultyBroker {
     }
     fn forget(&self) {
         self.seen.write().clear();
+        self.configurations.write().clear();
     }
 }
 
@@ -456,18 +458,21 @@ struct ProxyState {
     refuse: RefusalRule,
     absent: Arc<parking_lot::RwLock<Option<String>>>,
     seen: Arc<parking_lot::RwLock<Vec<String>>>,
+    configurations: Arc<parking_lot::RwLock<Vec<Value>>>,
 }
 
 async fn faulty_broker(real: &str) -> FaultyBroker {
     let refuse = Arc::new(parking_lot::RwLock::new(None));
     let absent = Arc::new(parking_lot::RwLock::new(None));
     let seen = Arc::new(parking_lot::RwLock::new(Vec::new()));
+    let configurations = Arc::new(parking_lot::RwLock::new(Vec::new()));
     let state = ProxyState {
         real: real.trim_end_matches('/').to_string(),
         http: reqwest::Client::new(),
         refuse: refuse.clone(),
         absent: absent.clone(),
         seen: seen.clone(),
+        configurations: configurations.clone(),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -484,6 +489,7 @@ async fn faulty_broker(real: &str) -> FaultyBroker {
         refuse,
         absent,
         seen,
+        configurations,
     }
 }
 
@@ -513,6 +519,11 @@ async fn proxy(
         .unwrap_or_default();
     let path = parts.uri.to_string();
     st.seen.write().push(path.clone());
+    if parts.method == axum::http::Method::POST && path == "/api/v1/configure" {
+        if let Ok(body) = serde_json::from_slice(&bytes) {
+            st.configurations.write().push(body);
+        }
+    }
 
     if let Some(marker) = st.absent.read().clone() {
         if path.contains(&marker) {
@@ -651,6 +662,173 @@ async fn a_flat_delete_refuses_an_ambiguous_graph_name() {
 }
 
 // ============================================================== the relay
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn watch_requires_history_before_starting_a_target() {
+    let Some(h) = harness("watch-no-history").await else {
+        return;
+    };
+    let (status, body) = h.put_graph("g", json!({
+        "version": 1, "watch": {"durationSeconds": 3600},
+        "nodes": {"limit": {"ingress": true, "egress": egress_of("watch-no-history", &h.application)}},
+        "paths": [{"name": "main", "nodes": ["limit"]}]
+    })).await;
+    assert_eq!(status, 422, "{body}");
+    assert!(body.to_string().contains("durable history"));
+    assert!(h.app.registry.get(&h.application, "g").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker and PostgreSQL history: set GATE_TEST_QUEEN_URL and PG_HOST"]
+async fn watch_relays_without_caps_keeps_its_timer_and_activates_limits_explicitly() {
+    use gate_server::history::{Bucket, History};
+    use std::collections::HashMap;
+    let Some(mut h) = harness("watch").await else {
+        return;
+    };
+    let history = Arc::new(
+        History::connect()
+            .await
+            .expect("watch test needs PG_HOST")
+            .expect("history connection"),
+    );
+    let mut app = api::App::new(h.queen.clone(), queen_url().unwrap());
+    app.history = Some(history.clone());
+    h.app = Arc::new(app);
+    h.base = spawn_server(h.app.clone()).await;
+    let out = egress_of("watch", &h.application);
+    let mut doc = json!({
+        "version": 1, "watch": {"durationSeconds": 120, "startedAt": 1},
+        "nodes": {"limit": {"ingress": {"shed": true, "partitions": 1}, "egress": out,
+            "budgets": [{"id": "rate", "count": 1, "timeMs": 60000, "scopeBy": "payload.account"}]}},
+        "paths": [{"name": "main", "nodes": ["limit"]}]
+    });
+    let (status, body) = h.put_graph("g", doc.clone()).await;
+    assert_eq!(status, 200, "{body}");
+    let (_, view) = h.get_graph("g").await;
+    let start = view["spec"]["watch"]["startedAt"].as_i64().unwrap();
+    assert!(start > 1, "client cannot choose the timer");
+    let cursor = view["stages"][0]["group"].clone();
+    for i in 0..4 {
+        let (status, body) = h
+            .push(
+                "g",
+                "limit",
+                json!({"partition": "p0", "payload": {"n": i}}),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "watch cannot shed or require a budget scope: {body}"
+        );
+    }
+    assert_eq!(
+        h.drain(&out, 4, Duration::from_secs(5)).await.len(),
+        4,
+        "watch cannot enforce the candidate cap of 1/minute"
+    );
+    assert_eq!(h.counter(&h.key("g", "limit", "rate")).await, 0);
+    assert_eq!(
+        h.backoff("g", "limit", json!({"retryAfterSeconds": 60}))
+            .await
+            .0,
+        409
+    );
+    assert_eq!(h.put_graph("g", doc.clone()).await.0, 200);
+    let (_, view) = h.get_graph("g").await;
+    assert_eq!(
+        view["spec"]["watch"]["startedAt"], start,
+        "redeclare keeps the timer"
+    );
+
+    // Advance this test-owned stored session without waiting minutes. A
+    // redeclare on another replica must honor the stored start, not its clock.
+    let now = gate_server::now_ms() / 60_000 * 60_000;
+    let mut stored = h.app.registry.get(&h.application, "g").unwrap().doc.clone();
+    stored.watch.as_mut().unwrap().started_at = Some(now - 180_000);
+    gate_server::store::save(&h.queen, &stored).await.unwrap();
+    assert_eq!(h.put_graph("g", doc.clone()).await.0, 200);
+    let buckets = HashMap::from([(
+        "main".into(),
+        Bucket {
+            admitted: 4,
+            cost_estimated: 8.0,
+            ..Bucket::default()
+        },
+    )]);
+    assert!(
+        history
+            .add(&h.application, "g.limit", now - 120_000, &buckets)
+            .await
+    );
+    let (status, observation) = h
+        .send(
+            reqwest::Method::GET,
+            &format!("/api/apps/{}/graphs/g/watch", h.application),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{observation}");
+    assert_eq!(observation["ready"], true);
+    assert_eq!(observation["minutes"], 2);
+    assert_eq!(observation["nodes"][0]["traffic"]["admitted"], 4);
+    assert_eq!(observation["nodes"][0]["traffic"]["peakCostPerMinute"], 8.0);
+    assert_eq!(
+        h.push(
+            "g",
+            "limit",
+            json!({"partition": "p0", "payload": {"n": 4}})
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        h.drain(&out, 1, Duration::from_secs(5)).await.len(),
+        1,
+        "expiry does not enforce"
+    );
+
+    doc.as_object_mut().unwrap().remove("watch");
+    doc["nodes"]["limit"]["budgets"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("scopeBy");
+    assert_eq!(
+        h.put_graph("g", doc.clone()).await.0,
+        409,
+        "activation needs a version bump"
+    );
+    doc["version"] = json!(2);
+    assert_eq!(h.put_graph("g", doc).await.0, 200);
+    let (_, view) = h.get_graph("g").await;
+    assert!(view["spec"]["watch"].is_null());
+    assert_eq!(view["stages"][0]["group"], cursor);
+    assert_eq!(
+        h.push(
+            "g",
+            "limit",
+            json!({"partition": "p0", "payload": {"n": 5}})
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(h.drain(&out, 1, Duration::from_secs(5)).await.len(), 1);
+    assert_eq!(
+        h.push(
+            "g",
+            "limit",
+            json!({"partition": "p0", "payload": {"n": 6}})
+        )
+        .await
+        .0,
+        429,
+        "enforcement now sheds at the real cap"
+    );
+    h.cleanup("g").await;
+}
 
 /// Exactly once, across a two-node graph. `got.len() == N` AND `distinct == N`,
 /// and nothing arrives in a follow-up drain.
@@ -2960,6 +3138,95 @@ async fn the_console_can_draw_what_is_running() {
 
 // ============================================================== lifecycle
 
+/// Provisioning and redeclaring must bound completed history without expiring
+/// pending work or taking over the application's ingress and egress policy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn owned_queues_keep_thirty_days_of_completed_history() {
+    let Some((h, broker)) = faulty_harness("retention").await else {
+        assert!(std::env::var("GATE_TEST_REQUIRE_LIVE").is_err());
+        return;
+    };
+    let input = format!("test.retention.{}.in", h.application);
+    let out = egress_of("retention", &h.application);
+    let mut external_configs = Vec::new();
+    for name in [&input, &out] {
+        h.queen
+            .queue(name)
+            .configure(queen_mq::QueueOptions {
+                lease_time: Some(127),
+                retry_limit: Some(41),
+                retention_enabled: Some(true),
+                retention_seconds: Some(0),
+                completed_retention_seconds: Some(7 * 24 * 60 * 60),
+                ..Default::default()
+            })
+            .await
+            .expect("configure application-owned queue");
+        let detail = h.queen.admin().queue_detail(name, &[]).await.unwrap();
+        external_configs.push(detail["queue"]["config"].clone());
+    }
+
+    for version in [1, 2] {
+        broker.forget();
+        let (status, body) = h
+            .put_graph(
+                "g",
+                json!({
+                    "version": version,
+                    "nodes": {
+                        "owned": { "ingress": true, "budgets": [wide("b")] },
+                        "external": { "ingress": { "queue": input }, "budgets": [wide("b")] },
+                        "terminal": { "budgets": [wide("b")], "egress": out }
+                    },
+                    "paths": [
+                        { "name": "owned", "nodes": ["owned", "terminal"] },
+                        { "name": "external", "nodes": ["external", "terminal"] }
+                    ]
+                }),
+            )
+            .await;
+        assert_eq!(status, 200, "declare version {version}: {body}");
+        // Queen 1.x omits retention from its read APIs. Inspect the requests
+        // accepted by the real broker, including which queues Gate configured.
+        let configurations = broker.configurations.read().clone();
+        assert_eq!(
+            configurations.len(),
+            2,
+            "only Gate-owned queues: {configurations:?}"
+        );
+        for name in [
+            gate_core::plan::owned_ingress_queue(&h.application, "g", "owned"),
+            gate_core::plan::interior_queue(&h.application, "g", "terminal"),
+        ] {
+            let config = &configurations
+                .iter()
+                .find(|request| request["queue"] == name)
+                .expect("owned queue was configured")["options"];
+            for (key, expected) in [
+                ("retentionEnabled", json!(true)),
+                ("completedRetentionSeconds", json!(2_592_000)),
+                ("retentionSeconds", json!(0)),
+                ("maxWaitTimeSeconds", json!(0)),
+            ] {
+                assert_eq!(config[key], expected, "{name}, version {version}: {key}");
+            }
+        }
+        for (name, expected) in [&input, &out].into_iter().zip(&external_configs) {
+            let detail = h.queen.admin().queue_detail(name, &[]).await.unwrap();
+            assert_eq!(
+                &detail["queue"]["config"], expected,
+                "Gate changed application-owned queue {name} on version {version}"
+            );
+        }
+    }
+
+    h.cleanup("g").await;
+    for name in [&input, &out] {
+        h.queen.queue(name).delete().await.unwrap();
+    }
+}
+
 /// Declaring a graph must not reconfigure the application's egress queue.
 ///
 /// Queen's `create()` is implemented as `/configure` with an empty option bag,
@@ -4489,4 +4756,171 @@ async fn a_duplicate_rolls_the_bundle_back_without_naming_itself() {
         .await
         .unwrap_or_default();
     assert_eq!(there.len(), 1, "only the planted one is on the queue");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs isolated broker and PostgreSQL history"]
+async fn insights_recording_is_idempotent_and_diagnostics_distinguish_workers() {
+    use gate_server::history::History;
+    let Some(mut h) = harness("insights").await else {
+        return;
+    };
+    let history = Arc::new(History::connect().await.expect("PG_HOST").expect("history"));
+    let mut app = api::App::new(h.queen.clone(), queen_url().unwrap());
+    app.history = Some(history.clone());
+    h.app = Arc::new(app);
+    h.base = spawn_server(h.app.clone()).await;
+    let out = egress_of("insights", &h.application);
+    let (status, body) = h.put_graph("g", json!({"version":1,"watch":{"durationSeconds":120},"nodes":{"n":{"ingress":{"partitions":1},"egress":out,"budgets":[]}},"paths":[{"name":"main","nodes":["n"]}]})).await;
+    assert_eq!(status, 200, "{body}");
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    for i in 0..10 {
+        assert_eq!(
+            h.push("g", "n", json!({"partition":"p0","payload":{"n":i}}))
+                .await
+                .0,
+            200
+        );
+    }
+    let rt = h.app.registry.get(&h.application, "g").unwrap();
+    let recorder = rt.stages[0].counters.observation.clone().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while rt.stages[0]
+        .counters
+        .admitted
+        .load(std::sync::atomic::Ordering::Relaxed)
+        < 10
+    {
+        assert!(Instant::now() < deadline, "relay did not settle");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let retry = recorder.pending(gate_server::now_ms() / 1000 * 1000);
+    history.flush_observation(&recorder).await.unwrap();
+    // Simulate a committed write whose response was lost: resend identical rows.
+    for (at, sample) in retry {
+        recorder.record(at, sample.items as u64, sample.cost as u64);
+    }
+    history.flush_observation(&recorder).await.unwrap();
+    let root = format!("/api/apps/{}/graphs/g", h.application);
+    let (status, simulation) = h
+        .send(
+            reqwest::Method::GET,
+            &format!("{root}/simulate?node=n&count=2&timeMs=1000"),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{simulation}");
+    assert_eq!(
+        simulation["items"], 10,
+        "a flush retry must not double count"
+    );
+    assert!(simulation["delayedItems"].as_i64().unwrap() > 0);
+    assert!(
+        h.app
+            .registry
+            .get(&h.application, "g")
+            .unwrap()
+            .doc
+            .watch
+            .is_some(),
+        "preview must not activate the candidate"
+    );
+    let (status, diagnoses) = h
+        .send(reqwest::Method::GET, &format!("{root}/diagnostics"), None)
+        .await;
+    assert_eq!(status, 200, "{diagnoses}");
+    assert!(diagnoses["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|i| i["kind"] == "workers"));
+    assert!(!diagnoses["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|i| i["kind"] == "budget"));
+    *rt.stages[0].wedge.write() = Some(gate_server::relay::Wedge {
+        head: "test-head".into(),
+        attempts: 8,
+        escalated: true,
+    });
+    let (_, diagnoses) = h
+        .send(reqwest::Method::GET, &format!("{root}/diagnostics"), None)
+        .await;
+    assert!(diagnoses["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|i| i["kind"] == "cursor"));
+    *rt.stages[0].wedge.write() = None;
+    *h.app.broker.write() = Some((
+        api::BrokerHealth {
+            reachable: false,
+            version: None,
+        },
+        Instant::now(),
+    ));
+    let (_, diagnoses) = h
+        .send(reqwest::Method::GET, &format!("{root}/diagnostics"), None)
+        .await;
+    assert_eq!(diagnoses["issues"][0]["kind"], "broker");
+    *h.app.broker.write() = None;
+    // Another recorder has a different contribution, even in the same second.
+    let watch = rt.doc.watch.as_ref().unwrap();
+    let mut peer = gate_server::observation::Observation::new(&h.application, "g", "n", watch);
+    peer.started_at = recorder.started_at;
+    peer.record(gate_server::now_ms() / 1000 * 1000 - 1000, 3, 3);
+    history.flush_observation(&peer).await.unwrap();
+    let (_, simulation) = h
+        .send(
+            reqwest::Method::GET,
+            &format!("{root}/simulate?node=n&count=2&timeMs=1000"),
+            None,
+        )
+        .await;
+    assert_eq!(
+        simulation["items"], 13,
+        "independent replicas contribute without replacing each other"
+    );
+    let at = gate_server::now_ms();
+    history
+        .snapshot(&h.application, "g", "n", at, &json!({"before":4}))
+        .await
+        .unwrap();
+    history
+        .snapshot(&h.application, "g", "n", at + 1, &json!({"before":7}))
+        .await
+        .unwrap();
+    history
+        .snapshot(&h.application, "g", "n", at, &json!({"before":99}))
+        .await
+        .unwrap();
+    let (_, timeline) = h
+        .send(reqwest::Method::GET, &format!("{root}/timeline"), None)
+        .await;
+    assert_eq!(
+        timeline["samples"][0]["value"]["before"], 7,
+        "replicas replace a snapshot; stale writes cannot overwrite it"
+    );
+    assert_eq!(timeline["events"][0]["change"]["label"], "Created");
+    assert!(history
+        .insights("another-application", "g", 60)
+        .await
+        .unwrap()["samples"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        h.send(
+            reqwest::Method::GET,
+            &format!("{root}/simulate?node=n&count=0&timeMs=1000"),
+            None
+        )
+        .await
+        .0,
+        422
+    );
+    assert_eq!(h.drain(&out, 10, Duration::from_secs(5)).await.len(), 10);
+    h.cleanup("g").await;
 }

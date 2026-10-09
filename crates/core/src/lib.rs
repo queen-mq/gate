@@ -25,8 +25,8 @@ pub use cost::{
 };
 pub use doc::{
     default_application, ok_name, ok_target_name, Budget, Confidence, Cost, CostPath, Counters,
-    Egress, EgressSpec, GraphDoc, Ingress, IngressSpec, Node, Path, PathElem,
-    COUNTERS_WINDOW_SECONDS, GATE_META, PAYLOAD_ROOT,
+    Egress, EgressSpec, GraphDoc, Ingress, IngressSpec, Node, Path, PathElem, Watch,
+    COUNTERS_WINDOW_SECONDS, GATE_META, MAX_WATCH_SECONDS, PAYLOAD_ROOT,
 };
 pub use ids::derive;
 pub use plan::{

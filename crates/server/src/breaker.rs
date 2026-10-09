@@ -261,6 +261,9 @@ pub async fn recent(budgets: &Budgets, limit: u32) -> queen_mq::Result<Vec<Value
 /// The record's own TTL is the answer: a key that has expired is a breaker that
 /// has lifted, and there is nothing to sweep and nothing to clear.
 pub async fn held(budgets: &Budgets, node: &NodePlan) -> queen_mq::Result<Option<Record>> {
+    if node.budgets.is_empty() {
+        return Ok(None);
+    }
     let rows = budgets
         .get_raw(std::slice::from_ref(&node.breaker_key))
         .await?;

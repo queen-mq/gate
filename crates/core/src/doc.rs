@@ -91,6 +91,30 @@ pub struct GraphDoc {
     /// 963 times.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub counters: Option<Counters>,
+
+    /// Observe routed traffic without charging budgets. Expiry is a reminder
+    /// to configure limits, never an automatic switch to enforcement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<Watch>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Watch {
+    #[serde(rename = "durationSeconds")]
+    pub duration_seconds: u32,
+    /// Server-owned start of this observation session, persisted across boots.
+    #[serde(default, rename = "startedAt", skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<i64>,
+}
+
+pub const MAX_WATCH_SECONDS: u32 = 30 * 24 * 60 * 60;
+
+impl Watch {
+    pub fn ends_at(&self) -> Option<i64> {
+        self.started_at
+            .map(|start| start.saturating_add(i64::from(self.duration_seconds) * 1000))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

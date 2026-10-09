@@ -23,6 +23,11 @@ import StatusDot from '../components/StatusDot.vue'
 import Metric from '../components/Metric.vue'
 import ConfirmModal from '../components/ConfirmModal.vue'
 import Icon from '../components/Icon.vue'
+import IntegrationGuide from '../components/IntegrationGuide.vue'
+import TrafficDiagnostics from '../components/TrafficDiagnostics.vue'
+import TrafficHistory from '../components/TrafficHistory.vue'
+import { nextTick } from 'vue'
+import WatchPanel from '../components/WatchPanel.vue'
 import {
   api, num, pct, period, window as windowOf, ago, utilisation,
   isAdmin, READ_ONLY_NOTE, graphApi, graphPath, DEFAULT_APP,
@@ -35,6 +40,7 @@ const router = useRouter()
 const application = computed(() => props.app || DEFAULT_APP)
 
 const graph = ref(null)
+const topology = ref(null)
 const error = ref('')
 /* `?path=` selects one path, which is what a `/lanes/:lane` link becomes. */
 const selected = ref(String(route.query.path ?? ''))
@@ -108,14 +114,23 @@ const totals = computed(() =>
    and a stage that is not running. */
 function nodeState(n) {
   if (!graph.value?.running) return 'down'
+  if (graph.value?.spec?.watch) return 'watch'
   if (n.breaker) return 'breached'
   if ((n.budgets ?? []).some((b) => b.confidence === 'assumed')) return 'blind'
   if ((n.waiting_for_budget ?? 0) > 0) return 'pacing'
   return 'flowing'
 }
 
+async function locate(issue) {
+  selected.value = issue.path || ''
+  await nextTick()
+  topology.value?.selectNode(issue.kind === 'workers' ? `@egress:${issue.node}` : issue.node)
+  document.getElementById('traffic-topology')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+}
+
 const state = computed(() => {
   if (!graph.value?.running) return 'down'
+  if (graph.value?.spec?.watch) return 'watch'
   if (nodes.value.some((n) => n.breaker)) return 'breached'
   if (nodes.value.some((n) => (n.budgets ?? []).some((b) => b.confidence === 'assumed')))
     return 'blind'
@@ -172,6 +187,7 @@ async function remove() {
 
 <template>
   <div>
+    <TrafficDiagnostics v-if="error" :application="application" :graph="name" @locate="locate" />
     <div v-if="error" class="card border-transparent bg-bad-dim px-5 py-4 text-[13.5px] text-bad">
       {{ error }}
     </div>
@@ -193,6 +209,7 @@ async function remove() {
           <span class="chip">v{{ graph.version }}</span>
           <span v-if="graph.counters" class="chip">counters {{ graph.counters }}s</span>
           <template v-if="isAdmin">
+            <RouterLink :to="{ path: '/graphs/new', query: { app: application, clone: name } }" class="btn">Clone</RouterLink>
             <RouterLink :to="graphPath(application, name, '/edit')" class="btn">
               <Icon name="edit" :size="14" /> Edit
             </RouterLink>
@@ -204,6 +221,9 @@ async function remove() {
       </PageHeader>
 
       <p v-if="!isAdmin" class="-mt-4 mb-6 text-[12px] text-fg-3">{{ READ_ONLY_NOTE }}</p>
+      <IntegrationGuide :graph="graph" :open="route.query.setup === '1'" />
+      <TrafficDiagnostics :application="application" :graph="name" @locate="locate" />
+      <WatchPanel v-if="graph.spec?.watch" :application="application" :graph="name" />
 
       <!-- --------------------------------------------------- headline -->
       <section class="card px-5 py-5">
@@ -218,6 +238,7 @@ async function remove() {
                class="text-[13px] text-fg-2 mt-2 ml-[22.5px] max-w-[52ch] leading-relaxed">
               At least one count below is a guess. Everything on this page is arithmetic on top of it.
             </p>
+            <p v-else-if="state === 'watch'" class="text-[13px] text-fg-2 mt-2 ml-[22.5px] max-w-[52ch] leading-relaxed">Gate is observing routed traffic. Rate limits and ingress load shedding are inactive.</p>
             <p v-else class="text-[13px] text-fg-2 mt-2 ml-[22.5px] max-w-[52ch] leading-relaxed">
               No vendor throttle has been reported against this graph.
             </p>
@@ -238,7 +259,7 @@ async function remove() {
       </section>
 
       <div class="mt-7">
-        <SpatialGraph :graph="graph" :highlighted-path="selected" />
+        <SpatialGraph id="traffic-topology" ref="topology" :graph="graph" :highlighted-path="selected" />
       </div>
 
       <!-- ----------------------------------------------------- paths -->
@@ -264,14 +285,15 @@ async function remove() {
               </div>
             </div>
             <span class="text-[11.5px] text-fg-3">
-              {{ selected === p.name ? 'highlighted' : 'show its ceilings' }}
+              {{ selected === p.name ? 'highlighted' : graph.spec?.watch ? 'show route' : 'show its ceilings' }}
             </span>
           </button>
         </div>
       </section>
 
       <!-- ----------------------------------------------------- nodes -->
-      <section v-for="n in nodes" :key="n.node" class="mt-8">
+      <TrafficHistory :application="application" :graph="name" :nodes="nodes" />
+      <section v-for="n in nodes" :id="`node-${n.node}`" :key="n.node" class="mt-8">
         <h2 class="section-title">
           <span class="font-mono">{{ n.node }}</span>
           <span class="section-count">
@@ -334,8 +356,7 @@ async function remove() {
               </div>
             </div>
             <p v-if="!(n.budgets ?? []).length" class="text-[12.5px] text-fg-3">
-              No budget: a node that limits nothing is a queue with extra steps, and a declare
-              refuses one.
+              {{ graph.spec?.watch ? 'Watch is active: traffic is measured without applying rate limits.' : 'No budget is available on this node.' }}
             </p>
           </div>
 
@@ -361,7 +382,7 @@ async function remove() {
               <tr v-for="s in stagesOf(n.node)" :key="s.path" class="border-t border-line"
                   :class="selected === s.path ? 'bg-surface-2' : ''">
                 <td class="py-2 font-mono">{{ s.path }}</td>
-                <td class="py-2 tabular-nums text-fg-2">{{ pct(s.share) }}</td>
+                <td class="py-2 tabular-nums text-fg-2">{{ graph.spec?.watch ? '—' : pct(s.share) }}</td>
                 <td class="py-2 tabular-nums text-fg-2">{{ num(s.counters?.admitted) }}</td>
                 <td class="py-2 tabular-nums text-fg-2">{{ num(s.counters?.deferred) }}</td>
                 <!-- Parked is in-handler, holding the lease; released let the

@@ -57,7 +57,7 @@ pub async fn overview(State(app): State<Shared>) -> ApiResult {
                 + c.released.load(std::sync::atomic::Ordering::Relaxed);
         }
         counters_on |= g.plan.counters_window_seconds.is_some();
-        for node in g.doc.nodes.values() {
+        for node in g.doc.nodes.values().filter(|_| g.doc.watch.is_none()) {
             for b in &node.budgets {
                 if b.confidence == gate_core::Confidence::Assumed {
                     assumed += 1;
@@ -265,10 +265,11 @@ pub async fn list_targets(State(app): State<Shared>) -> ApiResult {
             "version": g.doc.version,
             "graph": g.doc.graph,
             "running": g.is_running(),
+            "watch": g.doc.watch,
             "lanes": g.doc.paths.iter().map(|p| json!({ "name": p.name })).collect::<Vec<_>>(),
             "paths": g.doc.paths.iter().map(|p| json!({ "name": p.name })).collect::<Vec<_>>(),
-            "budgets_total": g.doc.nodes.values().map(|n| n.budgets.len()).sum::<usize>(),
-            "assumed_budgets": assumed_budgets,
+            "budgets_total": g.plan.nodes.values().map(|n| n.budgets.len()).sum::<usize>(),
+            "assumed_budgets": if g.doc.watch.is_some() { 0 } else { assumed_budgets },
             "worst_budget_id": worst.0,
             "worst_used": worst.2,
             "worst_cap": worst.3,
@@ -279,6 +280,8 @@ pub async fn list_targets(State(app): State<Shared>) -> ApiResult {
             "denied": den,
             "state": if !g.is_running() {
                 "down"
+            } else if g.doc.watch.is_some() {
+                "watch"
             } else if saturating {
                 "saturating"
             } else if backlog > 0 {
@@ -336,6 +339,7 @@ pub async fn list_graphs(State(st): State<Shared>) -> ApiResult {
             "name": g.doc.graph,
             "version": g.doc.version,
             "nodes": nodes,
+            "watch": g.doc.watch,
             "edges": gate_core::plan::edges(&g.doc).iter()
                 .map(|(a, b)| json!({ "from": a, "to": b })).collect::<Vec<_>>(),
             "paths": g.doc.paths.iter().map(|p| json!({
@@ -701,7 +705,9 @@ pub async fn app_metrics(
                 });
 
             let breaker = crate::breaker::held(&app.budgets, np).await?;
-            let state = if breaker.is_some() {
+            let state = if g.doc.watch.is_some() {
+                "watch"
+            } else if breaker.is_some() {
                 "breached"
             } else if waiting_budget > 0 {
                 "pacing"

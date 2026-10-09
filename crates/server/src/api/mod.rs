@@ -19,6 +19,7 @@ pub mod data;
 pub mod declare;
 pub mod eta;
 pub mod reenter;
+pub mod watch;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -37,6 +38,8 @@ use crate::obs::Traces;
 use crate::registry::Registry;
 
 pub struct App {
+    pub observations: parking_lot::Mutex<Vec<Arc<crate::observation::Observation>>>,
+    pub conditions: parking_lot::Mutex<std::collections::HashMap<String, i64>>,
     pub auth: Option<Arc<crate::auth::Auth>>,
     pub queen: Queen,
     pub budgets: Budgets,
@@ -71,6 +74,8 @@ impl App {
     /// listeners.
     pub fn new(queen: Queen, queen_url: String) -> Self {
         Self {
+            observations: Default::default(),
+            conditions: Default::default(),
             auth: None,
             budgets: Budgets::new(queen.clone()),
             queen,
@@ -268,6 +273,16 @@ fn routes() -> Router<Shared> {
         )
         .route("/api/flow", get(console::flow))
         .route("/api/rollups", get(console::rollups))
+        .route("/api/apps/:app/graphs/:name/watch", get(watch::summary))
+        .route("/api/apps/:app/graphs/:name/simulate", get(watch::simulate))
+        .route(
+            "/api/apps/:app/graphs/:name/timeline",
+            get(crate::insights::timeline),
+        )
+        .route(
+            "/api/apps/:app/graphs/:name/diagnostics",
+            get(crate::insights::diagnostics),
+        )
         .route("/api/budgets", get(console::shared_budgets))
         .route("/api/breaches/recent", get(console::recent_breaches))
         .route("/api/traces", get(console::traces))

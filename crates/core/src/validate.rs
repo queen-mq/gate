@@ -174,6 +174,14 @@ pub fn validate_plan_with(doc: &GraphDoc, plan: &Plan, facts: &ExternalFacts) ->
 }
 
 fn counters(doc: &GraphDoc, out: &mut Vec<Problem>) {
+    if let Some(watch) = &doc.watch {
+        if !(120..=crate::doc::MAX_WATCH_SECONDS).contains(&watch.duration_seconds) {
+            out.push(p("watch-duration", "watch.durationSeconds must be between 120 seconds and 30 days. Expiry leaves traffic in watch until limits are explicitly activated.".into()));
+        }
+        if watch.started_at.is_some_and(|start| start < 0) {
+            out.push(p("watch-start", "watch.startedAt must be a non-negative Unix timestamp in milliseconds; the server sets it on creation.".into()));
+        }
+    }
     let Some(counters) = &doc.counters else {
         return;
     };
@@ -377,6 +385,16 @@ fn shape(doc: &GraphDoc, out: &mut Vec<Problem>) {
 }
 
 fn budgets(doc: &GraphDoc, plan: &Plan, out: &mut Vec<Problem>) {
+    // Retained limits are inactive in watch, but must still be well formed.
+    let candidate_plan;
+    let plan = if doc.watch.is_some() {
+        let mut candidate = doc.clone();
+        candidate.watch = None;
+        candidate_plan = plan::compile(&candidate);
+        &candidate_plan
+    } else {
+        plan
+    };
     // A shared key is one counter across the whole application, so two
     // declarations of it that disagree about what it enforces are not two
     // budgets — one of them is a lie about the ceiling.
@@ -426,6 +444,9 @@ fn budgets(doc: &GraphDoc, plan: &Plan, out: &mut Vec<Problem>) {
         }
 
         if node.budgets.is_empty() {
+            if doc.watch.is_some() {
+                continue;
+            }
             out.push(p(
                 "node-budget",
                 format!(
@@ -435,7 +456,7 @@ fn budgets(doc: &GraphDoc, plan: &Plan, out: &mut Vec<Problem>) {
             ));
             continue;
         }
-        if np.node_wide().next().is_none() {
+        if doc.watch.is_none() && np.node_wide().next().is_none() {
             out.push(p(
                 "node-unscoped-budget",
                 format!(
@@ -1054,6 +1075,9 @@ pub fn warnings_with(doc: &GraphDoc, facts: &ExternalFacts) -> Vec<Problem> {
 /// batch, and `timeMs` changes the TTL the next ROTATION writes, so it takes up
 /// to one old window to land.
 pub fn needs_version_bump(old: &GraphDoc, new: &GraphDoc) -> bool {
+    if old.watch.is_some() != new.watch.is_some() {
+        return true;
+    }
     let op = plan::compile(old);
     let np = plan::compile(new);
 
