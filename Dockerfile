@@ -74,8 +74,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # The same uid the rest of the stack runs as, and the reason the chart can set
-# readOnlyRootFilesystem: nothing is written to disk. Config lives in queen.kv,
-# history in Postgres, and the console is inside the binary.
+# readOnlyRootFilesystem: nothing is written to disk. Config and history live
+# in queen.kv, and the console is inside the binary.
 RUN groupadd -g 10001 gate && useradd -u 10001 -g 10001 -M -s /usr/sbin/nologin gate
 
 WORKDIR /app

@@ -166,13 +166,12 @@ no-ops because cardinality is now rows with a TTL.
 
 ## Run it
 
-Gate needs a QueenMQ broker (**1.0.4 or newer**) and, optionally, a PostgreSQL for history. Without
-`PG_HOST` it limits exactly as well; it just cannot answer anything about yesterday.
+Gate needs a QueenMQ broker (**1.0.4 or newer**) and nothing else. History — roll-ups, refusals,
+Watch samples — is kept in the broker's kv, beside the counters. `GATE_HISTORY=off` switches it
+off, and Gate limits exactly as well without it.
 
 ```bash
-docker run -d --name queen-pg -e POSTGRES_PASSWORD=postgres -p 5434:5432 postgres:18
-docker run -d --name queen --link queen-pg -e PG_HOST=queen-pg -e PG_PASSWORD=postgres \
-  -p 6632:6632 ghcr.io/queen-mq/queen:latest
+docker run -d --name queen -p 6632:6632 ghcr.io/queen-mq/queen:latest
 docker run -d --name gate -p 8788:8788 -p 8790:8790 \
   -e QUEEN_URL=http://host.docker.internal:6632 \
   -e GATE_BIND=0.0.0.0:8788 -e GATE_PUBLIC_BIND=0.0.0.0:8790 \
@@ -193,7 +192,7 @@ the same draft; switching views keeps the limits, cost settings, shared counters
 
 Choose **Watch traffic** to observe a target before setting limits. Select an observation period
 between two minutes and 30 days. Gate still consumes the ingress and relays to the egress; your
-workers consume that outgoing queue. Watch requires PostgreSQL history, enables minute roll-ups,
+workers consume that outgoing queue. Watch needs history (on unless `GATE_HISTORY=off`), enables minute roll-ups,
 and applies no budgets or ingress load shedding. Limits retained in the document remain inactive.
 The target page shows relayed items, average cost per second and peak cost per minute for complete
 minutes within the observation period. Expiry marks it ready for review and keeps traffic in watch.
@@ -228,7 +227,8 @@ with no broker configured, which is green lines that verified nothing. CI sets
 | knob | default | what it is |
 |---|---|---|
 | `QUEEN_URL` | `http://localhost:6632` | the broker |
-| `GATE_KV_NAMESPACE` | `gate` | where the counters and the documents live |
+| `GATE_KV_NAMESPACE` | `gate` | where the counters, the documents and the history live |
+| `GATE_HISTORY` | on | `off` keeps no roll-ups, refusals or Watch samples; the limiter is unaffected and Watch is refused |
 | `GATE_STAGE_BATCH` | 200 | the per-claim batch; also the divisor on the counter's traffic |
 | `GATE_LANE_CAPACITY` | 1000 | what one lane drains, items/s. `workers = clamp(ceil(cap_rate / this), 1, partitions)`, overridable with `GATE_STAGE_CONCURRENCY` |
 | `GATE_LEASE_SECONDS` | 10 | a **work** lease, renewed while a handler runs |
@@ -270,6 +270,14 @@ backlog — the stage says so once at `ERROR` with the `seek` that fixes it. Den
 traced. Rollups are opt-in per graph (`"counters": { "windowSeconds": 60 }`); the current storage
 and API contract is a fixed one-minute window, so `60` is the only accepted value. Observability is
 a thing you switch on, not a thing that runs whether or not anyone is looking.
+
+**History is keys under `hist:` in the same kv namespace**, written once a minute and never on the
+hot path. Each replica appends to its own key per target and the reader sums them, so a day of a
+quiet target is a couple of keys. Every key expires on its own: roll-ups, queue samples and
+configuration markers after 25 hours (the console reads one day back), roll-ups of a target in
+Watch after 45 days, Watch samples and refusals after 7 days. Refusals are the newest 250 per
+replica. A queue sample whose per-partition positions pass 4 KiB is kept without them, and that
+node's incoming estimate shows as unknown.
 
 **One thing to say out loud.** The declaration names your egress queue, and:
 
@@ -382,7 +390,7 @@ worker backlog alone does not prove that a worker is broken.
 **Traffic over time** shows a selectable node over 15 minutes, 1, 6 or 24 hours:
 relayed items, incoming estimates, relay/worker backlog and oldest pending age.
 Successful configuration changes appear as timeline markers. Queue snapshots and
-annotations require the existing PostgreSQL history connection; queue sampling is
+annotations are part of history; queue sampling is
 opt-in through `counters` (enabled automatically in Watch and wizard templates).
 Incoming estimates use changes in consumer positions for a single-path ingress;
 retention or cursor changes can affect the estimate. Shared interior-queue traffic

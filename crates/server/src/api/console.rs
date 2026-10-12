@@ -70,7 +70,7 @@ pub async fn overview(State(app): State<Shared>) -> ApiResult {
     }
 
     // Every other field in this document comes from the registry and the
-    // broker, not from Postgres. Failing the whole response on the history read
+    // broker, not from history. Failing the whole response on the history read
     // would take `queen.reachable` down with it — the one field that says
     // whether the LIMITER is healthy, hidden at exactly the moment an operator
     // is working out what broke. So the rate reports itself as unknown and

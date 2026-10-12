@@ -112,8 +112,8 @@ const note = computed(() => OUTCOMES.find((o) => o.key === outcome.value)?.note 
     <div v-else-if="traces === null" class="card px-6 py-14 text-center">
       <p class="text-[15px] font-medium">Decision traces are not being served</p>
       <p class="hint mt-2 max-w-md mx-auto">
-        Refusals are kept in a bounded ring in each replica and flushed to Postgres when one is
-        configured, never written in line with a decision — so the gate can be perfectly healthy
+        Refusals are kept in a bounded ring in each replica and flushed to the broker's kv once a
+        minute, never written in line with a decision — so the gate can be perfectly healthy
         while this page has nothing to read.
       </p>
     </div>

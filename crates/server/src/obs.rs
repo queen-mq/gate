@@ -266,7 +266,7 @@ impl Traces {
             .collect()
     }
 
-    /// Take everything, for the periodic flush to Postgres.
+    /// Take everything, for the periodic flush to history.
     pub fn drain(&self) -> Vec<Trace> {
         std::mem::take(&mut *self.ring.write())
             .into_iter()

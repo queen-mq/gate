@@ -241,7 +241,7 @@ export function period(seconds) {
 }
 
 /* Instants arrive as epoch milliseconds from the gate's own clock and as ISO
-   strings from anything that went through Postgres on the way. Both are the
+   strings from anything that went through the broker on the way. Both are the
    same instant to an operator, so both are accepted everywhere. */
 export function toDate(t) {
   if (t === null || t === undefined || t === '') return null

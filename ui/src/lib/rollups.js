@@ -1,14 +1,13 @@
 import { api, toDate } from './api.js'
 
 /*
-  The roll-ups are the console's only memory. They come from `gate.rollups` in
-  Postgres, where every replica's minutes are summed into one row, so the series
-  is the deployment's and not the answering pod's.
+  The roll-ups are the console's only memory. They come from the broker's kv,
+  where every replica writes its own minutes and Gate sums them on read, so the
+  series is the deployment's and not the answering pod's.
 
-  A build with no database configured serves its own ring instead and reaches
-  back only as far as that process has been running. That is not a broken
-  console — it is a console with one replica's memory, which is exactly what a
-  local run has.
+  A build with history switched off (`GATE_HISTORY=off`) has none to serve.
+  That is not a broken console — it is a limiter that was told to keep no
+  memory.
 
   `null` therefore means "there is nothing to read", an array means "this is
   it, possibly empty", and every caller renders the difference.

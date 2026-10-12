@@ -18,7 +18,7 @@ pub async fn summary(
     let history = app.history.as_ref().ok_or_else(|| {
         Fail(
             StatusCode::SERVICE_UNAVAILABLE,
-            "Watch history is unavailable. Restore Gate's PostgreSQL history connection.".into(),
+            "Watch history is unavailable: this Gate runs with GATE_HISTORY=off.".into(),
         )
     })?;
     let now = crate::now_ms();
@@ -30,6 +30,10 @@ pub async fn summary(
     })?;
     let end = watch.ends_at().unwrap_or(start);
     let (since, until) = complete_minutes(start, now.min(end));
+    // A minute older than its retention is gone, not idle: leave it out of the
+    // average instead of counting it as zero traffic.
+    let kept = (now - (crate::history::KEEP_WATCH_SECONDS - 86_400) * 1000) / 60_000 * 60_000;
+    let since = since.max(kept).min(until);
     let minutes = (until - since) / 60_000;
     let mut nodes = Vec::new();
     for name in rt.plan.nodes.keys() {

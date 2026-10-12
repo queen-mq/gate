@@ -66,11 +66,8 @@ jobs:
       GATE_TEST_QUEEN_URL: http://127.0.0.1:6632
       # A missing broker is a red build here, never a skipped test.
       GATE_TEST_REQUIRE_LIVE: "1"
-      # The history layer was entirely untested because nothing set this: the
-      # schema, the upsert-sum and the rollup reads all short-circuit to `None`
-      # without it.
-      PG_HOST: 127.0.0.1
-      PG_PASSWORD: postgres
+      # Nothing for history: it is in the broker's kv. The postgres service
+      # above is there for the 1.0.5 broker and for nothing else.
 
     steps:
     - uses: actions/checkout@v4
