@@ -73,9 +73,22 @@ investigate delivery delays.
   already passed by every consumer group. Pending work has no age limit. The
   policy is applied during graph provisioning and restoration; application-owned
   ingress and egress queues keep their independently configured retention.
-- Watch and persisted history require Gate's PostgreSQL history connection.
-  Additional tables and indexes are created automatically when history connects.
-  Queue history requires counters, enabled automatically by Watch and wizard
+- **History moved from PostgreSQL to the broker's kv.** Gate now needs only its
+  broker: roll-ups, refusals, Watch samples, queue samples and configuration
+  markers are keys under `hist:` in `GATE_KV_NAMESPACE`, and history is on
+  without any setting (`GATE_HISTORY=off` switches it off). `PG_HOST`,
+  `PG_PORT`, `PG_DATABASE`, `PG_USER` and `PG_PASSWORD` are no longer read;
+  remove them, and the chart's `pg` values, when convenient. What schema `gate`
+  holds is not carried over and can be dropped: the console starts with an
+  empty history, and a Watch that is running loses the minutes recorded before
+  the upgrade.
+- History is kept for less time, each key expiring on its own: roll-ups, queue
+  samples and configuration markers for 25 hours (the console reads one day
+  back), roll-ups of a target in Watch for 45 days, Watch samples and refusals
+  for 7 days. Refusals are the newest 250 per replica. A queue sample whose
+  per-partition positions pass 4 KiB is kept without them, and that node's
+  incoming estimate is shown as unknown.
+- Queue history requires counters, enabled automatically by Watch and wizard
   templates.
 - Upgrade every Gate replica before declaring Watch targets. Older builds reject
   the new `watch` field. Changing between Watch and enforcement requires a higher

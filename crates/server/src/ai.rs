@@ -399,7 +399,7 @@ fn validate_draft(
     if let Some(watch) = &mut doc.watch {
         watch.started_at = None;
         if app.history.is_none() {
-            return Err("Watch is unavailable: PostgreSQL history is not configured. Ask the user for limits instead.".into());
+            return Err("Watch is unavailable: history is switched off (GATE_HISTORY=off). Ask the user for limits instead.".into());
         }
     }
     if app.registry.get(application, &doc.graph).is_some() {
@@ -554,7 +554,7 @@ mod tests {
                 assert!(doc.nodes.values().all(|node| node.budgets.is_empty()));
                 assert!(validate_draft(&app, "demo", &raw)
                     .unwrap_err()
-                    .contains("PostgreSQL"));
+                    .contains("history is switched off"));
             } else {
                 validate_draft(&app, "demo", &raw).unwrap();
             }
@@ -1154,7 +1154,7 @@ mod tests {
         invalid["watch"] = json!({"durationSeconds":3600});
         assert!(validate_draft(&app, "demo", &invalid.to_string())
             .unwrap_err()
-            .contains("PostgreSQL"));
+            .contains("history is switched off"));
         let mut invalid = doc();
         invalid["nodes"]["limit"]["cost"] = json!(1000);
         assert!(validate_draft(&app, "demo", &invalid.to_string()).is_err());

@@ -96,19 +96,19 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // History is optional: the data plane needs nothing from it, so a cell
-    // without a database limits traffic exactly as well and simply cannot answer
-    // "how were we doing last Tuesday".
-    let history = match history::History::connect().await {
-        Some(Ok(h)) => Some(Arc::new(h)),
-        Some(Err(e)) => return Err(e.into()),
-        None => {
-            tracing::warn!("PG_HOST is not set: rollups and traces are not being kept");
+    let queen = Queen::connect(Config::new(&queen_url))?;
+
+    // History lives in the broker's kv, beside the counters, so there is
+    // nothing to configure and it is on. It stays optional because the data
+    // plane needs nothing from it: `GATE_HISTORY=off` limits traffic exactly as
+    // well and simply cannot answer "how were we doing an hour ago".
+    let history = match std::env::var("GATE_HISTORY").as_deref() {
+        Ok("off") => {
+            tracing::warn!("GATE_HISTORY=off: rollups, traces and Watch are not being kept");
             None
         }
+        _ => Some(Arc::new(history::History::new(queen.clone()))),
     };
-
-    let queen = Queen::connect(Config::new(&queen_url))?;
 
     let app = Arc::new(api::App {
         ai: Some(ai::Agent::from_env()?),
@@ -121,7 +121,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         depths: Arc::new(depth::Depths::default()),
         backlogs: Default::default(),
         traces: Arc::new(obs::Traces::default()),
-        history: history.clone(),
+        history,
         queen_url: queen_url.clone(),
         started_ms: now_ms(),
         broker: parking_lot::RwLock::new(None),
@@ -167,17 +167,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => None,
     };
-
-    // Retention on its own slow clock: O(space) work does not belong on the same
-    // tick as O(work) work.
-    if let Some(h) = history.clone() {
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-                h.prune(90, 7).await;
-            }
-        });
-    }
 
     let internal_app = api::router(app.clone());
     match public {
@@ -272,7 +261,16 @@ pub fn spawn_counters(app: api::Shared) -> tokio::task::JoinHandle<()> {
                     }
                     for (target, samples) in checkpoints {
                         let written = match per_target.remove(&target) {
-                            Some(paths) => h.add(&g.doc.application, &target, minute, &paths).await,
+                            Some(paths) => {
+                                h.add(
+                                    &g.doc.application,
+                                    &target,
+                                    minute,
+                                    &paths,
+                                    g.doc.watch.is_some(),
+                                )
+                                .await
+                            }
                             None => true,
                         };
                         if written {

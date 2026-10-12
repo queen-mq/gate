@@ -14,7 +14,6 @@ pub fn spawn(app: Shared) -> tokio::task::JoinHandle<()> {
         let mut tick = tokio::time::interval(Duration::from_secs(10));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_minute = -1;
-        let mut last_hour = -1;
         loop {
             tick.tick().await;
             let live: HashSet<_> = app.registry.all().iter().map(|g| g.key()).collect();
@@ -72,10 +71,6 @@ pub fn spawn(app: Shared) -> tokio::task::JoinHandle<()> {
                         tracing::warn!(%error, "could not persist queue sample");
                     }
                 }
-            }
-            if minute / 60 != last_hour {
-                history.prune_insights().await;
-                last_hour = minute / 60;
             }
         }
     })

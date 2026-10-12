@@ -680,19 +680,164 @@ async fn watch_requires_history_before_starting_a_target() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs a broker and PostgreSQL history: set GATE_TEST_QUEEN_URL and PG_HOST"]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn history_in_kv_sums_every_replica_and_is_read_by_one_that_wrote_none_of_it() {
+    use gate_server::history::{Bucket, History};
+    use gate_server::obs::Trace;
+    use std::collections::HashMap;
+    let Some(h) = harness("history").await else {
+        return;
+    };
+    let app = h.application.as_str();
+    // Two replicas that each saw a share of the traffic, and a third that has
+    // just started: it holds nothing in memory and reads what the others wrote.
+    let (a, b) = (History::new(h.queen.clone()), History::new(h.queen.clone()));
+    let reader = History::new(h.queen.clone());
+    let now = gate_server::now_ms();
+    let minute = now / 60_000 * 60_000;
+    let lanes = |admitted, denied, cost| {
+        HashMap::from([(
+            "main".to_string(),
+            Bucket {
+                admitted,
+                denied,
+                cost_estimated: cost,
+                ..Bucket::default()
+            },
+        )])
+    };
+    assert!(
+        a.add(app, "g.n", minute - 180_000, &lanes(4, 1, 8.0), false)
+            .await
+    );
+    assert!(
+        b.add(app, "g.n", minute - 180_000, &lanes(2, 0, 2.0), false)
+            .await
+    );
+    assert!(
+        a.add(app, "g.n", minute - 120_000, &lanes(0, 0, 0.0), false)
+            .await
+    );
+    assert!(
+        a.add(app, "g.n", minute - 60_000, &lanes(60, 0, 120.0), false)
+            .await
+    );
+    assert!(
+        b.add(app, "g.n", minute - 60_000, &lanes(60, 0, 120.0), false)
+            .await
+    );
+
+    let rows = reader.rollups(app, "g.n", 10).await.unwrap();
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert_eq!(rows[0]["t"], minute - 180_000);
+    assert_eq!(rows[0]["total"]["admitted"], 6.0);
+    assert_eq!(rows[0]["total"]["denied"], 1.0);
+    assert_eq!(rows[0]["lanes"]["main"]["cost_estimated"], 10.0);
+    assert_eq!(
+        rows[1]["total"]["admitted"], 0.0,
+        "an idle minute is a measured zero, not a gap"
+    );
+    assert_eq!(rows[2]["total"]["admitted"], 120.0);
+    assert_eq!(
+        reader.rate_per_sec(app, "g.n", "main", now).await.unwrap(),
+        2.0
+    );
+    assert_eq!(
+        reader.avg_cost(app, "g.n", "main", now).await,
+        Some(250.0 / 126.0)
+    );
+    assert_eq!(
+        reader
+            .watch_minutes(app, "g.n", minute - 180_000, minute - 60_000)
+            .await
+            .unwrap(),
+        vec![(6, 10.0), (0, 0.0)],
+        "the window is half open"
+    );
+    let flow = reader.flow(10, now).await.unwrap();
+    assert!(
+        flow.contains(&(
+            app.to_string(),
+            "g.n".to_string(),
+            minute - 60_000,
+            120,
+            240.0
+        )),
+        "{flow:?}"
+    );
+    // A replica reads its own write, not the copy it cached before it.
+    assert!(a.rollups(app, "g.n", 10).await.unwrap().len() == 3);
+    assert!(a.add(app, "g.n", minute, &lanes(1, 0, 1.0), false).await);
+    assert!(a.rollups(app, "g.n", 10).await.unwrap().len() == 4);
+
+    let trace = |at| Trace {
+        at,
+        application: app.to_string(),
+        graph: "g".into(),
+        node: "n".into(),
+        path: "main".into(),
+        op: String::new(),
+        outcome: "denied",
+        budget_id: Some("rate".into()),
+    };
+    assert!(a.add_traces(&[trace(now - 3000), trace(now - 1000)]).await);
+    assert!(b.add_traces(&[trace(now - 2000)]).await);
+    // The ring is one value: a second flush keeps what the first wrote.
+    assert!(a.add_traces(&[trace(now - 500)]).await);
+    let mine = |rows: Vec<Value>| -> Vec<i64> {
+        rows.iter()
+            .filter(|t| t["application"] == app)
+            .map(|t| t["at"].as_i64().unwrap())
+            .collect()
+    };
+    let traces = reader.traces(Some("denied"), 500).await.unwrap();
+    assert_eq!(
+        mine(traces.clone()),
+        vec![now - 500, now - 1000, now - 2000, now - 3000],
+        "newest first, across replicas"
+    );
+    let first = traces.iter().find(|t| t["application"] == app).unwrap();
+    assert_eq!(first["target"], "g.n");
+    assert_eq!(first["budget_id"], "rate");
+    assert!(mine(reader.traces(Some("admitted"), 500).await.unwrap()).is_empty());
+
+    let idle = json!({"available": true, "before": 0, "workers": 0, "version": 1});
+    let busy = json!({"available": true, "before": 7, "workers": 0, "version": 1});
+    a.snapshot(app, "g", "n", minute - 120_000 + 3000, &idle)
+        .await
+        .unwrap();
+    b.snapshot(app, "g", "n", minute - 120_000 + 5000, &busy)
+        .await
+        .unwrap();
+    a.snapshot(app, "g", "n", minute - 60_000 + 3000, &idle)
+        .await
+        .unwrap();
+    a.snapshot(app, "g", "other", minute - 60_000 + 3000, &busy)
+        .await
+        .unwrap();
+    let insights = reader.insights(app, "g", 10).await.unwrap();
+    let samples = insights["samples"].as_array().unwrap();
+    assert_eq!(samples.len(), 3, "{insights}");
+    assert_eq!(samples[0]["node"], "n");
+    assert_eq!(samples[0]["t"], minute - 120_000);
+    assert_eq!(samples[0]["at"], minute - 120_000 + 5000);
+    assert_eq!(
+        samples[0]["value"]["before"], 7,
+        "the later reading of a minute wins"
+    );
+    assert_eq!(samples[1]["value"]["before"], 0);
+    assert_eq!(samples[2]["node"], "other");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn watch_relays_without_caps_keeps_its_timer_and_activates_limits_explicitly() {
     use gate_server::history::{Bucket, History};
     use std::collections::HashMap;
     let Some(mut h) = harness("watch").await else {
         return;
     };
-    let history = Arc::new(
-        History::connect()
-            .await
-            .expect("watch test needs PG_HOST")
-            .expect("history connection"),
-    );
+    let history = Arc::new(History::new(h.queen.clone()));
     let mut app = api::App::new(h.queen.clone(), queen_url().unwrap());
     app.history = Some(history.clone());
     h.app = Arc::new(app);
@@ -759,7 +904,7 @@ async fn watch_relays_without_caps_keeps_its_timer_and_activates_limits_explicit
     )]);
     assert!(
         history
-            .add(&h.application, "g.limit", now - 120_000, &buckets)
+            .add(&h.application, "g.limit", now - 120_000, &buckets, true)
             .await
     );
     let (status, observation) = h
@@ -4759,13 +4904,13 @@ async fn a_duplicate_rolls_the_bundle_back_without_naming_itself() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs isolated broker and PostgreSQL history"]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn insights_recording_is_idempotent_and_diagnostics_distinguish_workers() {
     use gate_server::history::History;
     let Some(mut h) = harness("insights").await else {
         return;
     };
-    let history = Arc::new(History::connect().await.expect("PG_HOST").expect("history"));
+    let history = Arc::new(History::new(h.queen.clone()));
     let mut app = api::App::new(h.queen.clone(), queen_url().unwrap());
     app.history = Some(history.clone());
     h.app = Arc::new(app);

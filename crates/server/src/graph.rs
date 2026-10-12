@@ -97,7 +97,7 @@ pub async fn declare_locked(
     };
     if from_caller && doc.watch.is_some() {
         if app.history.is_none() {
-            return Err(Refusal::Invalid("Watch requires durable history. Configure Gate's PostgreSQL history connection before creating an observation target.".into()));
+            return Err(Refusal::Invalid("Watch requires durable history, and this Gate runs with GATE_HISTORY=off. Remove it before creating an observation target.".into()));
         }
         start_watch(
             &mut doc,
