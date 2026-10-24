@@ -87,12 +87,12 @@ impl StageRuntime {
 /// # The clock this compares against is not ours
 ///
 /// The seed is a wall-clock instant taken from **Gate's** clock, and the broker
-/// resolves it against `log_segments.created_at`, stamped from **Postgres's**
-/// `clock_timestamp()` (`003_log_push.sql:219-224`). The two can disagree. Gate
-/// running AHEAD of the database is the direction that loses work — a frame
-/// this runtime relays could carry a database timestamp below our seed and be
-/// skipped — so the seed is pushed back by a margin that no plausible skew
-/// crosses.
+/// resolves it against each frame's `created_at_us`, stamped from the **Raft
+/// leader's** planner clock (Queen's `server/src/rsm/apply.rs`, "Time comes from
+/// the entry"). The two can disagree. Gate running AHEAD of the leader is the
+/// direction that loses work — a frame this runtime relays could carry a leader
+/// timestamp below our seed and be skipped — so the seed is pushed back by a
+/// margin that no plausible skew crosses.
 ///
 /// Two minutes, and it is bounded on BOTH sides:
 ///

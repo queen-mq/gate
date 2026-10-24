@@ -353,9 +353,9 @@ impl CompiledBudget {
         self.scope_by.is_some()
     }
 
-    /// The key one charge lands on. A scoped budget gets one row per distinct
-    /// value, reaped by its own TTL — 200,000 live listings is 200,000 Postgres
-    /// rows, where v1 needed 64 shards, 64 gate runners, 64 partition leases and
+    /// The key one charge lands on. A scoped budget gets one key per distinct
+    /// value, reaped by its own TTL — 200,000 live listings is 200,000 kv
+    /// keys, where v1 needed 64 shards, 64 gate runners, 64 partition leases and
     /// 64 state documents to hold the same thing.
     pub fn key_for(&self, scope: Option<&str>) -> String {
         match (self.scope_by.as_ref(), scope) {

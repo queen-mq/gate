@@ -189,7 +189,7 @@ fn every_dropped_v1_field_is_named_in_a_warning() {
 }
 
 /// A scoped budget's whole subsystem — `shardBy`, `shards`, `maxKeys` — is a
-/// no-op now, and the per-key limit becomes one Postgres row per value.
+/// no-op now, and the per-key limit becomes one kv key per value.
 #[test]
 fn a_sharded_scoped_budget_becomes_one_counter_per_value() {
     let spec: v1::GraphSpec = serde_json::from_str(V1_GRAPH).unwrap();

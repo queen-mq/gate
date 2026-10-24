@@ -1,8 +1,8 @@
 //! Where the declared graphs live between restarts.
 //!
 //! `gate` has no database of its own, and that is a deliberate position: the
-//! work is in queen's log and the budget counters are rows in `queen.kv`.
-//! Everything that matters is already durable in the Postgres queen owns, and
+//! work is in queen's log and the budget counters are keys in queen's kv.
+//! Everything that matters is already durable in queen's own log, and
 //! adding a second data system to hold one more thing would be a second data
 //! system to run, size, back up and lose.
 //!

@@ -192,7 +192,7 @@ pub struct Budget {
 
     /// One counter per distinct value of this payload path. Replaces the whole
     /// of v1's `scope[]` + `maxKeys` + `shardBy` + `shards` + store-fits
-    /// subsystem: cardinality is Postgres rows with a TTL now, not entries in a
+    /// subsystem: cardinality is kv keys with a TTL now, not entries in a
     /// document re-read whole on every cycle, so there is no shard to allocate.
     #[serde(default, rename = "scopeBy", skip_serializing_if = "Option::is_none")]
     pub scope_by: Option<String>,

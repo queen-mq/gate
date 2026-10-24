@@ -13,7 +13,7 @@
 //! wrong. Each one policed an invariant this architecture makes structural
 //! (`lane-shares` and its four siblings: there is one counter now, so N ceilings
 //! cannot oversubscribe it) or a resource it no longer allocates (`shard-count`,
-//! `max-keys`, `store-fits`, `kv-chunk`: cardinality is Postgres rows with a
+//! `max-keys`, `store-fits`, `kv-chunk`: cardinality is kv keys with a
 //! TTL, not entries in a document Gate re-reads whole every cycle).
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};

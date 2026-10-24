@@ -13,8 +13,8 @@
 //!   cannot oversubscribe it; the 93/s-against-50 and 7131-against-5000 defects
 //!   are not expressible.
 //! * `max-keys`, `store-fits`, `kv-scope`, `kv-match`, `kv-chunk` x2,
-//!   `shard-count` x3, `shard-scope`, `shard-entry` — cardinality is Postgres
-//!   rows with a TTL, not entries in a document Gate re-reads whole every cycle,
+//!   `shard-count` x3, `shard-scope`, `shard-entry` — cardinality is kv keys
+//!   with a TTL, not entries in a document Gate re-reads whole every cycle,
 //!   and there is no capacity lease in front of a shared budget any more.
 //! * `batch-fits`, `pacing`, `lease-beats-window` — the lease is a work lease
 //!   and pacing is the budget window; there is no pacing quantum to beat.
