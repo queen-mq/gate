@@ -4,6 +4,7 @@ import FlowChart from '../components/FlowChart.vue'
 import SpatialGraph from '../components/dashboard/SpatialGraph.vue'
 import StatusDot from '../components/StatusDot.vue'
 import Icon from '../components/Icon.vue'
+import PageHeader from '../components/PageHeader.vue'
 import {
   api,
   num,
@@ -24,7 +25,6 @@ const targets = ref(null)
 const breaches = ref(null)
 const errors = ref({ overview: '', targets: '', breaches: '' })
 const updatedAt = ref(null)
-const loading = ref(false)
 const query = ref('')
 const attentionOnly = ref(false)
 const selection = ref('')
@@ -33,7 +33,6 @@ const graphError = ref('')
 const graphLoading = ref(false)
 
 async function load() {
-  loading.value = true
   const results = await Promise.allSettled([
     api.get('/api/overview'),
     api.get('/api/targets'),
@@ -67,9 +66,8 @@ async function load() {
   })
   if (Object.values(errors.value).every((error) => !error))
     updatedAt.value = Date.now()
-  loading.value = false
 }
-const refresh = usePoll(load)
+usePoll(load)
 const failed = computed(() => Object.values(errors.value).some(Boolean))
 const selectedTarget = computed(() =>
   (targets.value ?? []).find((t) => targetKey(t) === selection.value),
@@ -238,27 +236,11 @@ function clearFilters() {
 
 <template>
   <div class="live-dashboard">
-    <header class="dashboard-heading">
-      <div>
-        <div class="dashboard-eyebrow"><span></span>TRAFFIC CONTROL</div>
-        <h1>Everything in flow.</h1>
-        <p>Your traffic, its ceilings, and a clearer perspective.</p>
-      </div>
-      <div class="dashboard-heading-actions">
-        <span class="dashboard-live" role="status"
-          ><i :class="failed ? 'warn' : overview ? 'good' : 'muted'"></i
-          >{{
-            failed
-              ? 'Refresh failed'
-              : overview
-                ? 'Live · every 4s'
-                : 'Connecting…'
-          }}</span
-        ><button class="btn" :disabled="loading" @click="refresh">
-          {{ loading ? 'Refreshing…' : 'Refresh' }}
-        </button>
-      </div>
-    </header>
+    <PageHeader
+      title="Overview"
+      sub="Your traffic, its ceilings, and a clearer perspective."
+      :live="failed ? 'refresh failed' : overview ? 'every 4s' : 'connecting…'"
+    />
 
     <section
       class="dashboard-health"

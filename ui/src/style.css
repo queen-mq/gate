@@ -3,6 +3,9 @@
    filesystem auto-detection and the two @source lines replace it: without them
    Tailwind walks up to the repository root and scans the Rust crates as well. */
 @import 'tailwindcss' source(none);
+/* The frame Queen, Gate and Traceflow share: sidebar, top bar, page head.
+   Queen owns it; `npm run sync:shell` copies it here. */
+@import './shell.css';
 @source '../index.html';
 @source '../src/**/*.{vue,js}';
 
@@ -98,7 +101,7 @@
     --surface: #f9f7f4;
     --surface-2: #ebe7e1;
     --input: #f1eee9;
-    --selected: #e2ded7;
+    --selected: color-mix(in srgb, var(--brand) 14%, var(--ink-2));
     --text: #1f1d1a;
     --text-2: #4f4b45;
     --text-3: #6c675f;
@@ -121,6 +124,29 @@
     --series-5: #5f5b53;
     --series-6: #968469;
 
+    /* The shell's tokens (shell.css), named as Queen names them. */
+    --ink-0: var(--bg);
+    --ink-2: var(--surface);
+    --ink-3: var(--input);
+    --ink-4: var(--surface-2);
+    --bd: var(--border);
+    --bd-hi: var(--border-2);
+    --text-hi: var(--text);
+    --text-mid: var(--text-2);
+    --text-low: var(--text-3);
+    --text-faint: #b0aaa2;
+    --accent-text: #806000;
+    --warn-400: var(--warn);
+    --ember-400: var(--bad);
+    --ember-500: var(--bad);
+    --r-chip: 4px;
+    --r-control: 6px;
+    --r-card: 8px;
+    --ease: cubic-bezier(.2, .7, .2, 1);
+    --drawer-duration: 300ms;
+    --drawer-ease: cubic-bezier(.2, .7, .2, 1);
+    --shadow-pop: 0 14px 32px -16px rgba(40, 30, 20, 0.28), 0 0 0 1px #d4cfc8;
+
     --scrim: rgb(40 36 32 / 0.25);
     color-scheme: light;
   }
@@ -131,7 +157,7 @@
     --surface: #191815;
     --surface-2: #25231e;
     --input: #1d1b17;
-    --selected: #353020;
+    --selected: color-mix(in srgb, var(--brand) 14%, var(--ink-2));
     --text: #f9f7f4;
     --text-2: #bcb6ab;
     --text-3: #969084;
@@ -153,6 +179,10 @@
     --series-5: #918d84;
     --series-6: #d3c9b6;
 
+    --text-faint: #57534e;
+    --accent-text: #fcc620;
+
+    --shadow-pop: 0 14px 34px -14px rgba(0, 0, 0, 0.7), 0 0 0 1px #34312e;
     --scrim: rgb(7 6 6 / 0.62);
     color-scheme: dark;
   }
@@ -234,10 +264,6 @@
            font-mono text-[11px] text-fg-2 whitespace-nowrap;
   }
 
-  .kbd {
-    @apply font-mono text-[11px] text-fg-2 bg-surface-2 border border-line rounded-sm px-1.5 py-px;
-  }
-
   /* Section heading: small, quiet, with room for a count. */
   .section-title {
     @apply flex items-baseline gap-2 text-[13px] font-semibold tracking-tight mb-3;
@@ -287,51 +313,12 @@
   .dark .gate-brand .gate-brand-light { display: none; }
   .dark .gate-brand .gate-brand-dark { display: block; }
 
-  .console-shell { --sidebar-width: 224px; }
-  .gate-sidebar {
-    position: fixed; inset: 0 auto 0 0; z-index: 40;
-    display: flex; flex-direction: column;
-    width: 224px; background: var(--rail); border-right: 1px solid var(--border);
-    transform: translateX(-100%);
-    transition: transform 0.18s var(--ease-spring), width 0.18s var(--ease-spring);
-  }
-  .gate-sidebar.is-open { transform: translateX(0); }
-  .sidebar-brand {
-    display: flex; align-items: center; justify-content: space-between;
-    height: 76px; padding: 0 22px; flex: none;
-  }
-  .sidebar-nav { flex: 1; overflow-y: auto; padding: 16px 8px; }
-  .nav-group + .nav-group { margin-top: 22px; }
-  .nav-label {
-    padding: 0 12px 9px; font-size: 9px; font-weight: 500; color: var(--text-3);
-    text-transform: uppercase; letter-spacing: 1.4px;
-  }
-  .nav-link {
-    display: flex; align-items: center; gap: 10px; height: 39px;
-    padding: 0 12px; margin-bottom: 5px; border-radius: 6px;
-    color: var(--text-2); font-size: 12px; white-space: nowrap;
-    transition: color 0.12s, background 0.12s;
-  }
-  .nav-link > svg { color: var(--text-3); }
-  .nav-link:hover { background: var(--surface); color: var(--text); }
-  .nav-link.is-active { background: var(--selected); color: var(--spatial-accent, var(--text)); font-weight: 500; }
-  .nav-link:hover > svg, .nav-link.is-active > svg { color: var(--text); }
-  .sidebar-foot { flex: none; margin: 0 16px; padding: 14px 0 16px; border-top: 1px solid var(--border); }
-  .sidebar-rail-foot { display: none; }
-  .console-topbar {
-    height: 60px; position: sticky; top: 0; z-index: 20;
-    display: flex; align-items: center; gap: 12px; padding: 0 20px;
-    background: var(--bg); border-bottom: 1px solid var(--border);
-  }
   .icon-button {
     display: inline-grid; place-items: center; flex: none;
     width: 30px; height: 30px; border-radius: 6px; color: var(--text-3);
     transition: color 0.12s, background 0.12s;
   }
   .icon-button:hover { color: var(--text); background: var(--surface-2); }
-  .console-main { min-width: 0; padding: 24px 20px 40px; }
-  .console-content { width: 100%; max-width: 1500px; margin: 0 auto; }
-  .nav-scrim { position: fixed; inset: 0; z-index: 30; background: var(--scrim); }
   .summary-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
   .metric-tile { padding: 16px 18px; }
   .segmented-control {
@@ -347,31 +334,6 @@
   @media (min-width: 640px) {
     .summary-metrics { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   }
-  @media (min-width: 1024px) {
-    .console-shell.is-rail { --sidebar-width: 56px; }
-    .gate-sidebar { width: var(--sidebar-width); transform: none; }
-    .console-page { margin-left: var(--sidebar-width); transition: margin-left 0.18s var(--ease-spring); }
-    .console-main { padding: 28px 32px 48px; }
-    .console-topbar { padding: 0 24px; }
-    .gate-sidebar.is-rail .sidebar-brand { padding: 0; justify-content: center; }
-    .gate-sidebar.is-rail .brand-wordmark,
-    .gate-sidebar:not(.is-rail) .brand-symbol { display: none; }
-    .gate-sidebar.is-rail .nav-link { justify-content: center; padding: 0; }
-    .gate-sidebar.is-rail .nav-name,
-    .gate-sidebar.is-rail .nav-label,
-    .gate-sidebar.is-rail .sidebar-foot { display: none; }
-    .gate-sidebar.is-rail .sidebar-rail-foot {
-      display: flex; flex-direction: column; align-items: center; gap: 6px;
-      margin: 0 8px; padding: 12px 0; border-top: 1px solid var(--border);
-    }
-    .gate-sidebar.is-rail .nav-group + .nav-group::before {
-      content: ''; display: block; margin: 0 8px 14px; border-top: 1px solid var(--border);
-    }
-    .nav-scrim { display: none; }
-  }
-  @media (max-width: 1023px) {
-    .brand-symbol { display: none; }
-  }
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after {
       animation-duration: 0.01ms !important;
@@ -380,6 +342,23 @@
     }
   }
 }
+
+/* ---------------------------------------------------------------- the shell
+   Gate's own pieces inside the shared frame (shell.css). Unlayered, like the
+   frame: a layered rule on a shell class always loses to it. */
+
+/* The shell sizes the logo's <img>; Gate's logo is two of them, one per theme,
+   in a wrapper whose fixed widths would leave a gap beside that height. */
+.brand-mark .gate-brand, .boot-mark .gate-brand { width: auto; }
+.brand-mark .gate-brand-dark, .boot-mark .gate-brand-dark { display: none; }
+.dark .brand-mark .gate-brand-light, .dark .boot-mark .gate-brand-light { display: none; }
+.dark .brand-mark .gate-brand-dark, .dark .boot-mark .gate-brand-dark { display: block; }
+
+/* A sign-out that failed says so in the account menu. */
+.user-who .is-bad { color: var(--ember-400); }
+
+/* Gate's pages explain themselves: one quiet line under the head. */
+.page-lede { margin: -6px 0 16px; max-width: 76ch; font-size: 12.5px; line-height: 1.6; color: var(--text-low); }
 
 .template-option { padding: 16px; border: 1px solid var(--border); border-radius: 9px; text-align: left; transition: border-color .15s, background .15s; }
 .template-option strong { display: block; font-size: 13px; }
@@ -459,5 +438,5 @@
 .ai-json { font-size: 10px; line-height: 1.8; overflow: auto; max-height: 300px; margin-top: 12px; padding: 12px; border: 1px solid var(--border); border-radius: 7px; }
 .ai-draft-footer { border-top: 1px solid var(--border); padding: 18px 20px; flex-shrink: 0; }
 .ai-draft-footer p { color: var(--text-3); font-size: 10px; line-height: 1.7; margin-top: 12px; }
-@media (max-width: 640px) { .ai-panel-header { padding: 14px 16px; } .ai-chat-header { padding: 12px 16px; } .ai-chat-header input { width: 130px; } .ai-transcript { padding: 18px; } .ai-composer { padding: 12px 16px; padding-bottom: max(12px, env(safe-area-inset-bottom)); } .ai-welcome { margin-top: 0; } .ai-welcome-icon { display: none; } .ai-welcome h3 { font-size: 18px; } .ai-notice { padding: 12px 16px; } .ai-composer-footer > span { max-width: 145px; } .ai-nav-trigger { padding-inline: 9px; } }
+@media (max-width: 640px) { .ai-panel-header { padding: 14px 16px; } .ai-chat-header { padding: 12px 16px; } .ai-chat-header input { width: 130px; } .ai-transcript { padding: 18px; } .ai-composer { padding: 12px 16px; padding-bottom: max(12px, env(safe-area-inset-bottom)); } .ai-welcome { margin-top: 0; } .ai-welcome-icon { display: none; } .ai-welcome h3 { font-size: 18px; } .ai-notice { padding: 12px 16px; } .ai-composer-footer > span { max-width: 145px; } }
 @media (prefers-reduced-motion: reduce) { .ai-thinking .ai-live-dot, .ai-chat-dialog[open], .ai-chat-dialog::backdrop { animation: none; } .ai-transcript { scroll-behavior: auto; } }

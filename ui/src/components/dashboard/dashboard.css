@@ -17,65 +17,6 @@
   --spatial-bottom: #1b1913;
   --spatial-shadow: #00000026;
 }
-.dashboard-heading {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 24px;
-  margin: 4px 0 25px;
-}
-.dashboard-eyebrow {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font: 9px var(--font-mono);
-  letter-spacing: 1.6px;
-  color: var(--text-3);
-  margin-bottom: 12px;
-}
-.dashboard-eyebrow > span {
-  display: block;
-  width: 18px;
-  height: 1px;
-  background: var(--spatial-accent);
-}
-.dashboard-heading h1 {
-  font-size: clamp(30px, 3vw, 44px);
-  font-weight: 450;
-  letter-spacing: -1.7px;
-  line-height: 1.15;
-}
-.dashboard-heading p {
-  font-size: 12px;
-  margin-top: 10px;
-  color: var(--text-2);
-}
-.dashboard-heading-actions {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-}
-.dashboard-live {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 10px;
-  color: var(--text-3);
-  white-space: nowrap;
-}
-.dashboard-live i {
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: var(--text-3);
-}
-.dashboard-live i.good {
-  background: var(--good);
-  box-shadow: 0 0 8px color-mix(in srgb, var(--good) 35%, transparent);
-}
-.dashboard-live i.warn {
-  background: var(--warn);
-}
 .dashboard-health {
   display: flex;
   align-items: center;
@@ -936,14 +877,6 @@
   }
 }
 @media (max-width: 800px) {
-  .dashboard-heading h1 {
-    font-size: 32px;
-  }
-  .dashboard-heading-actions {
-    flex-direction: column;
-    align-items: flex-end;
-    gap: 10px;
-  }
   .dashboard-kpis {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -1032,26 +965,6 @@
   }
 }
 @media (max-width: 480px) {
-  .dashboard-heading {
-    gap: 10px;
-  }
-  .dashboard-heading h1 {
-    font-size: 29px;
-    letter-spacing: -1.2px;
-  }
-  .dashboard-heading p {
-    font-size: 10px;
-  }
-  .dashboard-eyebrow {
-    font-size: 7px;
-  }
-  .dashboard-live {
-    font-size: 8px;
-  }
-  .dashboard-heading-actions .btn {
-    font-size: 10px;
-    height: 28px;
-  }
   .dashboard-kpis {
     gap: 10px;
   }

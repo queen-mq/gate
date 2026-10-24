@@ -59,20 +59,20 @@ function toGraph(to) {
 const router = createRouter({
   history: createWebHashHistory(),
   routes: [
-    { path: '/', component: () => import('./views/Overview.vue'), meta: { nav: 'overview' } },
+    { path: '/', component: () => import('./views/Overview.vue'), meta: { nav: 'overview', title: 'Overview' } },
 
-    { path: '/targets', component: () => import('./views/Targets.vue'), meta: { nav: 'targets' } },
-    { path: '/targets/new', component: () => import('./views/TargetNew.vue'), meta: { nav: 'targets' } },
+    { path: '/targets', component: () => import('./views/Targets.vue'), meta: { nav: 'targets', title: 'Targets' } },
+    { path: '/targets/new', component: () => import('./views/TargetNew.vue'), meta: { nav: 'targets', title: 'New target' } },
 
     // A graph is declared whole and drawn whole.
-    { path: '/graphs', component: () => import('./views/Graphs.vue'), meta: { nav: 'graphs' } },
-    { path: '/graphs/new', component: () => import('./views/GraphEdit.vue'), meta: { nav: 'graphs' } },
-    { path: '/apps/:app/graphs/:name', component: () => import('./views/GraphDetail.vue'), props: true, meta: { nav: 'graphs' } },
-    { path: '/apps/:app/graphs/:name/edit', component: () => import('./views/GraphEdit.vue'), props: true, meta: { nav: 'graphs' } },
+    { path: '/graphs', component: () => import('./views/Graphs.vue'), meta: { nav: 'graphs', title: 'Graphs' } },
+    { path: '/graphs/new', component: () => import('./views/GraphEdit.vue'), meta: { nav: 'graphs', title: 'New graph' } },
+    { path: '/apps/:app/graphs/:name', component: () => import('./views/GraphDetail.vue'), props: true, meta: { nav: 'graphs', title: 'Graph' } },
+    { path: '/apps/:app/graphs/:name/edit', component: () => import('./views/GraphEdit.vue'), props: true, meta: { nav: 'graphs', title: 'Edit graph' } },
     // A budget's history hangs off the node that declared it: the id is only
     // unique within its node, and two portals both calling a window `per-min`
     // is the normal case, not a collision.
-    { path: '/apps/:app/graphs/:name/nodes/:node/budgets/:budget', component: () => import('./views/BudgetHistory.vue'), props: true, meta: { nav: 'graphs' } },
+    { path: '/apps/:app/graphs/:name/nodes/:node/budgets/:budget', component: () => import('./views/BudgetHistory.vue'), props: true, meta: { nav: 'graphs', title: 'Budget' } },
 
     // ---- the target addresses, answered by the graph pages.
     { path: '/apps/:app/targets/:name', component: NeverRendered, beforeEnter: toGraph, meta: { nav: 'targets' } },
@@ -86,11 +86,16 @@ const router = createRouter({
     { path: '/targets/:name/budgets/:budget', component: NeverRendered, beforeEnter: resolveApplication, meta: { nav: 'targets' } },
     { path: '/graphs/:name', component: NeverRendered, beforeEnter: resolveApplication, meta: { nav: 'graphs' } },
 
-    { path: '/budgets', component: () => import('./views/SharedBudgets.vue'), meta: { nav: 'budgets' } },
-    { path: '/traces', component: () => import('./views/Traces.vue'), meta: { nav: 'traces' } },
+    { path: '/budgets', component: () => import('./views/SharedBudgets.vue'), meta: { nav: 'budgets', title: 'Shared budgets' } },
+    { path: '/traces', component: () => import('./views/Traces.vue'), meta: { nav: 'traces', title: 'Traces' } },
     { path: '/:pathMatch(.*)*', redirect: '/' },
   ],
-  scrollBehavior: () => ({ top: 0 }),
+})
+
+// Queen's tab title. The page scrolls inside the shell (.app-page), not the window.
+router.afterEach((to) => {
+  document.title = `${to.meta.title || 'Gate'} | Gate Dashboard`
+  document.querySelector('.app-page')?.scrollTo(0, 0)
 })
 
 createApp(App).use(router).mount('#app')
