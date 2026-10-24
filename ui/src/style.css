@@ -151,18 +151,19 @@
     color-scheme: light;
   }
 
+  /* Queen's dark values (app/src/style.css), as the light ones above are. */
   .dark {
-    --rail: #0d0c0b;
-    --bg: #11100e;
-    --surface: #191815;
-    --surface-2: #25231e;
-    --input: #1d1b17;
+    --rail: #000000;
+    --bg: #0b0a0a;
+    --surface: #111010;
+    --surface-2: #1c1b19;
+    --input: #171615;
     --selected: color-mix(in srgb, var(--brand) 14%, var(--ink-2));
-    --text: #f9f7f4;
-    --text-2: #bcb6ab;
-    --text-3: #969084;
-    --border: #302d27;
-    --border-2: #474238;
+    --text: #eeebe6;
+    --text-2: #aaa59e;
+    --text-3: #8f8a83;
+    --border: #1f1d1b;
+    --border-2: #34312e;
 
     --link: #fcc620;
     --good: #95cfaf;
@@ -353,6 +354,8 @@
 .brand-mark .gate-brand-dark, .boot-mark .gate-brand-dark { display: none; }
 .dark .brand-mark .gate-brand-light, .dark .boot-mark .gate-brand-light { display: none; }
 .dark .brand-mark .gate-brand-dark, .dark .boot-mark .gate-brand-dark { display: block; }
+/* At 39px the wordmark's letters are as tall as Queen's (shell.css, .brand-mark). */
+.sidebar { --brand-height: 39px; }
 
 /* A sign-out that failed says so in the account menu. */
 .user-who .is-bad { color: var(--ember-400); }
