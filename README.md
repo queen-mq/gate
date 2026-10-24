@@ -81,7 +81,7 @@ leaves at an **egress** queue your own workers pop, with their own SDK, their ow
 
 Read it back: `ip-10s` is ten one-second windows of 150, so a burst cannot take the whole
 ten-second allowance in the first 200 ms. `per-listing` is 100 photo deletions per listing per week
-— 200,000 Postgres rows with a seven-day TTL, and no Gate machinery at all. And `prices` may drive
+— 200,000 kv keys with a seven-day TTL, and no Gate machinery at all. And `prices` may drive
 the shared `ip` counter to its ceiling while `photos` refuses itself at half of it.
 
 **A sub-second window cannot be expressed.** A kv TTL is whole seconds, so `timeMs` below 1000 is

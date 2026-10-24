@@ -4688,11 +4688,12 @@ async fn a_charge_wider_than_one_kv_call_is_chunked() {
 // that says so instead of a throughput graph six months later.
 
 /// Settling a claim IN FULL re-arms its partition immediately; settling a PREFIX
-/// of one leaves it parked until the lease expires; a nack re-arms it at once
-/// and is not available for pacing.
+/// of one leaves it parked until the lease expires; a nack re-arms it after the
+/// queue's `retryDelay` and is not available for pacing.
 ///
-/// Measured, on this broker: **7ms** for the full ack, **the whole lease** for
-/// the prefix, **4ms** for the nack. Two decisions in the relay follow from it —
+/// Measured on Queen 1.0.5: **7ms** for the full ack, **the whole lease** for
+/// the prefix, **4ms** for the nack. Queen 2 holds a nacked partition for
+/// `retryDelay`, 1000 ms by default. Two decisions in the relay follow from it —
 /// `plan::fitting_batch` sizes a claim to what one sub-window admits so the
 /// prefix path is rare, and `GATE_LEASE_SECONDS` is ten rather than thirty so it
 /// is cheap when it is taken.
@@ -4820,9 +4821,9 @@ async fn an_ack_settles_the_whole_claim_or_pays_a_lease() {
         "the happy path must cost nothing; it waited {took:?}"
     );
 
-    // ---- a nack: immediate, and therefore tempting — which is why the relay
-    // never uses one for pacing. It charges the retry budget, and work that is
-    // merely waiting would dead-letter.
+    // ---- a nack: back after `retryDelay`, long before a lease, and therefore
+    // tempting — which is why the relay never uses one for pacing. It charges the
+    // retry budget, and work that is merely waiting would dead-letter.
     let (q, msgs) = claim(&h, "nack").await;
     h.queen
         .transaction()
@@ -4832,7 +4833,10 @@ async fn an_ack_settles_the_whole_claim_or_pays_a_lease() {
         .expect("nack");
     let (took, got) = back(&h, &q, Duration::from_secs(LEASE as u64 * 3)).await;
     assert_eq!(got, vec![0, 1, 2, 3, 4], "a nack moves no cursor");
-    assert!(took < Duration::from_secs(1), "it waited {took:?}");
+    assert!(
+        took < Duration::from_secs(LEASE as u64 - 1),
+        "a nack is back after retryDelay, not after a lease; it waited {took:?}"
+    );
 }
 
 /// The QDUP a transaction answers does not name the offending id.
