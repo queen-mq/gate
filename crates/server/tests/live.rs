@@ -48,7 +48,7 @@
 //!   deleted unnamed in the rewrite and is recorded here because §16.7 asks the
 //!   author to sign off on this trade, and a miscount understates it.)
 //! * `a_shard_serialises_one_key_and_lets_another_through` — there are no
-//!   shards. The per-key limit it tested is now one Postgres row per key, and
+//!   shards. The per-key limit it tested is now one kv entry per key, and
 //!   `a_scoped_budget_limits_one_key_and_lets_another_through` is the same
 //!   question asked of the new mechanism.
 //! * `a_redelivered_relay_is_refused_even_when_the_relay_is_sharded` — same.
@@ -91,7 +91,7 @@ struct Harness {
     ///
     /// They share a broker and several of them MEASURE something — how many
     /// items got through a window, how deep a queue got, whether a second
-    /// admission happened. Run concurrently they contend for the same Postgres
+    /// admission happened. Run concurrently they contend for the same broker
     /// and the numbers stop meaning what the assertions read them as.
     _serial: std::sync::MutexGuard<'static, ()>,
 }
@@ -2086,7 +2086,7 @@ async fn a_kv_route_that_refuses_loses_nothing() {
 /// state document could hold.
 ///
 /// This is v1's `a_shard_serialises_one_key_and_lets_another_through`, asked of
-/// the mechanism that replaced it: one Postgres row per key with its own TTL,
+/// the mechanism that replaced it: one kv entry per key with its own TTL,
 /// where v1 needed shards, gate runners, partition leases and state documents.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
@@ -4634,7 +4634,7 @@ async fn a_throttled_item_re_enters_at_its_origin_until_its_attempts_run_out() {
 
 /// A claim wider than the broker's op ceiling is chunked, not refused.
 ///
-/// One `kv` call carries at most 256 ops (`024_kv.sql`, `C_MAX_OPS_HTTP`), and a
+/// One `kv` call carries at most 256 ops (Queen's `concepts/kv.mdx`), and a
 /// `scopeBy` budget mints one counter per distinct value in the claim — so a
 /// node with a scoped budget and a large batch built a call the broker rejected
 /// outright with `kv_too_many_ops`. `charge` returned `Err`, the relay read that

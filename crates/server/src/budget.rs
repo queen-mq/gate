@@ -277,7 +277,7 @@ impl Ledger {
 }
 
 /// The broker's ceiling on ops in one HTTP `kv` call
-/// (`024_kv.sql`, `C_MAX_OPS_HTTP`), minus the `getMany` that rides along.
+/// (Queen's `concepts/kv.mdx`), minus the `getMany` that rides along.
 ///
 /// A call above it does not degrade — it raises `kv_too_many_ops`, which the
 /// relay reads as "try again later", and the identical batch is redelivered for
@@ -319,7 +319,7 @@ impl Budgets {
     ///
     /// # Chunking, and why it changes nothing semantically
     ///
-    /// One `kv` call carries at most 256 ops (`024_kv.sql`, `C_MAX_OPS_HTTP`),
+    /// One `kv` call carries at most 256 ops (Queen's `concepts/kv.mdx`),
     /// and a `scopeBy` budget mints one key per distinct scope value in the
     /// claim — so a node with a scoped budget and a large `batch` builds a call
     /// the broker REFUSES outright with `kv_too_many_ops`. The relay reads that

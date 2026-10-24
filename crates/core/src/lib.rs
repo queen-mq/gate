@@ -7,7 +7,7 @@
 //!
 //! v1's `engine.rs` used to live here: two-pass admission, a two-bucket rolling
 //! window, a calendar window, cell expiry, a synthetic lane budget. All of it is
-//! gone, and none of it because it was wrong. **Postgres does the counting now**
+//! gone, and none of it because it was wrong. **The broker's kv does the counting now**
 //! — `kv.incr` with `max` is the admission decision, `applied` IS the verdict,
 //! and the create-only TTL rotates the window — so an arithmetic Gate no longer
 //! owns is an arithmetic Gate must not keep a second copy of.

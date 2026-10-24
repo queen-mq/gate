@@ -1,7 +1,7 @@
 //! The declared graphs and their live state.
 //!
 //! One lock over a small map. Everything expensive — the counters, the work —
-//! lives in Postgres; this holds only what a process needs to route a request
+//! lives in the broker; this holds only what a process needs to route a request
 //! and what the console needs to answer "how close are we".
 //!
 //! v1's `TargetRuntime`, `LaneRuntime`, `RelayRuntime` and `RelaySource` are all

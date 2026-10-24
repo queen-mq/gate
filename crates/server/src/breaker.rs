@@ -91,9 +91,10 @@ fn decode_record(value: Value) -> Option<Record> {
 
 /// Trip the breaker on one node.
 ///
-/// The counter writes and the record are one KV batch, hence one PostgreSQL
-/// transaction. A caller must never be told the trip failed while an invisible
-/// breaker was nevertheless left holding the node.
+/// The counter writes and the record are one kv call, hence one entry in the
+/// broker's log (Queen's `concepts/kv.mdx`). A caller must never be told the
+/// trip failed while an invisible breaker was nevertheless left holding the
+/// node.
 pub async fn trip(
     budgets: &Budgets,
     application: &str,
@@ -106,11 +107,11 @@ pub async fn trip(
     // DEDUPLICATED, and it is not tidiness. Two budgets on one node may legally
     // compile to the same key — `shared-conflict` only fires when their `count`,
     // `time_ms` or `sub_windows` differ, so two budgets carrying the same
-    // `sharedKey` with identical parameters validate clean and map to one row.
-    // The broker refuses a call that writes one key twice
-    // (`024_kv.sql`, `kv_duplicate_key_in_call`, described there as load-bearing
-    // for the intra-space lock order), so without this the whole `trip` returns
-    // an error and the node KEEPS ADMITTING after a vendor has said 429.
+    // `sharedKey` with identical parameters validate clean and map to one key.
+    // The broker refuses a call that writes one key twice (Queen's
+    // `concepts/kv.mdx`: one write per key per call), so without this the whole
+    // `trip` returns an error and the node KEEPS ADMITTING after a vendor has
+    // said 429.
     let keys: Vec<String> = unique_keys(node);
     if keys.is_empty() {
         // `node-unscoped-budget` refuses this at declare time; a document stored

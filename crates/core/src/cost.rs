@@ -3,7 +3,7 @@
 //!
 //! The one piece of v1's `engine.rs` worth keeping is here — the `whenOp` glob
 //! matcher, ported verbatim from `engine::budgets_for`. Everything else in that
-//! file was window arithmetic Gate no longer owns, because Postgres owns it.
+//! file was window arithmetic Gate no longer owns, because the broker's kv owns it.
 
 use serde_json::Value;
 

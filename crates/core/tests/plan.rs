@@ -1,7 +1,7 @@
 //! The compiler. Every name, every stage, every ceiling.
 //!
 //! This file replaces v1's `tests/engine.rs`. The engine it tested does not
-//! exist — Postgres does the counting — so the properties that survived moved
+//! exist — the broker's kv does the counting — so the properties that survived moved
 //! here and to `tests/validate.rs`:
 //!
 //! * *cost is weighted, not counted* → `cost_is_a_payload_path`;
@@ -499,8 +499,8 @@ fn names_are_minted_in_one_place() {
     );
 }
 
-/// A scoped budget is one row per value with its own TTL — 200,000 live
-/// listings is 200,000 Postgres rows, where v1 needed 64 shards, 64 gate
+/// A scoped budget is one key per value with its own TTL — 200,000 live
+/// listings is 200,000 kv keys, where v1 needed 64 shards, 64 gate
 /// runners, 64 partition leases and 64 state documents to hold the same thing.
 #[test]
 fn a_scoped_budget_keys_on_the_value() {
