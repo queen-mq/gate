@@ -41,6 +41,10 @@ export function singleFlight(fn) {
   can declare is one second, and a gauge that refreshes every eight would show
   a saturated budget as an empty one for most of its life.
 */
+// Every poll on screen, so the top bar's refresh button can run them all.
+const active = new Set()
+export const refreshAll = () => Promise.allSettled([...active].map((run) => run()))
+
 export function usePoll(fn, ms = 4000) {
   let timer = null
   let mounted = false
@@ -65,12 +69,14 @@ export function usePoll(fn, ms = 4000) {
 
   onMounted(() => {
     mounted = true
+    active.add(refresh)
     refresh()
     start()
     document.addEventListener('visibilitychange', onVisibility)
   })
   onUnmounted(() => {
     mounted = false
+    active.delete(refresh)
     stop()
     document.removeEventListener('visibilitychange', onVisibility)
   })

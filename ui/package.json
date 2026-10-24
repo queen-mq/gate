@@ -9,7 +9,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "test": "node --test src/lib/*.test.js",
+    "test": "node --test src/lib/*.test.js src/shell.test.js",
+    "sync:shell": "node scripts/sync-shell.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

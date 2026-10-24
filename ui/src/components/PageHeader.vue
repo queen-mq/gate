@@ -1,33 +1,42 @@
 <script setup>
-import Icon from './Icon.vue'
-defineProps({
+import { onUnmounted, watchEffect } from 'vue'
+import { pageCrumb } from '../lib/crumbs.js'
+
+/*
+  The head of every page, Queen's anatomy (shell.css):
+
+    Title  ·························· live · actions
+
+  The way back is the top bar's crumb, not a row of its own. Gate's pages
+  explain themselves, so the explanation follows the head as one quiet line.
+*/
+const props = defineProps({
   title: String,
   sub: String,
   crumbs: { type: Array, default: () => [] },
   mono: Boolean,
+  /** "every 4s", "refresh failed" — only on a page that really polls. */
+  live: { type: String, default: '' },
 })
+
+watchEffect(() => {
+  pageCrumb.value = { title: props.title, parent: props.crumbs.at(-1) ?? null }
+})
+onUnmounted(() => { pageCrumb.value = null })
 </script>
 
 <template>
-  <header class="mb-6">
-    <nav v-if="crumbs.length" class="flex items-center gap-1.5 text-[12px] text-fg-3 mb-3" aria-label="Breadcrumb">
-      <template v-for="(c, i) in crumbs" :key="i">
-        <RouterLink :to="c.to" class="hover:text-fg transition-colors">{{ c.label }}</RouterLink>
-        <Icon name="chevron" :size="11" class="text-fg-3" />
-      </template>
-    </nav>
-
-    <div class="flex items-start gap-4 flex-wrap">
-      <div class="min-w-0 flex-1 basis-[280px]">
-        <h1 class="font-semibold tracking-[-0.02em] leading-tight"
-            :class="mono ? 'font-mono text-[20px] break-all' : 'text-[22px]'">
-          {{ title }}
-        </h1>
-        <p v-if="sub" class="text-[12.5px] text-fg-3 mt-2 max-w-[76ch] leading-relaxed">{{ sub }}</p>
-      </div>
-      <div v-if="$slots.actions" class="flex items-center gap-2 flex-wrap pt-0.5 max-w-full">
-        <slot name="actions" />
-      </div>
+  <header class="page-head">
+    <div class="page-id">
+      <h1 :class="{ 'font-mono': mono }">{{ title }}</h1>
+    </div>
+    <div v-if="live || $slots.actions" class="page-controls">
+      <span v-if="live" class="live-tick">
+        <span class="live-dot" aria-hidden="true" />
+        <span>live · {{ live }}</span>
+      </span>
+      <slot name="actions" />
     </div>
   </header>
+  <p v-if="sub" class="page-lede">{{ sub }}</p>
 </template>

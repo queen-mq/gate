@@ -15,7 +15,7 @@
 */
 import { computed } from 'vue'
 import GateBrand from '../components/GateBrand.vue'
-import ThemeSelector from '../components/ThemeSelector.vue'
+import ThemeMenu from '../components/ThemeMenu.vue'
 
 defineProps({ theme: { type: String, default: 'system' } })
 const emit = defineEmits(['update:theme'])
@@ -31,7 +31,9 @@ const loginUrl = computed(() => {
 
 <template>
   <div class="min-h-screen grid place-items-center px-6 py-16 relative">
-    <ThemeSelector class="absolute right-5 top-4" :model-value="theme" @update:model-value="emit('update:theme', $event)" />
+    <div class="absolute right-5 top-4">
+      <ThemeMenu :model-value="theme" @update:model-value="emit('update:theme', $event)" />
+    </div>
     <div class="w-full max-w-[380px] text-center">
       <GateBrand variant="full" class="mx-auto mb-8" />
       <div class="card px-6 py-7 sm:px-8">
