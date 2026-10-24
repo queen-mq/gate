@@ -17,8 +17,8 @@ once. The interesting question is not how to count. It is how those limits **com
 [Design](DESIGN_GATE_V2.md) · [Deploy](helm/gate/README.md) · Apache-2.0 · v0.2.1
 
 <a href="assets/dashboard.png"><img src="assets/dashboard.png" width="560"
-  alt="The Gate console drawing a declared graph: three entry nodes relaying into one
-  terminal called ip."></a>
+  alt="The Gate console, light theme, on the airbnb graph declared below: photos and prices
+  relay into the terminal node ip and its egress queue, with the node inspector open on ip."></a>
 
 </div>
 
@@ -73,8 +73,8 @@ leaves at an **egress** queue your own workers pop, with their own SDK, their ow
     }
   },
   "paths": [
-    { "name": "prices", "share": 1.0, "nodes": ["prices", "ip"] },
-    { "name": "photos", "share": 0.5, "nodes": ["photos", "ip"] }
+    { "name": "prices", "priority": 0, "share": 1.0, "nodes": ["prices", "ip"] },
+    { "name": "photos", "priority": 1, "share": 0.5, "nodes": ["photos", "ip"] }
   ]
 }
 ```
@@ -162,7 +162,7 @@ ownership (`ingress-owner`). Warnings are trades rather than mistakes: `window-s
 A v1 document is accepted, mapped, and answered **200 with warnings naming every field that was
 mapped or ignored** — `cap`/`periodSeconds` became `count`/`timeMs`, `alignment: rolling` became
 `subWindows`, `lanes[]` became paths, `edges[]` became `paths`, and `maxKeys`/`shardBy`/`pacing` are
-no-ops because cardinality is now rows with a TTL.
+no-ops because cardinality is now kv keys with a TTL.
 
 ## Run it
 
