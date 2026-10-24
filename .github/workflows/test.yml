@@ -32,29 +32,11 @@ jobs:
     runs-on: ubuntu-latest
 
     services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_PASSWORD: postgres
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-
       queen:
-        # >= 1.0.4, so the depth route's HAPPY path is exercised and not only its
-        # 404 fallback — and so `kv.incr` with `max`, which is the whole limiter,
-        # is the one the broker actually ships.
-        image: ghcr.io/queen-mq/queen:1.0.5
+        # Queen 2, the broker prod runs: its state is its own Raft log, so there is
+        # no database to provide, and kv is always on.
+        image: ghcr.io/queen-mq/queen:2.6.0
         env:
-          PG_HOST: postgres
-          PG_PASSWORD: postgres
-          # kv holds the declared specs and the cross-target budgets: without it a
-          # declare cannot persist and the reconcile has nothing to reconcile against.
-          QUEEN_KV_ENABLED: "true"
           # A consumer group created at the tail skips every message already waiting.
           # Gate asks for `all` explicitly on every group it owns, so this is belt to
           # that brace — and it is what the plan requires of the broker.
@@ -66,8 +48,7 @@ jobs:
       GATE_TEST_QUEEN_URL: http://127.0.0.1:6632
       # A missing broker is a red build here, never a skipped test.
       GATE_TEST_REQUIRE_LIVE: "1"
-      # Nothing for history: it is in the broker's kv. The postgres service
-      # above is there for the 1.0.5 broker and for nothing else.
+      # Nothing for history: it is in the broker's kv.
 
     steps:
     - uses: actions/checkout@v4

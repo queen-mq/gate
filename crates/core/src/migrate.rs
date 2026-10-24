@@ -203,7 +203,7 @@ fn budget(b: &v1::Budget, cost_max: i64, out: &mut Vec<Problem>, node: &str) -> 
             "maxKeys",
             format!(
                 "budget `{}` of node `{node}`: `maxKeys` is a no-op — per-key counters are \
-                 Postgres rows with a TTL, not entries in a document Gate re-reads whole every \
+                 kv keys with a TTL, not entries in a document Gate re-reads whole every \
                  cycle.",
                 b.id
             ),
@@ -782,7 +782,7 @@ fn shard_warnings(sharded: bool, node: &str, out: &mut Vec<Problem>) {
         out.push(w(
             "shards",
             format!(
-                "node `{node}`: `shardBy`/`shards` are a no-op — cardinality is Postgres rows with \
+                "node `{node}`: `shardBy`/`shards` are a no-op — cardinality is kv keys with \
                  a TTL, not shards, so there are no shard runners to allocate. The budget that was \
                  scoped on the shard dimension is now one counter per value."
             ),
