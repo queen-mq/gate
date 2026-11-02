@@ -569,7 +569,8 @@ async fn throttled(g: &Arc<Gate>, cfg: &Cfg) -> Result<(), String> {
             .partitions(32)
             .wait(true)
             .poll_timeout(Duration::from_millis(500))
-            .pop_auto_ack()
+            .commit_on_delivery(true)
+            .pop()
             .await
             .unwrap_or_default();
         for m in &msgs {

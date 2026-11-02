@@ -14,4 +14,4 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # The drain half of every scenario is the application's own SDK against the
 # egress queue: Gate does not mediate the pop, and a bench that went through
 # Gate to read a queue would be measuring a route that no longer exists.
-queen-mq = "1.0.5"
+queen-mq = "2.7.0"
