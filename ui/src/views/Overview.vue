@@ -227,7 +227,7 @@ const label = (t) =>
       : recentThrottle(t)
         ? 'backoff reported'
         : undefined
-const colour = () => 'var(--brand)'
+const colour = () => 'var(--series-1)'
 function clearFilters() {
   query.value = ''
   attentionOnly.value = false

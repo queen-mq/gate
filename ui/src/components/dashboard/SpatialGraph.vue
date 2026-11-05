@@ -153,7 +153,7 @@ const left = (n) =>
 const right = (n) =>
   `${n.x},${n.y - n.h + n.d} ${n.x + n.w},${n.y - n.h} ${n.x + n.w},${n.y} ${n.x},${n.y + n.d}`
 const color = (n) =>
-  `var(--${n.tone === 'bad' ? 'bad' : n.tone === 'warn' || selectedNode.value?.id === n.id ? 'spatial-accent' : 'text-2'})`
+  `var(--${n.tone === 'bad' ? 'bad' : n.tone === 'warn' ? 'warn' : selectedNode.value?.id === n.id ? 'spatial-accent' : 'text-2'})`
 const short = (name) => (name.length > 20 ? `${name.slice(0, 18)}…` : name)
 const reading = (value) => (value == null ? '—' : num(value))
 const watching = computed(() => !!(props.graph.watch || props.graph.spec?.watch))
@@ -341,7 +341,7 @@ function budgetLink(node, budget) {
             />
             <g v-if="edge.active">
               <g v-for="particle in 2" :key="particle">
-                <circle r="5" fill="var(--brand)" :filter="url('glow')">
+                <circle r="5" fill="var(--spatial-accent)" :filter="url('glow')">
                   <animateMotion
                     :dur="`${edge.duration}s`"
                     :begin="`${(-particle * edge.duration) / 2}s`"
@@ -349,7 +349,7 @@ function budgetLink(node, budget) {
                     :path="edge.d"
                   />
                 </circle>
-                <circle r="2" fill="var(--brand)">
+                <circle r="2" fill="var(--spatial-accent)">
                   <animateMotion
                     :dur="`${edge.duration}s`"
                     :begin="`${(-particle * edge.duration) / 2}s`"

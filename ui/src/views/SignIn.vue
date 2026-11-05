@@ -15,10 +15,7 @@
 */
 import { computed } from 'vue'
 import GateBrand from '../components/GateBrand.vue'
-import ThemeMenu from '../components/ThemeMenu.vue'
-
-defineProps({ theme: { type: String, default: 'system' } })
-const emit = defineEmits(['update:theme'])
+import LookChip from '../components/LookChip.vue'
 
 const loginUrl = computed(() => {
   const here = window.location.hash?.slice(1) || '/'
@@ -32,7 +29,7 @@ const loginUrl = computed(() => {
 <template>
   <div class="min-h-screen grid place-items-center px-6 py-16 relative">
     <div class="absolute right-5 top-4">
-      <ThemeMenu :model-value="theme" @update:model-value="emit('update:theme', $event)" />
+      <LookChip />
     </div>
     <div class="w-full max-w-[380px] text-center">
       <GateBrand variant="full" class="mx-auto mb-8" />

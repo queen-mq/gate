@@ -1,57 +1,41 @@
-/* `@import` has to lead the file — CSS drops one that appears after a rule, and
-   the @font-face blocks below are rules. `source(none)` turns off v4's
-   filesystem auto-detection and the two @source lines replace it: without them
-   Tailwind walks up to the repository root and scans the Rust crates as well. */
+/* `@import` has to lead the file (a @layer statement may come before it): CSS drops one that
+   appears after a rule. `source(none)` turns off v4's filesystem auto-detection and the two
+   @source lines replace it: without them Tailwind walks up to the repository root and scans the
+   Rust crates as well.
+
+   Layer order: Queen's console design (src/console.css, a copy kept by `npm run sync:console`)
+   sits under Gate's components and Tailwind's utilities. Its resets have no specificity of their
+   own (:where), so a part of a page (.btn, .card) wins over them, and a utility still wins over
+   both. */
+@layer theme, base, console, components, utilities;
 @import 'tailwindcss' source(none);
-/* The frame Queen, Gate and Traceflow share: sidebar, top bar, page head.
-   Queen owns it; `npm run sync:shell` copies it here. */
-@import './shell.css';
+@import './console.css' layer(console);
 @source '../index.html';
 @source '../src/**/*.{vue,js}';
 
-/* Dark is a class on <html>, written there before first paint. v4 would
-   otherwise resolve `dark:` against prefers-color-scheme and disagree with the
-   toggle. Nothing uses the variant today; it stays declared so that the first
-   thing that does is right rather than subtly inverted. */
+/* Dark is a class on <html> (dark and soft), written there before first paint (lib/theme.js).
+   v4 would otherwise resolve `dark:` against prefers-color-scheme and disagree with the toggle. */
 @custom-variant dark (&:where(.dark, .dark *));
 
-/* The fonts are bundled, not fetched: the console is embedded in the binary and
-   may run somewhere with no route to the internet. Latin subset only — the
-   console's entire vocabulary is Latin, and the other subsets are 160 kB an
-   operator would ship forever. */
-@font-face {
-  font-family: 'Inter';
-  font-style: normal;
-  font-weight: 100 900;
-  font-display: swap;
-  src: url('@fontsource-variable/inter/files/inter-latin-wght-normal.woff2') format('woff2-variations');
-}
-@font-face {
-  font-family: 'JetBrains Mono';
-  font-style: normal;
-  font-weight: 100 800;
-  font-display: swap;
-  src: url('@fontsource-variable/jetbrains-mono/files/jetbrains-mono-latin-wght-normal.woff2') format('woff2-variations');
-}
-
 /* ------------------------------------------------------------------- theme
-   Every colour resolves through a CSS variable declared below, so light and
-   dark are one class on <html> and no component knows which it is in.
-   `inline` is what makes that work: it spends the utilities as
-   `var(--surface)` rather than as `var(--color-surface)`, so a token the
-   `.dark` block redefines takes effect at the point of use instead of being
-   frozen at the value :root happened to hold.
+   The design is Queen's console (queen/app/src/console): themes dark, soft and light; areas
+   told apart by tone (filled, no lines, the default) or by lines (hairlines between areas). Its
+   tokens live on .qn, the <body> (lib/theme.js sets the classes). Gate keeps its own token names
+   below, each one the console's, so every page and utility reads the console.
 
-   One convention carried over from the relay console, learned the hard way:
-   structural sizes (sidebar, control heights) are px literals in the markup,
-   so nothing about the layout depends on the root font size. The v3 ban on
-   opacity modifiers (`bg-good/30`) is lifted — v4 composes alpha over a
-   var() colour with color-mix() instead of silently emitting nothing. */
+   `inline` spends the utilities as `var(--surface)` rather than `var(--color-surface)`, so the
+   token is read where it is used, under <body>, and follows the theme and the areas. The two
+   radii follow the console's too: a box drawn with `rounded-lg` rounds like a console area.
+
+   Colour means a message: amber = it will not fix itself, red = failing or destructive. Healthy
+   is grey, never green. Yellow lives in the logo only; a picked item is white on a lighter step.
+   Charts are white and grey, then blue, aqua, violet and magenta. IBM Plex is served with the
+   app (console.css imports it): the console is embedded in the binary and may run somewhere with
+   no route to the internet. */
 @theme inline {
   --color-bg: var(--bg);
   --color-surface: var(--surface);
   --color-surface-2: var(--surface-2);
-  --color-rail: var(--rail);
   --color-selected: var(--selected);
   --color-fg: var(--text);
   --color-fg-2: var(--text-2);
@@ -65,11 +49,13 @@
   --color-warn-dim: var(--warn-dim);
   --color-bad: var(--bad);
   --color-bad-dim: var(--bad-dim);
+  --radius-md: var(--r-ctl);
+  --radius-lg: var(--r-card);
 }
 
 @theme {
-  --font-sans: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
-  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font-sans: 'IBM Plex Sans', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, Menlo, monospace;
 
   --ease-spring: cubic-bezier(0.16, 1, 0.3, 1);
 
@@ -91,102 +77,71 @@
   }
 }
 
-/* Gate's logo provides the palette: sunflower yellow, warm white and black.
-   Green/coral are reserved for operational status, not decorative surfaces. */
 @layer base {
-  :root {
-    --brand: #FCC620;
-    --rail: #e8e5e0;
-    --bg: #f2f0ec;
-    --surface: #f9f7f4;
-    --surface-2: #ebe7e1;
-    --input: #f1eee9;
-    --selected: color-mix(in srgb, var(--brand) 14%, var(--ink-2));
-    --text: #1f1d1a;
-    --text-2: #4f4b45;
-    --text-3: #6c675f;
-    --border: #e0dcd6;
-    --border-2: #cfc9c1;
+  .qn {
+    --brand: #FCC620;  /* the logo's, and nothing else's */
 
-    --link: #4f4b45;
-    --good: #426b4e;
-    --good-dim: #e8eee7;
-    --warn: #9a5b07;
-    --warn-dim: #f0e6d6;
-    --bad: #c6452e;
-    --bad-dim: #f3e4dc;
+    /* surfaces: the page, an area, a step up for hover and recess, the picked step */
+    --surface: var(--bg);      /* an area: the page itself in lines, filled in tone */
+    --surface-2: var(--bg2);
+    --input: var(--bg2);
+    --selected: var(--bg3);
 
-    /* Brand-aligned chart colours are paired with line patterns for identity. */
-    --series-1: #846100;
-    --series-2: #24211c;
-    --series-3: #777065;
-    --series-4: #a67c23;
-    --series-5: #5f5b53;
-    --series-6: #968469;
+    /* words */
+    --text-2: var(--text2);
+    --text-3: var(--text3);
+    --link: var(--text);
 
-    /* The shell's tokens (shell.css), named as Queen names them. */
+    /* lines: between areas, between rows. None in tone. */
+    --border: var(--line);
+    --border-2: var(--line);
+
+    /* messages. Healthy is grey. */
+    --good: var(--text3);
+    --good-dim: transparent;
+    --warn: var(--amber);
+    --warn-dim: var(--amberbg);
+    --bad: var(--red);
+    --bad-dim: var(--redbg);
+
+    /* charts: white first, then the hues that tell series apart (Queen's --cat-*, checked
+       for colour-blind separation between neighbours, so take them in order) */
+    --series-1: var(--ink-in);
+    --series-2: #3987e5;
+    --series-3: #199e70;
+    --series-4: #9085e9;
+    --series-5: #d55181;
+    --series-6: var(--ink-out);
+
+    /* the names a few components still read */
     --ink-0: var(--bg);
     --ink-2: var(--surface);
     --ink-3: var(--input);
-    --ink-4: var(--surface-2);
-    --bd: var(--border);
-    --bd-hi: var(--border-2);
+    --ink-4: var(--bg2);
+    --bd: var(--line);
+    --bd-hi: var(--line);
     --text-hi: var(--text);
-    --text-mid: var(--text-2);
-    --text-low: var(--text-3);
-    --text-faint: #b0aaa2;
-    --accent-text: #806000;
-    --warn-400: var(--warn);
-    --ember-400: var(--bad);
-    --ember-500: var(--bad);
-    --r-chip: 4px;
-    --r-control: 6px;
-    --r-card: 8px;
+    --text-mid: var(--text2);
+    --text-low: var(--text3);
+    --text-faint: color-mix(in srgb, var(--text3) 55%, var(--bg));
+    --accent-text: var(--text);
+    --warn-400: var(--amber);
+    --ember-400: var(--red);
+    --ember-500: var(--red);
+    --r-chip: var(--r-ctl);
+    --r-control: var(--r-ctl);
     --ease: cubic-bezier(.2, .7, .2, 1);
     --drawer-duration: 300ms;
     --drawer-ease: cubic-bezier(.2, .7, .2, 1);
-    --shadow-pop: 0 14px 32px -16px rgba(40, 30, 20, 0.28), 0 0 0 1px #d4cfc8;
-
-    --scrim: rgb(40 36 32 / 0.25);
-    color-scheme: light;
+    --shadow-pop: 0 12px 32px rgba(0, 0, 0, .28);
   }
-
-  /* Queen's dark values (app/src/style.css), as the light ones above are. */
-  .dark {
-    --rail: #000000;
-    --bg: #0b0a0a;
-    --surface: #111010;
-    --surface-2: #1c1b19;
-    --input: #171615;
-    --selected: color-mix(in srgb, var(--brand) 14%, var(--ink-2));
-    --text: #eeebe6;
-    --text-2: #aaa59e;
-    --text-3: #8f8a83;
-    --border: #1f1d1b;
-    --border-2: #34312e;
-
-    --link: #fcc620;
-    --good: #95cfaf;
-    --good-dim: #1b2a1e;
-    --warn: #e8a849;
-    --warn-dim: #2a2116;
-    --bad: #f07a5f;
-    --bad-dim: #2c1c17;
-
-    --series-1: #fcc620;
-    --series-2: #f9f7f4;
-    --series-3: #b7afa2;
-    --series-4: #d8b45b;
-    --series-5: #918d84;
-    --series-6: #d3c9b6;
-
-    --text-faint: #57534e;
-    --accent-text: #fcc620;
-
-    --shadow-pop: 0 14px 34px -14px rgba(0, 0, 0, 0.7), 0 0 0 1px #34312e;
-    --scrim: rgb(7 6 6 / 0.62);
-    color-scheme: dark;
+  .qn.light {
+    --surface: #ffffff;   /* light, lines: an area is white on the paper */
+    --series-2: #2a78d6;
+    --series-4: #6250d6;
+    --shadow-pop: 0 10px 28px rgba(40, 36, 32, .12);
   }
+  .qn.tone { --surface: var(--card); }
 
   html {
     -webkit-font-smoothing: antialiased;
@@ -194,13 +149,8 @@
     text-rendering: optimizeLegibility;
   }
 
-  body {
-    @apply bg-bg text-fg font-sans;
-    font-size: 13px;
-    line-height: 1.55;
-    letter-spacing: -0.005em;
-    font-feature-settings: 'cv11', 'ss01', 'ss03', 'cv02';
-  }
+  /* Type, size and colour come from .qn (console.css): IBM Plex Sans, 13px. */
+  body { background: var(--bg); color: var(--text); }
 
   /* v3 preflight gave these a pointer and v4 leaves them at the browser
      default, which reads as "not a control" on all 18 of them. */
@@ -209,99 +159,141 @@
     cursor: pointer;
   }
 
-  ::selection { background: var(--selected); }
+  ::selection { background: color-mix(in srgb, var(--text) 20%, transparent); }
 
   :focus-visible {
-    outline: 2px solid var(--link);
+    outline: 2px solid var(--text);
     outline-offset: 2px;
     border-radius: 4px;
   }
 
   * {
     scrollbar-width: thin;
-    scrollbar-color: var(--border-2) transparent;
+    scrollbar-color: color-mix(in srgb, var(--text) 20%, transparent) transparent;
   }
 }
 
+/* ------------------------------------------------------------- components
+   Gate's parts drawn as the console's: a card is a panel, a button is the console's button.
+   Lines: hairlines round areas. Tone: filled areas, rounder controls, no lines. */
 @layer components {
+  /* Links that are parts keep no underline (the console underlines a plain link on hover). */
+  a.btn:hover, a.card:hover, a.template-option:hover, a.chip:hover { text-decoration: none; }
+
   .card {
-    @apply bg-surface border border-line rounded-lg;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--r-card);
   }
+  /* A filled area: what lies inside reads one step from the fill, as in a console card. */
+  .qn.tone .card { border-color: transparent; --bg2: var(--well); --surface-2: var(--well); --ink-4: var(--well); }
 
-  /* Queen's control sizes and quiet monochrome primary. */
+  /* Buttons: one primary per place (white on the page), then outlined, then plain. */
   .btn {
-    @apply inline-flex items-center justify-center gap-1.5 h-[32px] px-3 rounded-md
-           border border-line-2 text-fg text-[12px] font-medium select-none
-           transition-colors duration-100 hover:bg-surface-2
-           disabled:opacity-40 disabled:pointer-events-none;
-    background: color-mix(in srgb, var(--text) 3%, transparent);
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    height: 32px; padding: 0 12px; border-radius: var(--r-ctl);
+    border: 1px solid var(--line); background: transparent; color: var(--text);
+    font: inherit; font-size: 13px; line-height: 1; white-space: nowrap; user-select: none;
+    transition: background-color .1s, color .1s;
   }
-  .btn-primary {
-    @apply bg-fg text-bg border-transparent hover:bg-fg hover:opacity-88;
-  }
-  .btn-danger {
-    @apply text-bad border-transparent bg-transparent hover:bg-bad-dim;
-  }
-  .btn-sm { @apply h-[28px] px-2.5 text-xs rounded-md; }
+  .btn:hover { background: var(--bg3); }
+  .btn:disabled { opacity: .4; pointer-events: none; }
+  .qn.tone .btn { background: var(--ctl); border-color: transparent; }
+  .qn.tone .btn:hover { background: var(--bg3); }
+  .btn-primary, .qn.tone .btn-primary { background: var(--text); color: var(--bg); border-color: transparent; font-weight: 500; }
+  .btn-primary:hover, .qn.tone .btn-primary:hover { background: var(--text2); }
+  .btn-danger, .qn.tone .btn-danger { color: var(--red); border-color: var(--red); }
+  .btn-sm { height: 28px; padding: 0 10px; font-size: 12.5px; }
 
+  /* An input in a box. */
   .input {
-    @apply w-full h-[32px] px-2.5 rounded-md border border-line-2 text-fg
-           text-[12.5px] placeholder:text-fg-3 transition-colors
-           focus:outline-hidden focus:border-fg-3;
-    background: var(--input);
+    width: 100%; height: 32px; padding: 0 10px; border-radius: var(--r-ctl);
+    border: 1px solid var(--line); background: var(--bg2); color: var(--text);
+    font: inherit; font-size: 13px; transition: border-color .12s;
   }
+  textarea.input { height: auto; padding: 8px 10px; line-height: 1.55; }
+  .qn.tone .input { background: var(--ctl); border-color: transparent; }
+  .input::placeholder { color: var(--text3); }
+  .input:focus, .qn.tone .input:focus { outline: none; border-color: var(--text3); }
   select.input {
-    @apply pr-8 appearance-none bg-no-repeat;
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23888' stroke-width='1.5'%3E%3Cpath d='M4 6l4 4 4-4'/%3E%3C/svg%3E");
-    background-position: right 0.6rem center;
-    background-size: 1rem;
+    padding-right: 32px; appearance: none; background-repeat: no-repeat;
+    /* A data URI cannot hold a var(): a grey between the themes' --text3. */
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23908a82' stroke-width='1.5'%3E%3Cpath d='M4 6l4 4 4-4'/%3E%3C/svg%3E");
+    background-position: right 10px center;
+    background-size: 14px;
   }
-  .label { @apply block text-xs font-medium text-fg-2 mb-1.5; }
-  .hint { @apply text-xs text-fg-2 leading-relaxed; }
+  select.input option { background: var(--pop); color: var(--text); }
+  .label { display: block; margin-bottom: 6px; font-size: 12px; font-weight: 500; color: var(--text2); }
+  .hint { font-size: 12px; line-height: 1.6; color: var(--text2); }
 
-  /* Tiny mono chip for ids, ops and window periods — bordered, never filled. */
+  /* Tiny mono chip for ids, ops and window periods: the console's small bordered fact. */
   .chip {
-    @apply inline-flex items-center h-[20px] px-1.5 rounded-[5px] border border-line
-           font-mono text-[11px] text-fg-2 whitespace-nowrap;
+    display: inline-flex; align-items: center; height: 20px; padding: 0 6px;
+    border: 1px solid var(--line); border-radius: var(--r-ctl);
+    font-family: var(--font-mono); font-size: 11px; color: var(--text2); white-space: nowrap;
   }
+  .qn.tone .chip { border-color: transparent; background: var(--ctl); }
 
-  /* Section heading: small, quiet, with room for a count. */
-  .section-title {
-    @apply flex items-baseline gap-2 text-[13px] font-semibold tracking-tight mb-3;
+  /* Section titles: quiet, small, with room for a count. */
+  .section-title { display: flex; align-items: baseline; gap: 8px; margin-bottom: 12px; font-size: 13px; font-weight: 500; color: var(--text3); }
+  .section-count { font-size: 12px; font-weight: 400; color: var(--text3); font-variant-numeric: tabular-nums; }
+
+  .editor-section { padding: 20px; }
+  @media (min-width: 640px) { .editor-section { padding: 24px; } }
+  .qn.tone .editor-section { padding: 18px 20px; }
+  .editor-section-title { font-size: 14px; font-weight: 500; }
+  .editor-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 20px; }
+  /* A segmented switch, as the console's. */
+  .editor-tabs, .segmented-control {
+    display: inline-flex; align-items: center; gap: 2px; padding: 2px;
+    border: 1px solid var(--line); border-radius: calc(var(--r-ctl) + 1px); background: transparent;
   }
-  .section-count { @apply text-xs font-normal text-fg-3 tabular-nums; }
-
-  .editor-section { @apply p-5 sm:p-6; }
-  .editor-section-title { @apply text-[14px] font-semibold tracking-tight; }
-  .editor-toolbar { @apply flex flex-wrap items-center justify-between gap-3 mb-5; }
-  .editor-tabs { @apply inline-flex gap-1 p-1 rounded-lg border border-line bg-surface; }
-  .editor-tabs button { @apply px-4 py-1.5 rounded-md text-xs text-fg-2 disabled:opacity-40; }
-  .editor-tabs button[aria-pressed='true'] { @apply bg-selected text-fg font-semibold; }
-  .editor-budget { @apply rounded-lg border border-line bg-surface-2 p-4; }
-  .editor-details { @apply border-t border-line pt-4; }
-  .editor-details summary { @apply cursor-pointer text-xs font-medium text-fg-2; }
-  .editor-note { @apply rounded-md bg-surface-2 px-3 py-2.5 text-xs text-fg-3 leading-relaxed; }
-  .editor-note code { @apply font-mono break-all; }
-  .editor-text-button { @apply text-xs text-link underline underline-offset-4; }
-  .editor-errors { @apply rounded-lg border border-bad/25 bg-bad-dim px-5 py-4 text-[12.5px] text-bad; }
-  .editor-hop-number { @apply inline-grid place-items-center w-7 h-8 text-xs text-fg-3 shrink-0; }
-  .editor-json-preview { @apply max-h-[420px] overflow-auto rounded-lg border border-line bg-bg p-4 text-[11.5px] font-mono whitespace-pre-wrap break-all; }
-  .target-wizard { @apply max-w-[1100px] mx-auto; }
-  .wizard-steps { @apply grid grid-cols-4 gap-2 mb-6; }
-  .wizard-steps button { @apply flex flex-col sm:flex-row items-center gap-2 sm:gap-3 p-3 rounded-lg border border-line bg-surface text-fg-3 text-xs sm:text-[13px] disabled:cursor-default; }
-  .wizard-steps .current { @apply border-fg-3 text-fg bg-selected font-semibold; }
-  .wizard-step-number { @apply grid place-items-center rounded-full h-6 w-6 border border-line-2 text-[11px] shrink-0; }
-  .wizard-steps .current .wizard-step-number { @apply bg-fg text-bg border-fg; }
-  .wizard-steps .complete { @apply text-fg-2; }
-  .wizard-review { @apply grid sm:grid-cols-2 gap-4 rounded-lg bg-surface-2 p-4; }
-  .wizard-review > div { @apply min-w-0 flex flex-col gap-1; }
-  .wizard-review span { @apply text-[11px] text-fg-3; }
-  .wizard-review strong { @apply text-[12.5px] font-medium; }
-  .wizard-footer { @apply flex items-center gap-3 pt-5 mt-6 border-t border-line; }
+  .qn.tone .editor-tabs, .qn.tone .segmented-control { background: var(--ctl); }
+  .editor-tabs button { height: 26px; padding: 0 12px; border-radius: calc(var(--r-ctl) - 1px); font-size: 12.5px; color: var(--text2); }
+  .editor-tabs button:hover { background: var(--bg2); }
+  .editor-tabs button:disabled { opacity: .4; }
+  .editor-tabs button[aria-pressed='true'] { background: var(--bg3); color: var(--text); font-weight: 500; }
+  .segmented-control > button { border-radius: calc(var(--r-ctl) - 1px); }
+  .editor-budget { padding: 16px; border: 1px solid var(--line); border-radius: var(--r-card); background: var(--bg2); }
+  .qn.tone .editor-budget { border-color: transparent; }
+  .editor-details { padding-top: 16px; border-top: 1px solid var(--line); }
+  .qn.tone .editor-details { border-top-color: var(--bg3); }
+  .editor-details summary { cursor: pointer; font-size: 12px; font-weight: 500; color: var(--text2); }
+  .editor-note { padding: 10px 12px; border-radius: var(--r-ctl); background: var(--bg2); font-size: 12px; line-height: 1.6; color: var(--text3); }
+  .editor-note code { font-family: var(--font-mono); word-break: break-all; }
+  .editor-text-button { font-size: 12px; color: var(--text); text-decoration: underline; text-underline-offset: 4px; }
+  .editor-errors { padding: 16px 20px; border-radius: var(--r-card); background: var(--redbg); font-size: 12.5px; color: var(--red); }
+  .editor-hop-number { display: inline-grid; place-items: center; flex-shrink: 0; width: 28px; height: 32px; font-size: 12px; color: var(--text3); }
+  .editor-json-preview {
+    max-height: 420px; overflow: auto; padding: 16px; border-radius: var(--r-card); background: var(--bg2);
+    font-family: var(--font-mono); font-size: 11.5px; white-space: pre-wrap; word-break: break-all; color: var(--text2);
+  }
+  .target-wizard { max-width: 1100px; margin: 0 auto; }
+  .wizard-steps { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-bottom: 24px; }
+  .wizard-steps button {
+    display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 12px;
+    border: 1px solid var(--line); border-radius: var(--r-card); background: var(--surface);
+    font-size: 12px; color: var(--text3);
+  }
+  @media (min-width: 640px) { .wizard-steps button { flex-direction: row; gap: 12px; font-size: 13px; } }
+  .wizard-steps button:disabled { cursor: default; }
+  .qn.tone .wizard-steps button { border-color: transparent; }
+  .wizard-steps .current, .qn.tone .wizard-steps .current { background: var(--bg3); color: var(--text); font-weight: 500; }
+  .wizard-step-number { display: grid; place-items: center; flex-shrink: 0; width: 24px; height: 24px; border: 1px solid var(--text3); border-radius: 50%; font-size: 11px; }
+  .wizard-steps .current .wizard-step-number { background: var(--text); color: var(--bg); border-color: var(--text); }
+  .wizard-steps .complete { color: var(--text2); }
+  .wizard-review { display: grid; gap: 16px; padding: 16px; border-radius: var(--r-card); background: var(--bg2); }
+  @media (min-width: 640px) { .wizard-review { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  .wizard-review > div { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+  .wizard-review span { font-size: 11.5px; color: var(--text3); }
+  .wizard-review strong { font-size: 13px; font-weight: 500; }
+  .wizard-footer { display: flex; align-items: center; gap: 12px; padding-top: 20px; margin-top: 24px; border-top: 1px solid var(--line); }
+  .qn.tone .wizard-footer { border-top-color: var(--bg3); }
 
   .skeleton {
-    @apply rounded-sm animate-shimmer;
-    background: linear-gradient(90deg, var(--surface-2) 25%, var(--border) 37%, var(--surface-2) 63%);
+    border-radius: var(--r-ctl);
+    animation: var(--animate-shimmer);
+    background: linear-gradient(90deg, var(--bg2) 25%, var(--bg3) 37%, var(--bg2) 63%);
     background-size: 400% 100%;
   }
 
@@ -316,21 +308,20 @@
 
   .icon-button {
     display: inline-grid; place-items: center; flex: none;
-    width: 30px; height: 30px; border-radius: 6px; color: var(--text-3);
+    width: 30px; height: 30px; border-radius: var(--r-ctl); color: var(--text3);
     transition: color 0.12s, background 0.12s;
   }
-  .icon-button:hover { color: var(--text); background: var(--surface-2); }
+  .icon-button:hover { color: var(--text); background: var(--bg2); }
   .summary-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
   .metric-tile { padding: 16px 18px; }
-  .segmented-control {
-    display: inline-flex; align-items: center; gap: 2px; padding: 3px;
-    border: 1px solid var(--border); border-radius: 6px;
-  }
-  .status-glyph { display: inline-block; width: 7px; height: 7px; flex: none; border-radius: 50%; }
-  .status-glyph.good { background: var(--good); }
-  .status-glyph.warn { background: var(--warn); border-radius: 1px; transform: rotate(45deg); }
-  .status-glyph.bad { background: var(--bad); border-radius: 1px; }
-  .status-glyph.muted { border: 1px solid var(--text-3); }
+
+  /* The console's marks: an amber square (will not fix itself), a red diamond (failing).
+     Healthy is a grey dot; unknown a hollow ring. */
+  .status-glyph { display: inline-block; width: 8px; height: 8px; flex: none; border-radius: 50%; }
+  .status-glyph.good { background: var(--text3); }
+  .status-glyph.warn { background: var(--amber); border-radius: 0; }
+  .status-glyph.bad { background: var(--red); border-radius: 0; transform: rotate(45deg) scale(.86); }
+  .status-glyph.muted { border: 1.5px solid var(--text3); }
 
   @media (min-width: 640px) {
     .summary-metrics { grid-template-columns: repeat(4, minmax(0, 1fr)); }
@@ -344,102 +335,148 @@
   }
 }
 
-/* ---------------------------------------------------------------- the shell
-   Gate's own pieces inside the shared frame (shell.css). Unlayered, like the
-   frame: a layered rule on a shell class always loses to it. */
+/* ----------------------------------------------------------------- the page
+   One anatomy on every page, as the console draws it:
 
-/* The shell sizes the logo's <img>; Gate's logo is two of them, one per theme,
-   in a wrapper whose fixed widths would leave a gap beside that height. */
-.brand-mark .gate-brand, .boot-mark .gate-brand { width: auto; }
-.brand-mark .gate-brand-dark, .boot-mark .gate-brand-dark { display: none; }
-.dark .brand-mark .gate-brand-light, .dark .boot-mark .gate-brand-light { display: none; }
-.dark .brand-mark .gate-brand-dark, .dark .boot-mark .gate-brand-dark { display: block; }
-/* At 39px the wordmark's letters are as tall as Queen's (shell.css, .brand-mark). */
-.sidebar { --brand-height: 39px; }
+     Title ·························· live · actions
 
-/* A sign-out that failed says so in the account menu. */
-.user-who .is-bad { color: var(--ember-400); }
+   then, on Gate, one quiet line that explains the page. Unlayered, like the frame. */
+.view-container { padding: 26px 32px 56px; max-width: 1400px; margin: 0 auto; }
+@media (max-width: 640px) { .view-container { padding: 18px 16px 32px; } }
+/* The Overview's page: the answer first, its blocks a column apart. */
+.view-container.dash { padding: 24px 32px 56px; }
+@media (max-width: 640px) { .view-container.dash { padding: 18px 16px 32px; } }
 
+.page-head { display: flex; align-items: center; gap: 12px 16px; flex-wrap: wrap; min-height: 36px; margin-bottom: 18px; }
+.page-id { display: flex; align-items: center; gap: 10px; min-width: 0; flex-wrap: wrap; }
+.page-id h1 {
+  flex: 0 0 auto; max-width: 100%; margin: 0 8px 0 0;
+  font-size: 22px; line-height: 1.25; font-weight: 500; color: var(--text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.page-controls { margin-left: auto; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.live-tick { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text3); font-variant-numeric: tabular-nums; }
+.live-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text3); flex: none; }
+@media (max-width: 640px) {
+  .page-head { margin-bottom: 12px; }
+  .page-controls { margin-left: 0; width: 100%; }
+}
 /* Gate's pages explain themselves: one quiet line under the head. */
-.page-lede { margin: -6px 0 16px; max-width: 76ch; font-size: 12.5px; line-height: 1.6; color: var(--text-low); }
+.page-lede { margin: -8px 0 18px; max-width: 76ch; font-size: 13px; line-height: 1.55; color: var(--text2); }
 
-.template-option { padding: 16px; border: 1px solid var(--border); border-radius: 9px; text-align: left; transition: border-color .15s, background .15s; }
-.template-option strong { display: block; font-size: 13px; }
-.template-option span { display: block; font-size: 12px; color: var(--text-3); margin-top: 5px; line-height: 1.5; }
-.template-option.selected { border-color: var(--link); background: color-mix(in srgb, var(--link) 8%, transparent); }
-.diagnostic-row { padding: 13px 15px; border: 1px solid var(--border); border-left: 3px solid var(--text-3); border-radius: 7px; }
-.diagnostic-bad { border-left-color: var(--bad); }
-.diagnostic-warn { border-left-color: var(--warn); }
+/* A key to press, as the console writes one. */
+.kbd { font-family: var(--font-mono); font-size: 11px; line-height: 1.4; color: var(--text3); padding: 1px 5px; border: 1px solid var(--line); border-radius: 3px; }
+.qn.tone .kbd { border-color: var(--bg3); }
+
+/* The screen before the frame: the product's mark and one line. */
+.boot-screen {
+  height: 100vh; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 10px;
+  color: var(--text2); font-size: 13px; padding: 24px; text-align: center;
+}
+.boot-mark { color: var(--text); }
+.boot-mark .gate-brand { width: 72px; }
+.boot-error h2 { margin: 0; font-size: 16px; color: var(--text); font-weight: 600; }
+.boot-error p { margin: 0; max-width: 460px; line-height: 1.5; }
+.boot-actions { display: flex; gap: 8px; margin-top: 6px; }
+
+/* One motion language for drawers and scrims. */
+.drawer-scrim-enter-active, .drawer-scrim-leave-active { transition: opacity var(--drawer-duration) var(--drawer-ease); }
+.drawer-scrim-enter-from, .drawer-scrim-leave-to { opacity: 0; }
+
+.template-option { padding: 16px; border: 1px solid var(--line); border-radius: var(--r-card); text-align: left; transition: background .15s; }
+.template-option:hover { background: var(--bg2); }
+.qn.tone .template-option { border-color: transparent; background: var(--surface); }
+.template-option strong { display: block; font-size: 13px; font-weight: 500; }
+.template-option span { display: block; font-size: 12px; color: var(--text3); margin-top: 5px; line-height: 1.5; }
+.template-option.selected, .qn.tone .template-option.selected { background: var(--bg3); border-color: var(--text3); }
+.diagnostic-row { padding: 13px 15px; border: 1px solid var(--line); border-left: 3px solid var(--text3); border-radius: var(--r-ctl); }
+.qn.tone .diagnostic-row { border-color: transparent; border-left-color: var(--text3); background: var(--surface); }
+.diagnostic-row.diagnostic-bad { border-left-color: var(--red); }
+.diagnostic-row.diagnostic-warn { border-left-color: var(--amber); }
 .simulation-results { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
-.simulation-results > div { padding: 14px; border: 1px solid var(--border); border-radius: 8px; }
-.simulation-results span { display: block; color: var(--text-3); font-size: 11px; }
-.simulation-results strong { display: block; font-size: 25px; font-variant-numeric: tabular-nums; margin-top: 7px; }
+.simulation-results > div { padding: 14px; border: 1px solid var(--line); border-radius: var(--r-card); }
+.qn.tone .simulation-results > div { border-color: transparent; background: var(--surface); }
+.simulation-results span { display: block; color: var(--text3); font-size: 11.5px; }
+.simulation-results strong { display: block; font-size: 22px; font-weight: 500; font-variant-numeric: tabular-nums; margin-top: 7px; }
 .simulation-results small { font-size: 13px; font-weight: 400; }
-.history-chart { border: 1px solid var(--border); border-radius: 9px; padding: 14px; min-width: 0; }
+.history-chart { border: 1px solid var(--line); border-radius: var(--r-card); padding: 14px; min-width: 0; }
+.qn.tone .history-chart { border-color: transparent; background: var(--surface); padding: 16px 18px; }
 .chart-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; }
 .chart-reading { min-height: 32px; }
-[id^="node-"] { scroll-margin-top: 24px; }
+[id^="node-"] { scroll-margin-top: 76px; }
 @media (max-width: 640px) { .simulation-results { grid-template-columns: repeat(2, minmax(0, 1fr)); } .integration-guide summary span { display: block; margin: 5px 0 0; font-size: 12px; } }
-.history-chart { --chart-incoming: #0284c7; --chart-relayed: #059669; --chart-relay-queue: #7c3aed; --chart-worker-queue: #b7791f; --chart-age: #c2410c; }
-.dark .history-chart { --chart-incoming: #38bdf8; --chart-relayed: #34d399; --chart-relay-queue: #a78bfa; --chart-worker-queue: #fbbf24; --chart-age: #fb923c; }
+/* The console's chart colours: white first, then blue, aqua, violet and magenta. */
+.history-chart { --chart-incoming: var(--ink-in); --chart-relayed: var(--series-2); --chart-relay-queue: var(--series-3); --chart-worker-queue: var(--series-4); --chart-age: var(--series-5); }
 
-.ai-chat-dialog { inset: 0 0 0 auto; margin: 0; width: min(540px, 100%); height: 100dvh; max-width: 100%; max-height: 100dvh; padding: 0; border: 0; border-left: 1px solid var(--border); background: var(--surface); color: var(--text); box-shadow: -12px 0 48px rgb(0 0 0 / .12); overflow: hidden; }
+/* The AI agent: a drawer over the page, a console panel. */
+.ai-chat-dialog { inset: 0 0 0 auto; margin: 0; width: min(540px, 100%); height: 100dvh; max-width: 100%; max-height: 100dvh; padding: 0; border: 0; border-left: 1px solid var(--line); background: var(--pop); color: var(--text); box-shadow: -12px 0 48px rgb(0 0 0 / .18); overflow: hidden; }
+.qn.tone .ai-chat-dialog { border-left-color: transparent; --bg2: var(--well); --surface-2: var(--well); --surface: var(--pop); }
 .ai-chat-dialog[open] { display: flex; flex-direction: column; animation: ai-slide-in 240ms var(--ease-spring); }
 .ai-chat-dialog::backdrop { background: var(--scrim); animation: ai-backdrop-in 180ms ease-out; }
 @keyframes ai-slide-in { from { transform: translateX(100%); } to { transform: translateX(0); } }
 @keyframes ai-backdrop-in { from { opacity: 0; } to { opacity: 1; } }
 .ai-panel-header { display: flex; align-items: center; gap: 12px; padding: 19px 22px; flex-shrink: 0; }
-.ai-panel-header h2 { font-size: 16px; font-weight: 600; letter-spacing: -.02em; }
-.ai-panel-header p { color: var(--text-3); font-size: 11px; margin-top: 3px; overflow-wrap: anywhere; }
-.ai-panel-tabs { display: flex; gap: 22px; padding: 0 22px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
-.ai-panel-tabs button { padding: 10px 0; border-bottom: 2px solid transparent; color: var(--text-3); font-size: 12px; }
-.ai-panel-tabs button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--brand); font-weight: 600; }
-.ai-tab-dot { display: inline-block; width: 6px; height: 6px; margin-left: 5px; border-radius: 50%; background: var(--good); }
-.ai-notice { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; padding: 14px 22px; font-size: 12px; line-height: 1.6; background: var(--surface-2); flex-shrink: 0; }
+.ai-panel-header h2 { font-size: 16px; font-weight: 600; }
+.ai-panel-header p { color: var(--text3); font-size: 11.5px; margin-top: 3px; overflow-wrap: anywhere; }
+/* Tabs: words with a line under the picked one. */
+.ai-panel-tabs { display: flex; gap: 26px; padding: 0 22px; border-bottom: 1px solid var(--line); flex-shrink: 0; }
+.qn.tone .ai-panel-tabs { border-bottom-color: var(--bg3); }
+.ai-panel-tabs button { padding: 10px 0; margin-bottom: -1px; border-bottom: 2px solid transparent; color: var(--text2); font-size: 13px; }
+.ai-panel-tabs button:hover { color: var(--text); }
+.ai-panel-tabs button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--text); font-weight: 500; }
+.ai-tab-dot { display: inline-block; width: 6px; height: 6px; margin-left: 5px; border-radius: 50%; background: var(--text3); }
+.ai-notice { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; padding: 14px 22px; font-size: 12px; line-height: 1.6; background: var(--bg2); flex-shrink: 0; }
 .ai-notice > div { flex: 1; min-width: 200px; }
 .ai-conversation { overflow: hidden; min-width: 0; min-height: 0; flex: 1; display: flex; flex-direction: column; }
-.ai-chat-header { padding: 14px 22px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
+.ai-chat-header { padding: 14px 22px; border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
+.qn.tone .ai-chat-header { border-bottom-color: var(--bg3); }
 .ai-chat-header input { width: 160px; font-size: 12px; }
-.ai-agent-avatar, .ai-welcome-icon { display: inline-flex; align-items: center; justify-content: center; color: var(--link); background: color-mix(in srgb, var(--link) 9%, transparent); border: 1px solid color-mix(in srgb, var(--link) 18%, transparent); border-radius: 12px; }
+.ai-agent-avatar, .ai-welcome-icon { display: inline-flex; align-items: center; justify-content: center; color: var(--text); background: var(--bg2); border-radius: var(--r-pop); }
 .ai-agent-avatar { width: 38px; height: 38px; flex-shrink: 0; }
 .ai-welcome-icon { width: 58px; height: 58px; margin-bottom: 23px; border-radius: 17px; }
 .ai-transcript { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 22px; scroll-behavior: smooth; }
 .ai-welcome { margin: 15px auto 0; max-width: 430px; }
-.ai-welcome h3 { font-size: 21px; font-weight: 600; letter-spacing: -.02em; }
-.ai-welcome p { font-size: 13px; color: var(--text-2); line-height: 1.75; margin-top: 12px; }
+.ai-welcome h3 { font-size: 21px; font-weight: 500; letter-spacing: -.01em; }
+.ai-welcome p { font-size: 13px; color: var(--text2); line-height: 1.7; margin-top: 12px; }
 .ai-examples { display: grid; gap: 8px; margin-top: 23px; }
-.ai-example { display: flex; align-items: center; justify-content: space-between; border: 1px solid var(--border); border-radius: 7px; padding: 11px 14px; font-size: 12px; text-align: left; }
-.ai-example:hover:not(:disabled) { border-color: var(--link); color: var(--link); }
+.ai-example { display: flex; align-items: center; justify-content: space-between; border: 1px solid var(--line); border-radius: var(--r-ctl); padding: 11px 14px; font-size: 12.5px; text-align: left; }
+.qn.tone .ai-example { border-color: transparent; background: var(--ctl); }
+.ai-example:hover:not(:disabled) { background: var(--bg3); }
 .ai-example:disabled { opacity: .6; cursor: not-allowed; }
-.ai-message { max-width: 92%; margin-bottom: 22px; font-size: 13px; line-height: 1.75; overflow-wrap: anywhere; }
+.ai-message { max-width: 92%; margin-bottom: 22px; font-size: 13px; line-height: 1.7; overflow-wrap: anywhere; }
 .ai-message p { white-space: pre-wrap; }
-.ai-message-author { font-size: 10px; font-weight: 600; display: flex; gap: 6px; align-items: center; color: var(--text-3); margin-bottom: 7px; }
-.ai-message.user { margin-left: auto; border: 1px solid var(--border); background: color-mix(in srgb, var(--link) 5%, transparent); padding: 13px 16px; border-radius: 10px 10px 2px 10px; }
-.ai-live-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--link); margin-right: 5px; }
-.ai-thinking { color: var(--text-3); font-size: 12px; }
+.ai-message-author { font-size: 11px; font-weight: 500; display: flex; gap: 6px; align-items: center; color: var(--text3); margin-bottom: 7px; }
+.ai-message.user { margin-left: auto; background: var(--bg2); padding: 13px 16px; border-radius: var(--r-pop) var(--r-pop) 2px var(--r-pop); }
+.ai-live-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--text); margin-right: 5px; }
+.ai-thinking { color: var(--text3); font-size: 12px; }
 .ai-thinking .ai-live-dot { animation: ai-pulse 1.3s ease-in-out infinite; }
 @keyframes ai-pulse { 50% { opacity: .3; } }
-.ai-composer { border-top: 1px solid var(--border); padding: 14px 22px; flex-shrink: 0; }
+.ai-composer { border-top: 1px solid var(--line); padding: 14px 22px; flex-shrink: 0; }
+.qn.tone .ai-composer { border-top-color: var(--bg3); }
 .ai-composer textarea { resize: vertical; min-height: 70px; max-height: 160px; font-size: 13px; line-height: 1.6; }
 .ai-composer-footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 12px; }
-.ai-composer-footer > span, .ai-data-note { font-size: 10px; color: var(--text-3); }
+.ai-composer-footer > span, .ai-data-note { font-size: 11px; color: var(--text3); }
 .ai-data-note { line-height: 1.7; margin-top: 15px; }
 .ai-draft { min-width: 0; min-height: 0; overflow: hidden; flex: 1; display: flex; flex-direction: column; }
-.ai-draft-header { padding: 19px 20px; display: flex; align-items: center; justify-content: space-between; gap: 8px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
-.ai-draft-empty { padding: 40px 25px; color: var(--text-3); }
-.ai-draft-empty h3 { color: var(--text-2); font-size: 14px; font-weight: 500; margin-top: 22px; }
+.ai-draft-header { padding: 19px 20px; display: flex; align-items: center; justify-content: space-between; gap: 8px; border-bottom: 1px solid var(--line); flex-shrink: 0; }
+.qn.tone .ai-draft-header { border-bottom-color: var(--bg3); }
+.ai-draft-empty { padding: 40px 25px; color: var(--text3); }
+.ai-draft-empty h3 { color: var(--text2); font-size: 14px; font-weight: 500; margin-top: 22px; }
 .ai-draft-empty p { font-size: 12px; line-height: 1.8; margin-top: 10px; }
 .ai-draft-empty ol { list-style: decimal; padding-left: 16px; font-size: 12px; line-height: 2.7; margin-top: 27px; }
 .ai-draft-body, .ai-draft-empty { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
 .ai-draft-body { padding: 20px; }
-.ai-node { border-top: 1px solid var(--border); padding-top: 16px; margin-top: 18px; }
+.ai-node { border-top: 1px solid var(--line); padding-top: 16px; margin-top: 18px; }
+.qn.tone .ai-node { border-top-color: var(--bg3); }
 .ai-draft-notes { margin-top: 20px; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
 .ai-draft-notes h4, .ai-draft-notes summary { font-weight: 500; }
 .ai-draft-notes summary { cursor: pointer; }
-.ai-draft-notes ul { list-style: disc; padding-left: 17px; color: var(--text-2); margin-top: 7px; }
-.ai-json-toggle { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--text-3); margin-top: 23px; }
-.ai-json { font-size: 10px; line-height: 1.8; overflow: auto; max-height: 300px; margin-top: 12px; padding: 12px; border: 1px solid var(--border); border-radius: 7px; }
-.ai-draft-footer { border-top: 1px solid var(--border); padding: 18px 20px; flex-shrink: 0; }
-.ai-draft-footer p { color: var(--text-3); font-size: 10px; line-height: 1.7; margin-top: 12px; }
+.ai-draft-notes ul { list-style: disc; padding-left: 17px; color: var(--text2); margin-top: 7px; }
+.ai-json-toggle { display: flex; align-items: center; gap: 5px; font-size: 11.5px; color: var(--text3); margin-top: 23px; }
+.ai-json { font-family: var(--font-mono); font-size: 11px; line-height: 1.8; overflow: auto; max-height: 300px; margin-top: 12px; padding: 12px; border-radius: var(--r-ctl); background: var(--bg2); color: var(--text2); }
+.ai-draft-footer { border-top: 1px solid var(--line); padding: 18px 20px; flex-shrink: 0; }
+.qn.tone .ai-draft-footer { border-top-color: var(--bg3); }
+.ai-draft-footer p { color: var(--text3); font-size: 11px; line-height: 1.7; margin-top: 12px; }
 @media (max-width: 640px) { .ai-panel-header { padding: 14px 16px; } .ai-chat-header { padding: 12px 16px; } .ai-chat-header input { width: 130px; } .ai-transcript { padding: 18px; } .ai-composer { padding: 12px 16px; padding-bottom: max(12px, env(safe-area-inset-bottom)); } .ai-welcome { margin-top: 0; } .ai-welcome-icon { display: none; } .ai-welcome h3 { font-size: 18px; } .ai-notice { padding: 12px 16px; } .ai-composer-footer > span { max-width: 145px; } }
 @media (prefers-reduced-motion: reduce) { .ai-thinking .ai-live-dot, .ai-chat-dialog[open], .ai-chat-dialog::backdrop { animation: none; } .ai-transcript { scroll-behavior: auto; } }

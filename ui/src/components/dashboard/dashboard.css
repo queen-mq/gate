@@ -1,21 +1,22 @@
-/* Spatial dashboard: shared by the overview and graph details, using the console theme. */
-:root {
-  --spatial-accent: #805d00;
-  --spatial-top: #f5edda;
-  --spatial-top-end: #e8dab8;
-  --spatial-side: #d8cbae;
-  --spatial-side-dark: #c5b894;
-  --spatial-bottom: #e9e0ca;
-  --spatial-shadow: #3425100d;
+/* Spatial dashboard: shared by the overview and graph details, using the console theme.
+   The console's greys, a step apart: the top face lightest, the sides a step down. What is
+   highlighted is in the text's ink: yellow is the logo's only. */
+.qn {
+  --spatial-accent: var(--text);
+  --spatial-top: var(--bg3);
+  --spatial-top-end: color-mix(in srgb, var(--bg3) 55%, var(--bg2));
+  --spatial-side: var(--bg2);
+  --spatial-side-dark: color-mix(in srgb, var(--bg2) 50%, var(--bg));
+  --spatial-bottom: var(--bg);
+  --spatial-shadow: rgb(0 0 0 / .18);
 }
-.dark {
-  --spatial-accent: #fcc620;
-  --spatial-top: #4a4230;
-  --spatial-top-end: #302b20;
-  --spatial-side: #312d23;
-  --spatial-side-dark: #242118;
-  --spatial-bottom: #1b1913;
-  --spatial-shadow: #00000026;
+.qn.light {
+  --spatial-top: #ffffff;
+  --spatial-top-end: var(--bg2);
+  --spatial-side: var(--bg3);
+  --spatial-side-dark: color-mix(in srgb, var(--bg3) 80%, var(--text3));
+  --spatial-bottom: var(--bg2);
+  --spatial-shadow: rgb(40 36 32 / .08);
 }
 .dashboard-health {
   display: flex;
@@ -70,7 +71,7 @@
   padding: 18px 20px;
   background: linear-gradient(
     115deg,
-    color-mix(in srgb, var(--brand) 3%, var(--surface)),
+    color-mix(in srgb, var(--text) 3%, var(--surface)),
     var(--surface)
   );
 }
@@ -523,7 +524,7 @@
   min-width: 0;
   background: radial-gradient(
     ellipse at 50% 60%,
-    color-mix(in srgb, var(--brand) 3%, var(--surface)),
+    color-mix(in srgb, var(--text) 3%, var(--surface)),
     var(--surface) 75%
   );
 }
@@ -650,7 +651,7 @@
   width: 4px;
   height: 4px;
   border-radius: 50%;
-  background: var(--brand);
+  background: var(--spatial-accent);
 }
 .spatial-footer-divider {
   margin: 0 3px;
@@ -662,7 +663,7 @@
   flex-direction: column;
   background: linear-gradient(
     135deg,
-    color-mix(in srgb, var(--brand) 3%, var(--surface)),
+    color-mix(in srgb, var(--text) 3%, var(--surface)),
     var(--surface)
   );
   min-width: 0;

@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en" class="dark">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -11,20 +11,32 @@
   <link rel="alternate icon" type="image/png" sizes="32x32" href="/src/assets/brand/gate-favicon-32.png">
   <link rel="icon" type="image/x-icon" sizes="16x16 32x32 48x48" href="/src/assets/brand/gate-favicon.ico">
   <link rel="apple-touch-icon" sizes="180x180" href="/src/assets/brand/gate-favicon-180.png">
-  <script>
-    // Applied before first paint so a reload never flashes the wrong theme.
-    (function () {
-      var t
-      try { t = localStorage.getItem('gate-theme') } catch (_) {}
-      if (t !== 'light' && t !== 'dark' && t !== 'system') t = 'system'
-      var dark = t === 'dark' || (t === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches)
-      document.documentElement.classList.toggle('dark', dark)
-      document.documentElement.dataset.theme = t
-      document.documentElement.style.colorScheme = dark ? 'dark' : 'light'
-    })()
-  </script>
 </head>
 <body>
+  <!-- The look before the first paint, as src/lib/theme.js resolves it: a stored theme and
+       areas win; a first visit is soft with tone areas (light only when the previous design
+       stored Light); System follows the OS. Here, as the body's first child, because the
+       classes go on <body>. -->
+  <script>
+    (function () {
+      var saved = {}
+      var old = null
+      try { saved = JSON.parse(localStorage.getItem('gate-look') || '{}') || {} } catch (_) {}
+      try { old = localStorage.getItem('gate-theme') } catch (_) {}
+      var pick = ['dark', 'soft', 'light', 'system'].indexOf(saved.theme) >= 0 ? saved.theme : (old === 'light' ? 'light' : 'soft')
+      var t = pick
+      if (pick === 'system') {
+        t = 'dark'
+        try { if (window.matchMedia('(prefers-color-scheme: light)').matches) t = 'light' } catch (_) {}
+      }
+      document.body.classList.add('qn', t)
+      if (saved.areas !== 'lines') document.body.classList.add('tone')
+      var root = document.documentElement
+      root.classList.toggle('dark', t !== 'light')
+      root.style.colorScheme = t === 'light' ? 'light' : 'dark'
+      root.style.background = { dark: '#0d0c0b', soft: '#202020', light: '#f6f5f3' }[t]
+    })()
+  </script>
   <div id="app"></div>
   <script type="module" src="/src/main.js"></script>
 </body>
