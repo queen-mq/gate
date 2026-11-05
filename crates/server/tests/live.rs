@@ -343,7 +343,8 @@ impl Harness {
                 .partitions(32)
                 .wait(true)
                 .poll_timeout(Duration::from_millis(500))
-                .pop_auto_ack()
+                .commit_on_delivery(true)
+                .pop()
                 .await
                 .unwrap_or_default();
             out.extend(got);
@@ -366,7 +367,8 @@ impl Harness {
                 .partitions(32)
                 .wait(true)
                 .poll_timeout(Duration::from_millis(300))
-                .pop_auto_ack()
+                .commit_on_delivery(true)
+                .pop()
                 .await
                 .unwrap_or_default();
             out.extend(got);
@@ -4901,7 +4903,8 @@ async fn a_duplicate_rolls_the_bundle_back_without_naming_itself() {
         .subscription_mode(SubscriptionMode::All)
         .batch(10)
         .partitions(1)
-        .pop_auto_ack()
+        .commit_on_delivery(true)
+        .pop()
         .await
         .unwrap_or_default();
     assert_eq!(there.len(), 1, "only the planted one is on the queue");

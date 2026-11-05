@@ -35,7 +35,7 @@ jobs:
       queen:
         # Queen 2, the broker prod runs: its state is its own Raft log, so there is
         # no database to provide, and kv is always on.
-        image: ghcr.io/queen-mq/queen:2.6.0
+        image: ghcr.io/queen-mq/queen:2.7.0
         env:
           # A consumer group created at the tail skips every message already waiting.
           # Gate asks for `all` explicitly on every group it owns, so this is belt to

@@ -198,7 +198,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .partitions(16)
                     .wait(true)
                     .poll_timeout(Duration::from_millis(500))
-                    .pop_auto_ack()
+                    .commit_on_delivery(true)
+                    .pop()
                     .await
                     .unwrap_or_default();
                 if !got.is_empty() {

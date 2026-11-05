@@ -118,7 +118,8 @@ impl Gate {
             .partitions(32)
             .wait(true)
             .poll_timeout(Duration::from_millis(wait_ms))
-            .pop_auto_ack()
+            .commit_on_delivery(true)
+            .pop()
             .await
         {
             Ok(m) => Outcome::ok(200).with_units(m.len() as u64),
