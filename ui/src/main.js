@@ -2,6 +2,7 @@ import { createApp } from 'vue'
 import { createRouter, createWebHashHistory } from 'vue-router'
 import App from './App.vue'
 import { api, DEFAULT_APP } from './lib/api.js'
+import { initTheme } from './lib/theme.js'
 import './style.css'
 import './components/dashboard/dashboard.css'
 
@@ -92,10 +93,14 @@ const router = createRouter({
   ],
 })
 
-// Queen's tab title. The page scrolls inside the shell (.app-page), not the window.
+// Queen's tab title. The page scrolls inside the frame (.qn-body), not the window.
 router.afterEach((to) => {
   document.title = `${to.meta.title || 'Gate'} | Gate Dashboard`
-  document.querySelector('.app-page')?.scrollTo(0, 0)
+  document.querySelector('.qn-body')?.scrollTo(0, 0)
 })
+
+// The look before the first mount: index.html has already painted it; this seeds the refs the
+// theme switch reads and follows the OS while the pick is System.
+initTheme()
 
 createApp(App).use(router).mount('#app')
