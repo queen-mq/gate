@@ -317,7 +317,7 @@ function clearFilters() {
           }}<svg viewBox="0 0 70 40" class="dashboard-gauge" aria-hidden="true">
             <path d="M7 35A28 28 0 0 1 63 35" />
             <path
-              v-if="peak !== null"
+              v-if="peak > 0"
               d="M7 35A28 28 0 0 1 63 35"
               class="dashboard-gauge-fill"
               pathLength="100"

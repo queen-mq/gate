@@ -121,6 +121,15 @@
 .dashboard-gauge .dashboard-gauge-fill {
   stroke: var(--spatial-accent);
 }
+/* Tone areas draw no lines: the track and the banner follow the cards, not --border. */
+.qn.tone .dashboard-gauge {
+  stroke: var(--well);
+}
+.qn.tone .dashboard-health {
+  border-color: transparent;
+  border-radius: var(--r-card);
+  background-color: var(--card);
+}
 .dashboard-topology-selection {
   display: flex;
   gap: 12px;

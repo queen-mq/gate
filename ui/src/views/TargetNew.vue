@@ -62,7 +62,7 @@ async function create() {
 </script>
 
 <template>
-  <div class="target-wizard">
+  <div>
     <PageHeader title="New target" sub="Set up a target one step at a time: choose its application, connect its queues, then watch traffic or enforce rate limits." :crumbs="[{ to: '/targets', label: 'Targets' }]">
       <template #actions><RouterLink to="/targets" class="btn">Cancel</RouterLink></template>
     </PageHeader>
