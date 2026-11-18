@@ -15,7 +15,6 @@
 */
 import { computed } from 'vue'
 import GateBrand from '../components/GateBrand.vue'
-import LookChip from '../components/LookChip.vue'
 
 const loginUrl = computed(() => {
   const here = window.location.hash?.slice(1) || '/'
@@ -27,42 +26,51 @@ const loginUrl = computed(() => {
 </script>
 
 <template>
-  <div class="min-h-screen grid place-items-center px-6 py-16 relative">
-    <div class="absolute right-5 top-4">
-      <LookChip />
-    </div>
-    <div class="w-full max-w-[380px] text-center">
-      <GateBrand variant="full" class="mx-auto mb-8" />
-      <div class="card px-6 py-7 sm:px-8">
-        <h1 class="text-[20px] font-semibold tracking-tight">Sign in to Gate</h1>
-        <p class="text-[13px] text-fg-2 mt-3 leading-relaxed">
-          The ceilings this console shows are the ones being enforced right now.
-          Sign in with your work account.
-        </p>
-
-        <a
-          :href="loginUrl"
-          class="btn btn-primary mt-6 h-10 w-full text-[13px]"
-        >
-          <!-- Google's mark, inlined: the console embeds every asset it serves,
-               and a sign-in button that waits on a CDN is a sign-in button that
-               is sometimes blank. -->
-          <svg width="16" height="16" viewBox="0 0 48 48" aria-hidden="true">
-            <path fill="#EA4335" d="M24 9.5c3.5 0 6.6 1.2 9 3.6l6.7-6.7C35.6 2.6 30.2 0 24 0 14.6 0 6.5 5.4 2.6 13.2l7.8 6.1C12.3 13.2 17.7 9.5 24 9.5z"/>
-            <path fill="#4285F4" d="M46.1 24.6c0-1.6-.1-3.2-.4-4.6H24v9.1h12.4c-.5 2.9-2.2 5.3-4.6 6.9l7.1 5.5c4.2-3.9 6.6-9.6 6.6-16.9z"/>
-            <path fill="#FBBC05" d="M10.4 28.7c-.5-1.4-.8-2.9-.8-4.7s.3-3.3.8-4.7l-7.8-6.1C.9 16.6 0 20.2 0 24s.9 7.4 2.6 10.8l7.8-6.1z"/>
-            <path fill="#34A853" d="M24 48c6.2 0 11.5-2 15.3-5.5l-7.1-5.5c-2 1.3-4.6 2.1-8.2 2.1-6.3 0-11.7-3.7-13.6-9.4l-7.8 6.1C6.5 42.6 14.6 48 24 48z"/>
-          </svg>
-          Continue with Google
-        </a>
+  <!-- Mirrors Queen's sign-in page (queen-mq/queen: proxy/src/oauth.rs, login_html):
+       wordmark at the same visual size, a 400px card, Google's official light button, a help line. -->
+  <main class="min-h-screen grid place-items-center px-4 sm:px-6 py-6">
+    <div class="w-full max-w-[400px]">
+      <div class="flex justify-center mb-7"><GateBrand variant="full" class="w-[200px]" /></div>
+      <div class="card">
+        <div class="px-5 pt-6 sm:px-7 sm:pt-7 text-center">
+          <h1 class="text-[24px] font-semibold tracking-[-.035em] leading-tight">Welcome to Gate</h1>
+          <p class="text-[13px] text-fg-2 mt-2">Sign in to your account to continue.</p>
+        </div>
+        <div class="px-5 pt-6 pb-6 sm:px-7 sm:pb-7">
+          <a :href="loginUrl" class="google-signin">
+            <!-- Google's mark, inlined: the console embeds every asset it serves,
+                 and a sign-in button that waits on a CDN is a sign-in button that
+                 is sometimes blank. -->
+            <svg width="20" height="20" viewBox="0 0 48 48" aria-hidden="true">
+              <path fill="#EA4335" d="M24 9.5c3.5 0 6.6 1.2 9 3.6l6.7-6.7C35.6 2.6 30.2 0 24 0 14.6 0 6.5 5.4 2.6 13.2l7.8 6.1C12.3 13.2 17.7 9.5 24 9.5z"/>
+              <path fill="#4285F4" d="M46.1 24.6c0-1.6-.1-3.2-.4-4.6H24v9.1h12.4c-.5 2.9-2.2 5.3-4.6 6.9l7.1 5.5c4.2-3.9 6.6-9.6 6.6-16.9z"/>
+              <path fill="#FBBC05" d="M10.4 28.7c-.5-1.4-.8-2.9-.8-4.7s.3-3.3.8-4.7l-7.8-6.1C.9 16.6 0 20.2 0 24s.9 7.4 2.6 10.8l7.8-6.1z"/>
+              <path fill="#34A853" d="M24 48c6.2 0 11.5-2 15.3-5.5l-7.1-5.5c-2 1.3-4.6 2.1-8.2 2.1-6.3 0-11.7-3.7-13.6-9.4l-7.8 6.1C6.5 42.6 14.6 48 24 48z"/>
+            </svg>
+            <span>Continue with Google</span>
+          </a>
+        </div>
       </div>
-
-      <!-- The two things worth knowing BEFORE signing in, because the second
-           one is otherwise discovered as a 403 on a button that looked live. -->
-      <p class="text-[11.5px] text-fg-3 leading-relaxed mt-5 px-2 text-center">
-        Access is limited to the domains this deployment allows. Everyone who signs in can read;
-        changing a ceiling needs an account on the admin list.
+      <!-- The second sentence is worth knowing BEFORE signing in: otherwise it is
+           discovered as a 403 on a button that looked live. -->
+      <p class="text-[12px] text-fg-3 text-center mt-5 leading-relaxed">
+        Need access? Contact your administrator. Changing a ceiling needs an account on the admin list.
       </p>
     </div>
-  </div>
+  </main>
 </template>
+
+<style scoped>
+/* Google's official light button, in every theme, as on Queen's page. */
+.google-signin {
+  display: flex; align-items: center; justify-content: center; gap: 10px;
+  width: 100%; min-height: 44px; padding: 10px 12px;
+  border: 1px solid #747775; border-radius: var(--r-ctl, 8px);
+  background: #fff; color: #1f1f1f;
+  font-size: 14px; font-weight: 500; letter-spacing: .25px; text-decoration: none;
+  transition: background-color .12s cubic-bezier(.2, .7, .2, 1);
+}
+.google-signin:hover { background: #f2f2f2; }
+.google-signin svg { flex-shrink: 0; }
+@media (prefers-reduced-motion: reduce) { .google-signin { transition: none; } }
+</style>
