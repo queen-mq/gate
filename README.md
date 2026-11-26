@@ -251,12 +251,14 @@ and head are the same thing and nothing changes; a restart finds the group alrea
 broker leaves its cursor alone.
 
 **Queue retention.** Gate-owned ingress and interior queues retain completed messages for
-30 days (`completedRetentionSeconds: 2592000`, with retention enabled). Only messages older
+2 days (`completedRetentionSeconds: 172800`, with retention enabled). Only messages older
 than that threshold and passed by every consumer group are eligible for cleanup. Pending
 work has no age limit (`retentionSeconds: 0`, `maxWaitTimeSeconds: 0`), so waiting for a
 budget cannot expire it. Gate applies this policy when provisioning or restoring a graph.
-Application-owned ingress and egress queues retain their own configuration; configure their
-retention separately in Queen.
+An existing egress queue whose retention is switched off gets the same bound (retention
+enabled, `completedRetentionSeconds: 172800`, `retentionSeconds: 0`) and nothing else: its
+lease, retries and dedup window stay the application's. An egress retention the application
+configured is kept, and application-owned ingress queues are never configured.
 
 **Replicas are safe.** Declarations live in `queen.kv` and every replica reconciles against them on
 that timer; counters are one row each, so N replicas spend one budget.

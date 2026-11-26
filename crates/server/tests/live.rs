@@ -3289,7 +3289,7 @@ async fn the_console_can_draw_what_is_running() {
 /// pending work or taking over the application's ingress and egress policy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
-async fn owned_queues_keep_thirty_days_of_completed_history() {
+async fn owned_queues_keep_two_days_of_completed_history() {
     let Some((h, broker)) = faulty_harness("retention").await else {
         assert!(std::env::var("GATE_TEST_REQUIRE_LIVE").is_err());
         return;
@@ -3352,7 +3352,7 @@ async fn owned_queues_keep_thirty_days_of_completed_history() {
                 .expect("owned queue was configured")["options"];
             for (key, expected) in [
                 ("retentionEnabled", json!(true)),
-                ("completedRetentionSeconds", json!(2_592_000)),
+                ("completedRetentionSeconds", json!(172_800)),
                 ("retentionSeconds", json!(0)),
                 ("maxWaitTimeSeconds", json!(0)),
             ] {
@@ -3374,12 +3374,14 @@ async fn owned_queues_keep_thirty_days_of_completed_history() {
     }
 }
 
-/// Declaring a graph must not reconfigure the application's egress queue.
+/// Declaring a graph must not replace the application's egress settings.
 ///
 /// Queen's `create()` is implemented as `/configure` with an empty option bag,
-/// and `/configure` is a full replace rather than a patch. Calling it merely to
-/// ensure the queue exists resets every setting the application chose. An absent
-/// egress needs no eager setup: Queen creates it atomically on Gate's first push.
+/// and on an old broker `/configure` is a full replace rather than a patch.
+/// Calling it merely to ensure the queue exists resets every setting the
+/// application chose. An absent egress needs no eager setup: Queen creates it
+/// atomically on Gate's first push. (The one setting Gate adds, a retention when
+/// the egress has none, is the next test.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
 async fn declaring_a_graph_preserves_its_egress_queue_configuration() {
@@ -3416,6 +3418,62 @@ async fn declaring_a_graph_preserves_its_egress_queue_configuration() {
         json!(41),
         "Gate replaced the application's retry setting: {detail}"
     );
+
+    h.cleanup("g").await;
+    h.queen
+        .queue(&out)
+        .delete()
+        .await
+        .expect("delete application-owned egress");
+}
+
+/// An egress with retention switched off is bounded like Gate's own queues,
+/// and keeps every other setting the application chose.
+///
+/// Without it, the egress of an application that never configured a retention
+/// keeps every message Gate ever admitted into it, for as long as it exists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a broker: set GATE_TEST_QUEEN_URL and run with --include-ignored"]
+async fn an_egress_without_retention_keeps_two_days_of_completed_history() {
+    let Some(h) = harness("egress-retention").await else {
+        return;
+    };
+    let out = egress_of("egress-retention", &h.application);
+    h.queen
+        .queue(&out)
+        .configure(queen_mq::QueueOptions {
+            lease_time: Some(127),
+            retry_limit: Some(41),
+            retention_enabled: Some(false),
+            ..Default::default()
+        })
+        .await
+        .expect("configure application-owned egress");
+
+    for version in [1, 2] {
+        let mut doc = one_node(&out, wide("b"));
+        doc["version"] = json!(version);
+        let (status, body) = h.put_graph("g", doc).await;
+        assert_eq!(status, 200, "declare version {version}: {body}");
+        let detail = h
+            .queen
+            .admin()
+            .queue_detail(&out, &[])
+            .await
+            .expect("read egress configuration");
+        for (key, expected) in [
+            ("retentionEnabled", json!(true)),
+            ("completedRetentionSeconds", json!(172_800)),
+            ("retentionSeconds", json!(0)),
+            ("leaseTime", json!(127)),
+            ("retryLimit", json!(41)),
+        ] {
+            assert_eq!(
+                detail["queue"]["config"][key], expected,
+                "{out}, version {version}: {key}: {detail}"
+            );
+        }
+    }
 
     h.cleanup("g").await;
     h.queen

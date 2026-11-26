@@ -103,7 +103,12 @@ pub async fn start(
     Ok(rt)
 }
 
-/// The queues Gate owns, and only those.
+/// How long a queue Gate provisions keeps a message that every consumer group
+/// has already passed: two days. Pending work has no age limit, so a message
+/// waiting for a budget can never expire.
+const COMPLETED_RETENTION_SECONDS: i32 = 2 * 24 * 60 * 60;
+
+/// The queues Gate owns, and a retention for an egress that has none.
 async fn provision(queen: &Queen, plan: &Plan) -> Result<()> {
     let k = knobs();
     for q in &plan.queues {
@@ -118,10 +123,10 @@ async fn provision(queen: &Queen, plan: &Plan) -> Result<()> {
                     lease_time: Some(k.lease_seconds),
                     retry_limit: Some(k.retry_limit),
                     // Keep pending work until it can be admitted. Only messages
-                    // older than 30 days and passed by every group can expire.
+                    // older than two days and passed by every group can expire.
                     retention_enabled: Some(true),
                     retention_seconds: Some(0),
-                    completed_retention_seconds: Some(30 * 24 * 60 * 60),
+                    completed_retention_seconds: Some(COMPLETED_RETENTION_SECONDS),
                     max_wait_time_seconds: Some(0),
                     ..Default::default()
                 };
@@ -131,13 +136,14 @@ async fn provision(queen: &Queen, plan: &Plan) -> Result<()> {
                     .configure(opts)
                     .await?;
             }
-            // Produced into, never configured. `QueueBuilder::create` is a
-            // `/configure` with an empty option bag. Older brokers treat it as a
-            // full replace, resetting the application's retention, lease, retry
-            // and dedup settings; newer brokers merge omitted options. Queen
+            // Produced into, never created. `QueueBuilder::create` is a
+            // `/configure` with an empty option bag, and a configure creates a
+            // queue with configure's defaults rather than a push's. Queen
             // creates an absent queue atomically on the first push; applications
             // that need to subscribe before then own its explicit provisioning.
-            QueueKind::Egress => {}
+            // The one setting Gate adds to an egress that exists is a retention,
+            // and only when it has none.
+            QueueKind::Egress => bound_egress_history(queen, &q.name).await,
             // Consumed, never created. If it does not exist yet, Gate finds it
             // on its first message; declare-time validation says so as a
             // warning.
@@ -145,6 +151,49 @@ async fn provision(queen: &Queen, plan: &Plan) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Give an existing egress with retention switched off the bound Gate's own
+/// queues have.
+///
+/// An application that never configured a retention on its egress keeps every
+/// message Gate ever admitted into it, for as long as the queue exists. So when
+/// the broker says the egress has retention off, Gate switches it on with
+/// [`COMPLETED_RETENTION_SECONDS`] for consumed messages and no age limit for
+/// pending ones, and sends nothing else: `/configure` merges, so the
+/// application's lease, retries and dedup window stay as they are. A retention
+/// the application chose is left alone, and so is a broker that does not say
+/// (Queen 1.x leaves retention out of its read APIs). Best effort: a failure
+/// here costs the bound until the next provisioning, never the graph.
+async fn bound_egress_history(queen: &Queen, name: &str) {
+    // Absent (Queen creates it on Gate's first push) or unreadable: the next
+    // provisioning looks again.
+    let Ok(detail) = queen
+        .admin()
+        .queue_detail(name, &[("includePartitions", "false".to_string())])
+        .await
+    else {
+        return;
+    };
+    if detail["queue"]["config"]["retentionEnabled"].as_bool() != Some(false) {
+        return;
+    }
+    let opts = QueueOptions {
+        retention_enabled: Some(true),
+        retention_seconds: Some(0),
+        completed_retention_seconds: Some(COMPLETED_RETENTION_SECONDS),
+        ..Default::default()
+    };
+    match queen.queue(name).configure(opts).await {
+        Ok(_) => tracing::info!(
+            queue = %name,
+            seconds = COMPLETED_RETENTION_SECONDS,
+            "egress had no retention: completed messages now expire"
+        ),
+        Err(error) => {
+            tracing::warn!(%error, queue = %name, "could not bound the egress's retention")
+        }
+    }
 }
 
 /// What the broker knows about the queues a declaration names.

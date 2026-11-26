@@ -69,10 +69,12 @@ investigate delivery delays.
   Public chat access is restricted to administrators. Both adapters have bounded
   retries, redact provider errors and validate drafts before review. OpenAI uses
   Responses with `store: false`; Gemini uses native `generateContent` requests.
-- Gate-owned ingress and interior queues now enable 30-day retention for messages
+- Gate-owned ingress and interior queues now enable 2-day retention for messages
   already passed by every consumer group. Pending work has no age limit. The
-  policy is applied during graph provisioning and restoration; application-owned
-  ingress and egress queues keep their independently configured retention.
+  policy is applied during graph provisioning and restoration. An existing egress
+  queue with retention switched off gets the same 2-day bound and no other change;
+  an egress retention the application configured is kept, and application-owned
+  ingress queues are never configured.
 - **History moved from PostgreSQL to the broker's kv.** Gate now needs only its
   broker: roll-ups, refusals, Watch samples, queue samples and configuration
   markers are keys under `hist:` in `GATE_KV_NAMESPACE`, and history is on
@@ -108,8 +110,9 @@ investigate delivery delays.
 ### Validation
 
 - 274 Rust tests passed, including 60 integration tests against Queen.
-- An additional Queen integration test verifies the 30-day retention settings on
-  creation and redeclaration, and preserves application-owned queue configuration.
+- Queen integration tests verify the 2-day retention settings on creation and
+  redeclaration, the bound on an egress without retention, and that every other
+  application-owned queue setting is preserved.
 - The AI addition passes 98 server library tests, including 15 AI tests with
   mock OpenAI and Gemini servers covering provider selection, credentials,
   conversation mapping, validation, repair, error handling and write isolation.
